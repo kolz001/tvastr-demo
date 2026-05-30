@@ -38,8 +38,9 @@ class ClaudeClient:
 class MockClaudeClient:
     """Deterministic stand-in for Claude — no API key required.
 
-    Produces structured-looking output so downstream parsing and the demo work
-    end-to-end offline.
+    Returns structured JSON when the prompt asks for a fix proposal (so the
+    fix-generation tool's search/replace path is exercised end-to-end), and a
+    prose explanation otherwise.
     """
 
     target = "cloud"
@@ -49,10 +50,56 @@ class MockClaudeClient:
 
     def complete(self, prompt: str, *, system: str | None = None) -> LLMResponse:
         log.info("llm.cloud.complete", model=self.model, mocked=True)
-        text = (
-            "[cloud-reasoning] Based on the failure signature, the most likely root "
-            "cause is a contract mismatch between connected components. Recommended fix: "
-            "align the producing component's output type with the consumer's expected "
-            "input, and add a regression test that exercises the connection."
-        )
+        if self._looks_like_fix_prompt(prompt, system):
+            text = self._mock_fix_json(prompt)
+        else:
+            text = (
+                "[cloud-reasoning] Based on the failure signature, the most likely root "
+                "cause is a contract mismatch between connected components. Recommended fix: "
+                "align the producing component's output type with the consumer's expected "
+                "input, and add a regression test that exercises the connection."
+            )
         return LLMResponse(text=text, model=self.model, target=self.target, mocked=True)
+
+    @staticmethod
+    def _looks_like_fix_prompt(prompt: str, system: str | None) -> bool:
+        haystack = f"{system or ''}\n{prompt}"
+        return '"search"' in haystack and '"replace"' in haystack
+
+    @staticmethod
+    def _mock_fix_json(prompt: str) -> str:
+        """Find a real substring of the retrieved source and propose a comment-insertion.
+
+        Locates the first ``# ── <path> ──`` section and the first non-empty,
+        non-header line in it, then proposes inserting a deterministic marker
+        comment above that line. The result is a valid, applicable fix — enough
+        to exercise the parser, validator, and ``str.replace`` path end-to-end.
+        """
+        import re
+
+        section = re.search(r"# ── (\S+) ──\n(.+?)(?=\n# ── |\Z)", prompt, re.DOTALL)
+        if not section:
+            return '{"summary": "no source retrieved", "changes": [], "test_plan": "n/a"}'
+        path = section.group(1)
+        body = section.group(2)
+        # Pick the first non-blank line as the anchor.
+        anchor = next((ln for ln in body.splitlines() if ln.strip()), None)
+        if anchor is None:
+            return '{"summary": "empty file", "changes": [], "test_plan": "n/a"}'
+        marker = "# tvastr-mock: proposed fix anchor"
+        replace = f"{marker}\n{anchor}"
+        return (
+            '{"summary": "[mock-fix] insert a marker comment above the first '
+            'statement of the suspected file to exercise the search/replace path.", '
+            '"changes": [{"path": ' + _json_str(path) + ', "search": ' + _json_str(anchor)
+            + ", \"replace\": " + _json_str(replace)
+            + ', "rationale": "deterministic mock edit"}], '
+            '"test_plan": "Assert the marker appears in the patched file."}'
+        )
+
+
+def _json_str(s: str) -> str:
+    """Minimal JSON-safe string encoder for embedding into a hand-built JSON payload."""
+    import json as _json
+
+    return _json.dumps(s)

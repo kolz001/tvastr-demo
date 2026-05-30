@@ -19,9 +19,10 @@ from tvastr.agent.context import AgentContext
 from tvastr.agent.state import AgentState
 from tvastr.agent.tools import (
     extract_stack_files,
+    format_code_for_prompt,
     generate_fix,
     open_pull_request,
-    retrieve_code,
+    retrieve_code_files,
     search_codebase,
     send_notification,
 )
@@ -73,8 +74,12 @@ class RemediationAgent:
         suspected = extract_stack_files(events)
         if not suspected and pattern.exception_type:
             suspected = search_codebase(self.ctx, pattern.exception_type)
-        code_context = retrieve_code(self.ctx, suspected)
-        return {"suspected_files": suspected, "code_context": code_context}
+        code_files = retrieve_code_files(self.ctx, suspected)
+        return {
+            "suspected_files": suspected,
+            "code_files": code_files,
+            "code_context": format_code_for_prompt(code_files),
+        }
 
     def _reason_root_cause(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
@@ -109,7 +114,7 @@ class RemediationAgent:
     def _generate_fix(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
         fix, decision = generate_fix(
-            self.ctx, pattern, state["root_cause"], state.get("code_context", "")
+            self.ctx, pattern, state["root_cause"], state.get("code_files", {})
         )
         return {"fix": fix, "routing": _append_routing(state, decision)}
 
@@ -143,7 +148,12 @@ class RemediationAgent:
 
     def _open_pr(self, state: AgentState) -> AgentState:
         result = open_pull_request(self.ctx, state["pr_draft"])
-        outcome = "pr_opened" if result.created else "failed"
+        if result.dry_run:
+            outcome = "dry_run"
+        elif result.created:
+            outcome = "pr_opened"
+        else:
+            outcome = "failed"
         return {"pr_result": result, "outcome": outcome}
 
     def _notify(self, state: AgentState) -> AgentState:
@@ -152,6 +162,13 @@ class RemediationAgent:
         if outcome == "pr_opened" and (result := state.get("pr_result")):
             message = f":wrench: tvastr opened a PR for *{pattern.title}* → {result.url}"
             notes = f"PR opened: {result.url}"
+        elif outcome == "dry_run" and (draft := state.get("pr_draft")):
+            files = ", ".join(c.path for c in draft.changes) or "(none)"
+            message = (
+                f":construction: tvastr [DRY-RUN] would open PR for *{pattern.title}* — "
+                f"{len(draft.changes)} file(s): {files}"
+            )
+            notes = f"Dry-run: no PR created. Proposed files: {files}"
         else:
             message = (
                 f":mag: tvastr flagged *{pattern.title}* ({pattern.count}x) for human "

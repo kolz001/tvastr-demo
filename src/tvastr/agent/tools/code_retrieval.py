@@ -24,15 +24,31 @@ def extract_stack_files(events: list[LogEvent]) -> list[str]:
     return files
 
 
-def retrieve_code(ctx: AgentContext, paths: list[str], *, max_files: int = 5) -> str:
-    """Fetch the contents of ``paths`` and concatenate into a single context blob."""
-    chunks: list[str] = []
+def retrieve_code_files(
+    ctx: AgentContext, paths: list[str], *, max_files: int = 5
+) -> dict[str, str]:
+    """Fetch contents for ``paths``; return a {path: content} mapping.
+
+    Skips paths the code host can't return (logged as misses). The mapping
+    preserves insertion order, so the first suspected file stays first.
+    """
+    files: dict[str, str] = {}
     for path in paths[:max_files]:
         try:
-            content = ctx.code_host.get_file(path)
+            files[path] = ctx.code_host.get_file(path)
         except Exception as exc:
             log.warning("tool.code_retrieval.miss", path=path, error=str(exc))
-            continue
-        chunks.append(f"# ── {path} ──\n{content}")
-    log.info("tool.code_retrieval", requested=len(paths), retrieved=len(chunks))
-    return "\n\n".join(chunks)
+    log.info("tool.code_retrieval", requested=len(paths), retrieved=len(files))
+    return files
+
+
+def format_code_for_prompt(files: dict[str, str]) -> str:
+    """Render a ``{path: content}`` mapping as a single labelled blob for a prompt."""
+    if not files:
+        return ""
+    return "\n\n".join(f"# ── {path} ──\n{content}" for path, content in files.items())
+
+
+def retrieve_code(ctx: AgentContext, paths: list[str], *, max_files: int = 5) -> str:
+    """Back-compat wrapper: returns the prompt-formatted blob."""
+    return format_code_for_prompt(retrieve_code_files(ctx, paths, max_files=max_files))

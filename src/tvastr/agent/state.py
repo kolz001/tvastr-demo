@@ -23,11 +23,12 @@ class AgentState(TypedDict, total=False):
     pattern: FailurePattern
     sample_events: list[LogEvent]
     code_context: str
+    code_files: dict[str, str]
     suspected_files: list[str]
     root_cause: RootCause
     fix: FixProposal
     pr_draft: PullRequestDraft
     pr_result: PullRequestResult
     routing: list[RoutingDecision]
-    outcome: str  # pr_opened | skipped | failed
+    outcome: str  # pr_opened | dry_run | skipped | failed
     notes: str

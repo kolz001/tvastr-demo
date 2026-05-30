@@ -18,8 +18,13 @@ log = get_logger(__name__)
 
 
 def default_sample_path() -> Path:
-    """Path to the bundled sample Haystack failure logs."""
-    return Path(__file__).resolve().parents[3] / "data" / "sample_logs" / "haystack_failures.jsonl"
+    """Path to the bundled sample LlamaIndex failure logs."""
+    return (
+        Path(__file__).resolve().parents[3]
+        / "data"
+        / "sample_logs"
+        / "llamaindex_failures.jsonl"
+    )
 
 
 class SimulatedLogSource:

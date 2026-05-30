@@ -20,19 +20,22 @@ def recurring_events() -> list[LogEvent]:
     events = [
         LogEvent(
             timestamp=base + timedelta(minutes=i),
-            service="haystack-pipeline",
+            service="llamaindex-app",
             severity=Severity.ERROR,
-            message="ValueError: Missing required input variable 'question'",
-            stack_trace='File "haystack/components/builders/prompt_builder.py", line 142',
+            message="ModuleNotFoundError: No module named 'llama_index.llms.openai'",
+            stack_trace=(
+                'File "app/rag.py", line 12, in <module>\n'
+                "    from llama_index.llms.openai import OpenAI"
+            ),
         )
         for i in range(3)
     ]
     events.append(
         LogEvent(
             timestamp=base,
-            service="haystack-converter",
+            service="llamaindex-agent",
             severity=Severity.ERROR,
-            message="PyPDFError: Could not read malformed PDF",
+            message="RuntimeError: This event loop is already running",
         )
     )
     return events
@@ -41,7 +44,7 @@ def recurring_events() -> list[LogEvent]:
 @pytest.fixture
 def sensitive_event() -> LogEvent:
     return LogEvent(
-        service="haystack-retriever",
+        service="llamaindex-vector-store",
         message=(
             "ConnectionError: failed for user jane.doe@example.com token sk-ant-REDACTEDABC123"
         ),

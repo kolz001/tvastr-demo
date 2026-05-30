@@ -31,6 +31,9 @@ class PatternOutcome(BaseModel):
     sensitivity: str
     outcome: str
     pull_request_url: str | None = None
+    pr_title: str | None = None
+    pr_branch: str | None = None
+    pr_changes: list[dict] = Field(default_factory=list)
     routing: list[dict] = Field(default_factory=list)
 
 
@@ -74,14 +77,22 @@ class RemediationPipeline:
             self.threshold.mark_handled(pattern)
 
             pr_result = final.get("pr_result")
+            pr_draft = final.get("pr_draft")
             routing = final.get("routing", [])
+            outcome_label = final.get("outcome", "skipped")
+            # In dry-run, the PR URL is a sentinel — don't pollute the audit log with it.
+            audit_pr_url = (
+                pr_result.url
+                if pr_result and not pr_result.dry_run
+                else None
+            )
             record = AuditRecord(
                 pattern_id=pattern.id,
                 pattern_title=pattern.title,
                 routing=routing,
                 root_cause_summary=(rc := final.get("root_cause")) and rc.summary,
-                pull_request_url=pr_result.url if pr_result else None,
-                outcome=final.get("outcome", "skipped"),
+                pull_request_url=audit_pr_url,
+                outcome=outcome_label,
                 notes=final.get("notes", ""),
             )
             self.audit_store.save(record)
@@ -93,7 +104,13 @@ class RemediationPipeline:
                     count=pattern.count,
                     sensitivity=pattern.sensitivity.value,
                     outcome=record.outcome,
-                    pull_request_url=record.pull_request_url,
+                    pull_request_url=audit_pr_url,
+                    pr_title=pr_draft.title if pr_draft else None,
+                    pr_branch=pr_draft.branch if pr_draft else None,
+                    pr_changes=[
+                        {"path": c.path, "rationale": c.rationale, "diff": c.diff or ""}
+                        for c in (pr_draft.changes if pr_draft else [])
+                    ],
                     routing=[d.model_dump(mode="json") for d in routing],
                 )
             )
@@ -113,7 +130,9 @@ class RemediationPipeline:
         return run
 
 
-def build_pipeline(settings: Settings | None = None) -> RemediationPipeline:
+def build_pipeline(
+    settings: Settings | None = None, *, log_source: LogSource | None = None
+) -> RemediationPipeline:
     settings = settings or get_settings()
     router = build_router(settings)
     ctx = AgentContext(
@@ -129,5 +148,5 @@ def build_pipeline(settings: Settings | None = None) -> RemediationPipeline:
         ),
         agent=RemediationAgent(ctx),
         audit_store=build_audit_store(settings),
-        log_source=SimulatedLogSource(),
+        log_source=log_source or SimulatedLogSource(),
     )

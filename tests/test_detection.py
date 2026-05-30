@@ -3,8 +3,8 @@ from tvastr.domain import LogEvent, Sensitivity
 
 
 def test_same_failure_different_ids_clusters_together():
-    a = LogEvent(service="svc", message="DuplicateDocumentError: id 4f9a2 already exists")
-    b = LogEvent(service="svc", message="DuplicateDocumentError: id 7b1c8 already exists")
+    a = LogEvent(service="svc", message="KeyError: 'doc-4f9a2' not found in index")
+    b = LogEvent(service="svc", message="KeyError: 'doc-7b1c8' not found in index")
     assert fingerprint(a) == fingerprint(b)
     clusters = cluster_events([a, b])
     assert len(clusters) == 1
@@ -13,7 +13,7 @@ def test_same_failure_different_ids_clusters_together():
 
 def test_clusters_sorted_by_frequency(recurring_events):
     clusters = cluster_events(recurring_events)
-    assert clusters[0].count == 3  # the recurring ValueError leads
+    assert clusters[0].count == 3  # the recurring import failure leads
     assert clusters[0].is_recurring
 
 

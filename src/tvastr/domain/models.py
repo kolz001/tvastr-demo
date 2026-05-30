@@ -102,6 +102,7 @@ class FileChange(BaseModel):
     original_snippet: str | None = None
     patched_content: str
     rationale: str = ""
+    diff: str | None = None  # unified diff of original → patched, populated when known
 
 
 class FixProposal(BaseModel):
@@ -133,6 +134,7 @@ class PullRequestResult(BaseModel):
     branch: str
     created: bool = True
     mocked: bool = False
+    dry_run: bool = False
 
 
 class AuditRecord(BaseModel):
@@ -145,5 +147,5 @@ class AuditRecord(BaseModel):
     routing: list[RoutingDecision] = Field(default_factory=list)
     root_cause_summary: str | None = None
     pull_request_url: str | None = None
-    outcome: str = "pending"  # pending | pr_opened | skipped | failed
+    outcome: str = "pending"  # pending | pr_opened | dry_run | skipped | failed
     notes: str = ""

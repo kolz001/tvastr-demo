@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # --- Runtime ---
     env: Literal["local", "staging", "production"] = "local"
     use_mocks: bool = True
+    # When true, the agent goes through the whole flow (real or mock backends) but
+    # the final PR-creation side effect is suppressed. Use to inspect what the
+    # agent *would* do against a real repo before letting it actually push.
+    dry_run: bool = False
     log_level: str = "INFO"
     log_json: bool = False
 
@@ -47,7 +51,7 @@ class Settings(BaseSettings):
 
     # --- GitHub ---
     github_token: str | None = Field(default=None, alias="GITHUB_TOKEN")
-    github_repo: str = "deepset-ai/haystack"
+    github_repo: str = "run-llama/llama_index"
     github_base_branch: str = "main"
 
     # --- Slack ---
