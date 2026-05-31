@@ -73,13 +73,84 @@ account needed** — the project runs fully offline in mock mode by default.
 ```bash
 uv sync --extra dev      # create venv + install
 make demo                # run the pipeline against bundled sample logs
-make test                # run the test suite
-make run                 # start the API at http://localhost:8000  (/docs for OpenAPI)
+make test                # run the test suite (69+ tests, <1s)
+make run                 # start the server  (visit /app for the triage UI, /docs for OpenAPI)
 ```
 
 `make demo` ingests sample LlamaIndex failure logs, clusters them, selects the
 recurring ones, runs the agent on each, and prints the routing decisions and the
 (mock) pull request it would open.
+
+### Interactive triage UI
+
+```bash
+make run
+open http://localhost:8000/app
+```
+
+The page is a single-file vanilla-JS app served by the same FastAPI server. It
+gives you:
+
+- **Top-N GitHub issues** for any repo, ranked by 👍 thumbs-up, comments, total
+  interactions, or recency. GitHub's Search API does the sorting server-side.
+- **One-click "Apply fix" → live pipeline stream.** Every node transition, tool
+  call, routing decision, LLM prompt + response, generated diff, and PR draft
+  appears as a card in the right pane as it happens. Cards are summarised by
+  default; click to expand the full prompt/response/diff/JSON.
+- **Persisted runs.** Each run is written to `data/runs/<run_id>.jsonl`. The
+  *Past runs* tab lists every previous run; clicking one replays the event
+  stream. Demos are reproducible — link a `run_id` and anyone can re-watch the
+  same agent run later.
+- **Auto-detect mode.** Live (real GitHub + real Claude) if `ANTHROPIC_API_KEY`
+  and `GITHUB_TOKEN` are set; mock otherwise. The header badge shows which.
+- **Dry-run by default.** The UI never opens a real PR. Use the CLI
+  (`tvastr demo`) when you're ready to flip the safety off.
+
+The architecture and trade-offs are written up in
+[ADR-0004](docs/adr/0004-live-pipeline-instrumentation-via-event-sinks.md) and
+[docs/design-doc.md §4.6](docs/design-doc.md).
+
+### The agent verifies its own fixes
+
+A diff isn't a fix — the loop closes only when we've shown the failure goes
+away. After the agent produces a `pr.dry_run` in the triage UI, a **"Verify
+this fix"** button appears on the timeline. Click it and tvastr:
+
+1. **Synthesizes a reproducer** — extracts a runnable Python block from the
+   issue body when one exists, else asks Claude to write one from the
+   exception class + traceback.
+2. **Spins up a sandbox** — Docker preferred (`--read-only --network=none
+   --cap-drop=ALL`), `uv`-style subprocess as a fallback.
+3. **Runs baseline → applies patch → re-runs** the reproducer, then
+   optionally runs a scoped slice of the project's own tests as a
+   regression check.
+4. **Emits a verdict** with an explicit oracle label, streamed into the same
+   timeline:
+   - `verified_via_reproducer` — the original exception no longer fires.
+   - `verified_via_scoped_tests` — repro ambiguous, but scoped tests pass.
+   - `still_broken` / `regression` / `no_repro` — surfaced as the same UX
+     prominence as a green; we don't quietly hide failures.
+
+The verdict appears in the **Past runs** table's `Verified?` column so a
+run's outcome is visible at a glance later. See
+[ADR-0005](docs/adr/0005-verify-fix-loop.md) for the design rationale and
+[docs/design-doc.md §4.7](docs/design-doc.md) for the full loop.
+
+**Honest limits worth knowing**
+
+- The verifier runs synthesized Python — Docker's sandbox flags are
+  load-bearing. The subprocess fallback is weaker; use it for development,
+  not for verifying patches from untrusted sources.
+- `no_repro` is common when the issue body has no code and the traceback is
+  thin — the verdict is recorded honestly rather than upgraded.
+- Each verification ≈ 1 Claude call (~$0.01–0.05) + ~30s of sandbox time
+  (longer on Docker cold pull). The UI shows the cost before firing.
+
+To use Docker, build the LlamaIndex base image once:
+
+```bash
+docker build -t tvastr-verify:llamaindex -f verification/Dockerfile.llamaindex .
+```
 
 ### Dry-run against real source
 
@@ -93,10 +164,34 @@ uv run python -m tvastr.cli demo --dry-run
 
 This is the recommended gate before any first-time live run.
 
-### Harvest real LlamaIndex issues
+### Bring your own logs (no proprietary SaaS required)
 
-The `ingest-github-issues` command turns bug-labelled GitHub issues into the
-JSONL shape the simulated source replays:
+tvastr's only contract with the outside world is **JSONL of `LogEvent`** —
+`{service, severity, message, stack_trace, attributes}`. Anything that can
+produce that shape plugs in. Three concrete paths, in order of "least infra
+needed":
+
+**1. Pipe via stdin** — adapt with `jq` in one line:
+
+```bash
+# Your app already writes structured JSON logs? Map the fields:
+cat /var/log/myapp.log \
+  | jq -c '{service: .app, severity: .level, message: .msg, stack_trace: .trace}' \
+  | uv run python -m tvastr.cli demo --logs - --dry-run
+```
+
+**2. From a Grafana Loki cluster** — OSS, Apache-2.0, self-hostable:
+
+```bash
+TVASTR_LOKI_URL=http://localhost:3100 \
+TVASTR_LOKI_QUERY='{app="myapp"} |= "Error"' \
+uv run python -m tvastr.cli ingest-loki --out data/sample_logs/loki.jsonl
+
+uv run python -m tvastr.cli demo --logs data/sample_logs/loki.jsonl --dry-run
+```
+
+**3. From a GitHub repo's bug tracker** — useful when you don't have a
+production log stream yet:
 
 ```bash
 uv run python -m tvastr.cli ingest-github-issues \
@@ -108,6 +203,9 @@ uv run python -m tvastr.cli demo \
     --logs data/sample_logs/llamaindex_real.jsonl \
     --dry-run
 ```
+
+Adding a new source is ~30 LOC implementing the `LogSource` Protocol — see
+[docs/design-doc.md](docs/design-doc.md) §4.1.
 
 ### Going live
 
@@ -122,19 +220,25 @@ Dashboards) and an Ollama model with `ollama pull llama3.1`.
 
 ```
 src/tvastr/
-├── config.py          # env-driven settings; use_mocks + dry_run master switches
+├── config.py          # env-driven settings (use_mocks, dry_run, audit_backend)
 ├── logging.py         # structured logging (structlog)
+├── events.py          # PipelineEvent + EventSink protocol (Null/List/Jsonl/Fanout)
 ├── domain/            # pydantic models shared across layers
-├── ingestion/         # log sources (simulated, cloudwatch, github_issues)  ── INGESTION
-├── detection/         # clustering, detector, threshold engine               ── DETECTION
+├── ingestion/         # log sources: simulated, stdin, github_issues, loki      ── INGESTION
+├── detection/         # clustering, detector, threshold engine                   ── DETECTION
 ├── pii/               # PII / secret redaction at the boundary
 ├── llm/               # local + cloud clients, hybrid router
-├── agent/             # LangGraph state graph + tools                        ── REASONING
+├── agent/             # LangGraph state graph + tools                            ── REASONING
 ├── integrations/      # GitHub, Slack (real + mock + dry-run decorator)
-├── storage/           # OpenSearch audit store (+ in-memory)                 ── OUTPUT
-├── pipeline.py        # end-to-end orchestration
-├── api/               # FastAPI app (health, /remediate)
-└── cli.py             # `tvastr demo|serve|ingest-github-issues|version`
+├── storage/           # audit stores: in-memory, file (default), OpenSearch       ── OUTPUT
+├── pipeline.py        # end-to-end orchestration (event-sink instrumented)
+├── verification/      # sandbox + reproducer + verifier                        ── VERIFY
+├── api/
+│   ├── app.py         # FastAPI factory
+│   ├── routes/        # health, remediate, issues, run, verify (SSE + replay)
+│   └── templates/
+│       └── app.html   # single-file triage + verification UI
+└── cli.py             # tvastr demo|serve|ingest-github-issues|ingest-loki|version
 ```
 
 Every integration ships a real client and a mock behind a shared interface; the

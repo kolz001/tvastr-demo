@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 from tvastr import __version__
-from tvastr.api.routes import health, remediate
+from tvastr.api.routes import health, issues, remediate, run, verify
 from tvastr.config import get_settings
 from tvastr.logging import configure_logging
 
@@ -26,4 +29,13 @@ def create_app() -> FastAPI:
     )
     app.include_router(health.router)
     app.include_router(remediate.router)
+    app.include_router(issues.router)
+    app.include_router(run.router)
+    app.include_router(verify.router)
+
+    @app.get("/app", response_class=HTMLResponse, include_in_schema=False)
+    def _app_page() -> HTMLResponse:
+        page = Path(__file__).resolve().parent / "templates" / "app.html"
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+
     return app

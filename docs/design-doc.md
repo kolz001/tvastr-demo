@@ -63,11 +63,14 @@ A four-layer pipeline. Every layer is wired behind a Protocol so the offline (mo
 
 ### 4.1 Ingestion
 
-Sources are pulled (or pushed) into a uniform `LogEvent` shape (`service`, `severity`, `message`, `stack_trace`, `attributes`, `source`).
+Sources are pulled (or pushed) into a uniform `LogEvent` shape (`service`, `severity`, `message`, `stack_trace`, `attributes`, `source`). The architecture is OSS-first and source-agnostic — `LogSource` is a Protocol, not a coupling to any vendor.
 
-- **Production:** application logs land in CloudWatch (or OpenSearch); EventBridge routes failure events to an SQS queue; a Lambda batches and calls the agent.
-- **Local development:** `SimulatedLogSource` replays a bundled JSONL of LlamaIndex-flavoured failure events. Same shape as production.
-- **GitHub issues (for the demo):** the `tvastr ingest-github-issues` CLI command harvests bug-labelled issues from a target repo (default `run-llama/llama_index`), extracts error signatures from the body, and writes them out as a JSONL the simulated source can replay. This is how the demo gets real-world signal without needing a production deployment.
+- **Universal escape hatch:** `StdinLogSource` reads JSONL of `LogEvent` from stdin. Anyone with logs in any system writes a small `jq`/`awk`/Python converter and pipes in — no adapter code needed.
+- **`SimulatedLogSource`:** replays a bundled JSONL file. Default for local development and the demo.
+- **`LokiLogFetcher`:** queries Grafana Loki (Apache-2.0, self-hostable) via its HTTP `/loki/api/v1/query_range` endpoint. `tvastr ingest-loki --query '{app="myapp"} |= "Error"'` writes a JSONL the simulated source replays. Default `line_to_event` converter handles JSON log lines; users with custom shapes pass a callable.
+- **`GitHubIssuesFetcher`:** harvests bug-labelled issues from a target repo. Useful when you don't have a production log stream yet — the agent gets real-world signal from open-source bug trackers.
+- **`CloudWatchLogSource`:** stub for the AWS production path (CloudWatch → EventBridge → SQS → Lambda → batch into the agent). Implemented in the AWS deployment phase.
+- **Planned:** `OTLPLogSource` — OpenTelemetry Logs over OTLP/HTTP. The vendor-neutral CNCF spec; works with any OTel-compatible backend (Loki, Jaeger, Tempo, Honeycomb, SigNoz, etc.).
 
 ### 4.2 Detection
 
@@ -107,6 +110,54 @@ Dry-run is mandatory for any first-time live run against a real repo. The flow:
 1. Run with `TVASTR_USE_MOCKS=false`, `TVASTR_DRY_RUN=true`, `ANTHROPIC_API_KEY=...` — fetch real source, get real Claude analysis, see real diffs, **no PR is opened**.
 2. Eyeball 10–20 dry-run outputs. Tune prompts, thresholds, code search.
 3. Only when confidence in the output is high, flip `TVASTR_DRY_RUN=false` against a **fork** (never the upstream).
+
+### 4.6 Live instrumentation & triage UI
+
+The agent's value is in *how* it decides, not just *that* it decided. The pipeline emits a `PipelineEvent` at every significant moment — node entry/exit, tool calls, LLM prompts and responses, routing decisions with the redacted payload, generated diffs, PR drafts, dry-run interceptions, audit writes. The emitter is a `EventSink` Protocol (`src/tvastr/events.py`) with four implementations:
+
+- `NullEventSink` — the default. Zero overhead when instrumentation is off.
+- `ListEventSink` — in-memory list for tests. Lets `tests/test_events.py` assert on the actual event sequence end-to-end instead of mocking structlog.
+- `JsonlEventSink` — append-only JSONL writer. One file per run at `data/runs/<run_id>.jsonl`.
+- `FanoutEventSink` — broadcasts to multiple sinks, swallowing per-sink errors so a misbehaving consumer (e.g. a disconnected SSE client) cannot break the pipeline.
+
+The triage UI at `GET /app` surfaces this end-to-end:
+
+- `GET /api/issues?repo=&sort=reactions-+1|comments|interactions&label=&limit=` — ranked issue list. Live mode uses GitHub's Search API so the sort happens server-side; mock mode returns deterministic fixtures with synthetic reaction/comment counts. The same response shape and ordering contract in both.
+- `POST /api/run {repo, issue_number}` — picks the issue, converts it to `LogEvent(s)` via `issue_to_events`, **bypasses the recurrence threshold** (the user has explicitly chosen this issue), and runs the pipeline in a background thread. The handler returns a `text/event-stream` response that drains a queue into SSE frames as the events arrive. Each run is also persisted to JSONL via the fanout, so the demo is reproducible.
+- `GET /api/runs` — past-runs index (newest first by mtime), built by scanning `data/runs/*.jsonl` and summarising each.
+- `GET /api/runs/{run_id}` — full event stream of a past run, as JSON for replay or as SSE for an animated walkthrough.
+
+The frontend (`src/tvastr/api/templates/app.html`) is a single self-contained file: vanilla JS, no build step, no framework. Triage tab on the left with the ranked issue list; live pipeline pane on the right that streams events as collapsible cards (one-line summary by default; full prompt/response/diff on click). Past-runs tab provides replay. The architecture-strip at the top of the pipeline pane lights up the active layer as the agent moves through it.
+
+SSE was chosen over WebSocket for this surface because the stream is unidirectional, HTTP-native (no protocol upgrade, friendly to proxies), and consumable from vanilla `fetch()` without a client library. The user cancels by disconnecting.
+
+The full rationale and trade-offs are in [ADR-0004](adr/0004-live-pipeline-instrumentation-via-event-sinks.md).
+
+### 4.7 Verification loop
+
+A diff is not a fix. To make "the agent fixed it" mean something, every fix can be verified in a hermetic sandbox before being trusted. The verification module (`src/tvastr/verification/`) runs:
+
+1. **Synthesize a reproducer.** Prefer extracting a runnable Python block from the issue body; fall back to a Claude synthesis prompt that takes the exception class + traceback + suspected files. The result carries its source label (`issue_body` vs `claude`) so the UI shows where the repro came from.
+2. **Prepare a sandbox.** `DockerSandbox` (preferred) runs each command in a one-shot container with `--read-only --network=none --cap-drop=ALL --tmpfs=/tmp`. `SubprocessSandbox` is the fallback when Docker isn't installed; isolation is weaker but the contract is the same.
+3. **Baseline.** Run the reproducer pre-patch. If the original exception type isn't seen in stderr *and* the exit code is 0, the reproducer is wrong — verdict `no_repro`, fix recorded as **unverified**.
+4. **Apply the patch.** Write each `FileChange.patched_content` into the sandbox.
+5. **Re-run.** Run the reproducer post-patch.
+6. **Optional regression check.** If `TVASTR_VERIFY_PROJECT_ROOT` is configured, discover test files whose name or imports reference the changed files (`tests/test_<basename>.py`, files that `from <module>` the patched path), and run `pytest -q` on that slice in the sandbox.
+7. **Judge.** Produce a `Verdict` plus structured evidence. The verdict is *explicit about which oracle produced it* so the UI badge isn't ambiguous:
+
+| Verdict | Oracle | Meaning |
+| --- | --- | --- |
+| `verified_via_reproducer` | reproducer | Repro no longer raises + exit 0. Strongest. |
+| `verified_via_scoped_tests` | scoped_tests | Scoped tests pass (when repro alone is ambiguous). |
+| `unverified_smoke_import_only` | smoke_import | Patch applied, repro didn't crash but didn't give a clear signal. Honest. |
+| `no_repro` | none | Baseline didn't trigger the bug. |
+| `still_broken` | reproducer | Repro post-patch still raises. |
+| `regression` | scoped_tests | Repro passes but scoped tests fail. |
+| `environmental_error` | none | Sandbox or repro synthesis failed. |
+
+Every step emits a `verify.*` event into the same `EventSink` the rest of the pipeline uses, so verification streams live into the UI and appends to the same `data/runs/<run_id>.jsonl` as the agent events. The Past-runs table shows a `Verified?` column with the verdict label; a green badge always carries the explicit oracle name.
+
+In v1, verification is **user-triggered** from a "Verify this fix" button that appears on the live timeline after `pr.dry_run`. Once measured to be reliable, it moves onto the autonomous path between `generate_fix` and `draft_pr` (failure routes to `notify` rather than `draft_pr`). This deliberate two-step ship — described in [ADR-0005](adr/0005-verify-fix-loop.md) — lets us iterate on verifier reliability without silently degrading the agent.
 
 ## 5. Hybrid local/cloud LLM routing
 
@@ -166,16 +217,18 @@ LlamaIndex's namespace structure also gives the code-retrieval layer something t
 
 The schedule assumes ~10 hours/week and aggressive use of Claude Code for scaffolding, tests, and docs.
 
-**Weeks 1–2 — Foundation & MVP** *(in progress)*
+**Weeks 1–2 — Foundation & MVP** *(complete as of 2026-05-31)*
 - Project scaffolding, config, structured logging, domain models. ✅
-- Ingestion (simulated source + GitHub-issues harvester). ✅
+- Ingestion: simulated source, stdin source, GitHub-issues harvester, Loki harvester. ✅
 - Detection: fingerprint clustering, PII regex, threshold engine. ✅
-- Agent skeleton: investigate → reason → generate fix → draft PR → open PR → notify. ✅
-- Hybrid router with mock backends. ✅
-- First end-to-end demo against bundled sample logs. ✅
-- Dry-run mode + structured fix-generation with diff display. ✅
-- ADR-0001 (record decisions), ADR-0002 (hybrid routing). ✅
-- **Pivot the testbed to LlamaIndex:** replace bundled sample logs, default repo, mock paths, README copy. *(this turn)*
+- Agent: investigate → reason → confidence gate → generate fix → draft PR → open PR → notify. ✅
+- Hybrid router with mock + real backends. ✅
+- Audit storage: in-memory, file (default), OpenSearch. ✅
+- Dry-run mode + structured fix-generation with unified-diff display. ✅
+- LlamaIndex testbed (sample logs, mock paths, defaults). ✅
+- **Live triage UI:** `/app` with top-N issue ranking, SSE event streaming, persisted runs, replay. ✅
+- **Verification loop:** sandbox (Docker + subprocess), reproducer synth, baseline/rerun, scoped regression, honest verdict labels. ✅
+- ADR-0001 (record decisions), ADR-0002 (hybrid routing), ADR-0003 (LlamaIndex testbed), ADR-0004 (event sinks + SSE), ADR-0005 (verify-fix loop). ✅
 
 **Weeks 3–4 — Intelligence & hybrid routing**
 - Multi-turn agent reasoning (retry fix gen on validation failure; ask for diff with more context).

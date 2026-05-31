@@ -42,12 +42,25 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     claude_model: str = "claude-opus-4-7"
 
-    # --- Storage (OpenSearch) ---
+    # --- Audit storage ---
+    # "memory"  — in-process list; loses data on exit. Best for tests/ephemeral runs.
+    # "file"    — append-only JSONL on disk; zero infrastructure. Default.
+    # "opensearch" — production path; requires a reachable OpenSearch cluster.
+    audit_backend: Literal["memory", "file", "opensearch"] = "file"
+    audit_file_path: str = "data/audit/tvastr-audit.jsonl"
+
+    # --- Storage (OpenSearch) — used when audit_backend="opensearch" ---
     opensearch_url: str = "http://localhost:9200"
     opensearch_user: str = "admin"
     opensearch_password: str | None = None
     opensearch_log_index: str = "tvastr-logs"
     opensearch_audit_index: str = "tvastr-audit"
+
+    # --- Grafana Loki (optional log source; OSS, Apache-2.0, self-hostable) ---
+    loki_url: str | None = None              # e.g. http://localhost:3100
+    loki_query: str | None = None            # default LogQL query, e.g. '{app="myapp"} |= "Error"'
+    loki_user: str | None = Field(default=None, alias="LOKI_USER")
+    loki_password: str | None = Field(default=None, alias="LOKI_PASSWORD")
 
     # --- GitHub ---
     github_token: str | None = Field(default=None, alias="GITHUB_TOKEN")
@@ -60,6 +73,13 @@ class Settings(BaseSettings):
     # --- Detection thresholds ---
     recurrence_threshold: int = 3
     dedup_window_minutes: int = 60
+
+    # --- Verification ---
+    # Sandbox for the verify-fix loop. "auto" picks docker if available, else subprocess.
+    verify_sandbox: Literal["auto", "docker", "subprocess"] = "auto"
+    verify_docker_image: str = "tvastr-verify:llamaindex"
+    # Project root scanned for scoped regression tests. Empty disables that oracle.
+    verify_project_root: str = ""
 
 
 @lru_cache

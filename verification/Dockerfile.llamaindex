@@ -1,0 +1,23 @@
+# Base image for the verify-fix sandbox against the LlamaIndex testbed.
+#
+# Build once:    docker build -t tvastr-verify:llamaindex -f verification/Dockerfile.llamaindex .
+# Used by:       src/tvastr/verification/sandbox.py (DockerSandbox)
+#
+# Runtime constraints applied by the caller: --read-only --network=none
+# --cap-drop=ALL --tmpfs=/tmp. Synthesized reproducers run inside /work which
+# is a host-mounted temp dir; everything else on the filesystem is read-only.
+
+FROM python:3.11-slim
+
+# Minimum viable surface for the LlamaIndex bug shapes the agent targets:
+# the post-v0.10 split packages, a vector store, an embedding model, and
+# pytest for the scoped regression oracle.
+RUN pip install --no-cache-dir \
+      'llama-index>=0.10' \
+      'llama-index-llms-openai' \
+      'llama-index-vector-stores-chroma' \
+      'llama-index-embeddings-openai' \
+      'pytest>=8' \
+ && rm -rf /root/.cache/pip
+
+WORKDIR /work

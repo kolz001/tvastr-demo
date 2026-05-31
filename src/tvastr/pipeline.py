@@ -14,6 +14,7 @@ from tvastr.agent import AgentContext, RemediationAgent
 from tvastr.config import Settings, get_settings
 from tvastr.detection import FailureDetector, ThresholdEngine
 from tvastr.domain import AuditRecord, LogEvent
+from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.ingestion import LogSource, SimulatedLogSource
 from tvastr.ingestion.base import collect
 from tvastr.integrations import build_code_host, build_notifier
@@ -53,26 +54,84 @@ class RemediationPipeline:
         agent: RemediationAgent,
         audit_store: AuditStore,
         log_source: LogSource,
+        event_sink: EventSink | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.detector = detector
         self.threshold = threshold
         self.agent = agent
         self.audit_store = audit_store
         self.log_source = log_source
+        self.event_sink: EventSink = event_sink or NullEventSink()
+        self.run_id = run_id
 
-    def run(self, events: list[LogEvent] | None = None) -> PipelineRun:
+    def _emit(self, type_: str, step: str, layer: str = "ingestion", **payload: object) -> None:
+        self.event_sink.emit(
+            PipelineEvent(
+                type=type_,  # type: ignore[arg-type]
+                layer=layer,  # type: ignore[arg-type]
+                step=step,
+                run_id=self.run_id,
+                payload=dict(payload),
+            )
+        )
+
+    def run(
+        self, events: list[LogEvent] | None = None, *, run_meta: dict | None = None
+    ) -> PipelineRun:
+        self._emit("pipeline.start", "pipeline", **(run_meta or {}))
         if events is None:
             events = collect(self.log_source)
         events_by_id = {e.id: e for e in events}
+        self._emit(
+            "ingest.read",
+            "ingest",
+            count=len(events),
+            services=sorted({e.service for e in events}),
+        )
 
         patterns = self.detector.detect(events)
+        self._emit(
+            "detect.cluster",
+            "cluster",
+            layer="detection",
+            patterns=len(patterns),
+            breakdown=[
+                {"title": p.title, "count": p.count, "sensitivity": p.sensitivity.value}
+                for p in patterns
+            ],
+        )
+        sensitive = [p for p in patterns if p.sensitivity.value == "sensitive"]
+        if sensitive:
+            self._emit(
+                "detect.pii",
+                "pii_scan",
+                layer="detection",
+                count=len(sensitive),
+                patterns=[p.title for p in sensitive],
+            )
+
         selected = self.threshold.select(patterns)
+        self._emit(
+            "threshold.select",
+            "threshold",
+            layer="detection",
+            recurrence_threshold=self.threshold.recurrence_threshold,
+            selected=[p.title for p in selected],
+        )
 
         outcomes: list[PatternOutcome] = []
         for pattern in selected:
             sample_events = [
                 events_by_id[eid] for eid in pattern.sample_event_ids if eid in events_by_id
             ]
+            self._emit(
+                "agent.start",
+                "agent",
+                layer="agent",
+                pattern=pattern.fingerprint,
+                title=pattern.title,
+            )
             final = self.agent.run({"pattern": pattern, "sample_events": sample_events})
             self.threshold.mark_handled(pattern)
 
@@ -96,6 +155,14 @@ class RemediationPipeline:
                 notes=final.get("notes", ""),
             )
             self.audit_store.save(record)
+            self._emit(
+                "audit.saved",
+                "audit",
+                layer="output",
+                outcome=outcome_label,
+                pattern=pattern.fingerprint,
+                pull_request_url=audit_pr_url,
+            )
 
             outcomes.append(
                 PatternOutcome(
@@ -127,18 +194,36 @@ class RemediationPipeline:
             detected=run.patterns_detected,
             selected=run.patterns_selected,
         )
+        self._emit(
+            "pipeline.end",
+            "pipeline",
+            ingested=run.events_ingested,
+            detected=run.patterns_detected,
+            selected=run.patterns_selected,
+            outcome=(outcomes[0].outcome if outcomes else "no_patterns_selected"),
+        )
         return run
 
 
 def build_pipeline(
-    settings: Settings | None = None, *, log_source: LogSource | None = None
+    settings: Settings | None = None,
+    *,
+    log_source: LogSource | None = None,
+    event_sink: EventSink | None = None,
+    run_id: str | None = None,
 ) -> RemediationPipeline:
     settings = settings or get_settings()
+    sink = event_sink or NullEventSink()
     router = build_router(settings)
+    # Thread the sink + run_id into the router so its decisions and LLM calls emit too.
+    router.event_sink = sink
+    router.run_id = run_id
     ctx = AgentContext(
         router=router,
         code_host=build_code_host(settings),
         notifier=build_notifier(settings),
+        event_sink=sink,
+        run_id=run_id,
     )
     return RemediationPipeline(
         detector=FailureDetector(),
@@ -149,4 +234,6 @@ def build_pipeline(
         agent=RemediationAgent(ctx),
         audit_store=build_audit_store(settings),
         log_source=log_source or SimulatedLogSource(),
+        event_sink=sink,
+        run_id=run_id,
     )

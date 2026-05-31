@@ -61,7 +61,7 @@ def test_harvest_writes_jsonl_and_pipeline_can_replay(tmp_path: Path) -> None:
     assert events >= 2  # the feature-request issue contributes no events
     assert out.exists() and out.stat().st_size > 0
 
-    settings = Settings(use_mocks=True, recurrence_threshold=2)
+    settings = Settings(use_mocks=True, audit_backend="memory", recurrence_threshold=2)
     run = build_pipeline(settings, log_source=SimulatedLogSource(out)).run()
     assert run.events_ingested == events
     # The mock fetcher emits two issues sharing a ModuleNotFoundError signature

@@ -4,20 +4,22 @@ from tvastr.pipeline import build_pipeline
 
 
 def test_build_code_host_wraps_when_dry_run_set() -> None:
-    settings = Settings(use_mocks=True, dry_run=True)
+    settings = Settings(use_mocks=True, audit_backend="memory", dry_run=True)
     host = build_code_host(settings)
     assert isinstance(host, DryRunCodeHost)
     assert isinstance(host.inner, MockGitHubClient)
 
 
 def test_build_code_host_unwrapped_when_dry_run_false() -> None:
-    settings = Settings(use_mocks=True, dry_run=False)
+    settings = Settings(use_mocks=True, audit_backend="memory", dry_run=False)
     host = build_code_host(settings)
     assert not isinstance(host, DryRunCodeHost)
 
 
 def test_pipeline_in_dry_run_records_draft_but_opens_no_pr() -> None:
-    settings = Settings(use_mocks=True, dry_run=True, recurrence_threshold=3)
+    settings = Settings(
+        use_mocks=True, audit_backend="memory", dry_run=True, recurrence_threshold=3
+    )
     pipeline = build_pipeline(settings)
     run = pipeline.run()
 
@@ -45,7 +47,9 @@ def test_pipeline_in_dry_run_records_draft_but_opens_no_pr() -> None:
 
 
 def test_dry_run_url_uses_sentinel_scheme() -> None:
-    settings = Settings(use_mocks=True, dry_run=True, recurrence_threshold=3)
+    settings = Settings(
+        use_mocks=True, audit_backend="memory", dry_run=True, recurrence_threshold=3
+    )
     host = build_code_host(settings)
     assert isinstance(host, DryRunCodeHost)
 

@@ -43,6 +43,13 @@ class IssueRecord:
     created_at: datetime
     url: str
     labels: list[str]
+    reactions: int = 0           # total reactions across all types
+    thumbs_up: int = 0           # 👍 reactions specifically — the cleanest "this affects me" signal
+    comments: int = 0            # comment count
+
+    @property
+    def interactions(self) -> int:
+        return self.reactions + self.comments
 
 
 def _extract_error_signatures(text: str) -> list[tuple[str, str]]:
@@ -125,17 +132,98 @@ class GitHubIssuesFetcher:
         self.repo = repo
         self.token = token
 
-    def fetch(self, *, label: str = "bug", limit: int = 50) -> list[IssueRecord]:
-        from github import Github  # lazy import — only needed in live mode
+    def fetch(
+        self, *, label: str = "bug", limit: int = 50, sort: str | None = None
+    ) -> list[IssueRecord]:
+        """Fetch issues; optionally sort via GitHub Search API.
+
+        ``sort`` accepts any value the Search API supports:
+        ``"reactions-+1"`` (👍 desc), ``"comments"`` (desc), ``"interactions"``,
+        ``"reactions"`` (total), ``"created"``, ``"updated"``. When ``None`` we
+        use the regular Issues API (faster, unsorted).
+
+        Sorted fetches use httpx against the REST Search API directly because
+        PyGithub's ``search_issues`` rejects ``reactions-*`` and ``interactions``
+        with a client-side assertion even though the API accepts them.
+        """
+        log.info(
+            "ingest.github_issues.fetch",
+            repo=self.repo,
+            label=label,
+            limit=limit,
+            sort=sort,
+        )
+        if sort:
+            return self._fetch_via_search_api(label=label, limit=limit, sort=sort)
+        return self._fetch_via_pygithub(label=label, limit=limit)
+
+    def _fetch_via_search_api(
+        self, *, label: str, limit: int, sort: str
+    ) -> list[IssueRecord]:
+        import httpx
+
+        query = f"repo:{self.repo} is:issue is:open label:{label}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        params = {
+            "q": query,
+            "sort": sort,
+            "order": "desc",
+            "per_page": str(min(limit, 100)),
+        }
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(
+                "https://api.github.com/search/issues", headers=headers, params=params
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+        records: list[IssueRecord] = []
+        for item in payload.get("items", [])[:limit]:
+            reactions = item.get("reactions") or {}
+            records.append(
+                IssueRecord(
+                    number=int(item["number"]),
+                    title=item.get("title") or "",
+                    body=item.get("body") or "",
+                    created_at=_parse_iso(item.get("created_at")) or datetime.now(UTC),
+                    url=item.get("html_url") or "",
+                    labels=[
+                        lab["name"]
+                        for lab in (item.get("labels") or [])
+                        if isinstance(lab, dict) and "name" in lab
+                    ],
+                    reactions=int(reactions.get("total_count", 0)),
+                    thumbs_up=int(reactions.get("+1", 0)),
+                    comments=int(item.get("comments", 0) or 0),
+                )
+            )
+        return records
+
+    def _fetch_via_pygithub(self, *, label: str, limit: int) -> list[IssueRecord]:
+        from github import Github
 
         gh = Github(self.token) if self.token else Github()
         repo = gh.get_repo(self.repo)
-        log.info("ingest.github_issues.fetch", repo=self.repo, label=label, limit=limit)
+        paged = repo.get_issues(state="all", labels=[label])
 
         records: list[IssueRecord] = []
-        for issue in repo.get_issues(state="all", labels=[label]):
+        for issue in paged:
             if issue.pull_request is not None:
-                continue  # PRs masquerade as issues in the API
+                continue
+            reactions_obj = getattr(issue, "reactions", None) or {}
+            total_reactions = (
+                int(reactions_obj.get("total_count", 0))
+                if isinstance(reactions_obj, dict)
+                else 0
+            )
+            thumbs_up = (
+                int(reactions_obj.get("+1", 0)) if isinstance(reactions_obj, dict) else 0
+            )
             records.append(
                 IssueRecord(
                     number=issue.number,
@@ -146,11 +234,23 @@ class GitHubIssuesFetcher:
                     else issue.created_at,
                     url=issue.html_url,
                     labels=[lbl.name for lbl in issue.labels],
+                    reactions=total_reactions,
+                    thumbs_up=thumbs_up,
+                    comments=int(getattr(issue, "comments", 0) or 0),
                 )
             )
             if len(records) >= limit:
                 break
         return records
+
+
+def _parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class MockGitHubIssuesFetcher:
@@ -159,8 +259,10 @@ class MockGitHubIssuesFetcher:
     def __init__(self, repo: str = "run-llama/llama_index") -> None:
         self.repo = repo
 
-    def fetch(self, *, label: str = "bug", limit: int = 50) -> list[IssueRecord]:
-        log.info("ingest.github_issues.fetch", repo=self.repo, mocked=True)
+    def fetch(
+        self, *, label: str = "bug", limit: int = 50, sort: str | None = None
+    ) -> list[IssueRecord]:
+        log.info("ingest.github_issues.fetch", repo=self.repo, sort=sort, mocked=True)
         base = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
         all_records = [
             IssueRecord(
@@ -175,6 +277,9 @@ class MockGitHubIssuesFetcher:
                 created_at=base,
                 url=f"https://github.com/{self.repo}/issues/8001",
                 labels=["bug", "topic:llm:openai"],
+                reactions=87,
+                thumbs_up=64,
+                comments=42,
             ),
             IssueRecord(
                 number=8002,
@@ -186,6 +291,9 @@ class MockGitHubIssuesFetcher:
                 created_at=base,
                 url=f"https://github.com/{self.repo}/issues/8002",
                 labels=["bug", "topic:llm:openai"],
+                reactions=23,
+                thumbs_up=18,
+                comments=11,
             ),
             IssueRecord(
                 number=8010,
@@ -198,6 +306,9 @@ class MockGitHubIssuesFetcher:
                 created_at=base,
                 url=f"https://github.com/{self.repo}/issues/8010",
                 labels=["bug", "topic:vector_stores"],
+                reactions=45,
+                thumbs_up=38,
+                comments=19,
             ),
             IssueRecord(
                 number=8050,
@@ -206,9 +317,32 @@ class MockGitHubIssuesFetcher:
                 created_at=base,
                 url=f"https://github.com/{self.repo}/issues/8050",
                 labels=["feature-request"],
+                reactions=12,
+                thumbs_up=10,
+                comments=3,
             ),
         ]
-        return all_records[:limit]
+        sorted_records = _sort_records(all_records, sort)
+        return sorted_records[:limit]
+
+
+def _sort_records(records: list[IssueRecord], sort: str | None) -> list[IssueRecord]:
+    """Mirror the GitHub Search API sort options on a local list."""
+    if not sort:
+        return list(records)
+    if sort == "reactions-+1":
+        key = lambda r: r.thumbs_up  # noqa: E731
+    elif sort == "comments":
+        key = lambda r: r.comments  # noqa: E731
+    elif sort == "interactions":
+        key = lambda r: r.interactions  # noqa: E731
+    elif sort == "reactions":
+        key = lambda r: r.reactions  # noqa: E731
+    elif sort == "created" or sort == "updated":
+        key = lambda r: r.created_at.timestamp()  # noqa: E731
+    else:
+        return list(records)
+    return sorted(records, key=key, reverse=True)
 
 
 def harvest_issues_to_jsonl(

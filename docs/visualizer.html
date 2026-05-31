@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tvastr — pipeline visualizer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1419;
+    --surface: #161b22;
+    --surface-2: #1c232c;
+    --border: #2a3340;
+    --text: #d8dde6;
+    --text-dim: #8b96a6;
+    --accent: #58c8b0;       /* teal */
+    --accent-2: #f0b86e;     /* amber */
+    --cloud: #7aa7ff;
+    --local: #c195e8;
+    --rule: #8b96a6;
+    --error: #ef6f6f;
+    --ok: #58c8b0;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  body { min-height: 100vh; padding: 24px; }
+  a { color: var(--accent); }
+  header { max-width: 1280px; margin: 0 auto 20px; }
+  header h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
+  header .tag { color: var(--text-dim); font-size: 13px; }
+  header .tag b { color: var(--text); font-weight: 600; }
+
+  .layout {
+    max-width: 1280px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    gap: 20px;
+  }
+  @media (max-width: 980px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+
+  /* Pipeline strip */
+  .strip {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 4px;
+    padding: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+  .strip .pill {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font: 600 11px var(--mono);
+    color: var(--text-dim);
+    border-radius: 4px;
+    background: transparent;
+    border: 1px solid transparent;
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }
+  .strip .pill:hover { color: var(--text); }
+  .strip .pill.done { color: var(--text); }
+  .strip .pill.done::before { content: "✓"; color: var(--ok); }
+  .strip .pill.active {
+    color: var(--bg);
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .strip .pill.active::before { content: "▶"; }
+  .strip .layer-tag {
+    font: 600 9px var(--mono);
+    color: var(--text-dim);
+    opacity: 0.7;
+    margin-left: 2px;
+  }
+
+  /* Card / panel */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+  }
+  .panel h2 {
+    margin: 0 0 4px;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .panel .layer {
+    display: inline-block;
+    font: 600 10px var(--mono);
+    color: var(--text-dim);
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 12px;
+  }
+  .panel .desc {
+    color: var(--text-dim);
+    font-size: 14px;
+    line-height: 1.55;
+    margin-bottom: 14px;
+  }
+  .panel .desc b { color: var(--text); font-weight: 600; }
+
+  .codepath {
+    font: 500 11px var(--mono);
+    color: var(--accent);
+    background: rgba(88, 200, 176, 0.07);
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: inline-block;
+    margin-bottom: 14px;
+  }
+
+  .io {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .io .box {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .io .box-label {
+    font: 600 10px var(--mono);
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+  .io pre {
+    margin: 0;
+    font: 12.5px/1.55 var(--mono);
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .io .diff .add { color: #98c379; }
+  .io .diff .sub { color: #ef6f6f; }
+  .io .diff .hunk { color: var(--text-dim); }
+
+  /* Routing badge */
+  .route {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    font: 600 10px var(--mono);
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-right: 4px;
+  }
+  .route.local { background: rgba(193, 149, 232, 0.13); color: var(--local); border: 1px solid rgba(193, 149, 232, 0.3); }
+  .route.cloud { background: rgba(122, 167, 255, 0.13); color: var(--cloud); border: 1px solid rgba(122, 167, 255, 0.3); }
+  .route.rule  { background: rgba(139, 150, 166, 0.13); color: var(--rule);  border: 1px solid rgba(139, 150, 166, 0.3); }
+  .route .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* Controls */
+  .controls {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .controls .left { display: flex; gap: 8px; align-items: center; }
+  .controls button {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 7px 14px;
+    font: 600 12px var(--sans);
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }
+  .controls button:hover { background: var(--border); }
+  .controls button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .controls button.primary:hover { background: #69d1bb; border-color: #69d1bb; }
+  .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .controls .stepno { font: 600 12px var(--mono); color: var(--text-dim); }
+
+  /* Architecture panel */
+  .arch {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .arch h2 { margin: 0 0 6px; font-size: 14px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  .arch .layer-box {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    transition: all 0.2s ease;
+  }
+  .arch .layer-box.hot {
+    border-left-color: var(--accent);
+    background: rgba(88, 200, 176, 0.06);
+  }
+  .arch .layer-box .name { font: 600 12px var(--mono); color: var(--text); text-transform: uppercase; letter-spacing: 0.05em; }
+  .arch .layer-box .sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; line-height: 1.4; }
+  .arch .layer-box .nodes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .arch .layer-box .node-pill {
+    font: 600 10px var(--mono);
+    padding: 2px 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-dim);
+    transition: all 0.15s ease;
+  }
+  .arch .layer-box .node-pill.hot {
+    background: var(--accent);
+    color: var(--bg);
+    border-color: var(--accent);
+  }
+
+  /* Routing log */
+  .routing-log {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 230px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .routing-log .entry {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 8px 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font-size: 12px;
+  }
+  .routing-log .entry .task {
+    font: 600 11px var(--mono);
+    color: var(--text);
+    min-width: 110px;
+  }
+  .routing-log .entry .reason {
+    color: var(--text-dim);
+    line-height: 1.45;
+  }
+
+  footer {
+    max-width: 1280px;
+    margin: 24px auto 0;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+  footer code { font: 11px var(--mono); background: var(--surface); padding: 2px 6px; border-radius: 3px; color: var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>tvastr — autonomous code remediation agent</h1>
+  <div class="tag">Watching <b>run-llama/llama_index</b> · hybrid <b>local + cloud</b> LLM routing · <b>dry-run</b> mode</div>
+  <div class="tag" style="margin-top:6px;color:var(--accent)">
+    Looking for the <b>live</b> version? Run <code style="background:var(--surface);padding:1px 5px;border-radius:3px;font:11px var(--mono);color:var(--text)">make run</code> and open
+    <a href="http://localhost:8000/app" style="color:var(--accent)">/app</a> —
+    same flow, real issues from any repo, real Claude diffs, persisted past runs.
+  </div>
+</header>
+
+<div class="layout">
+  <div id="strip" class="strip"></div>
+
+  <section id="step-panel" class="panel">
+    <div class="layer" id="step-layer">—</div>
+    <h2 id="step-title">—</h2>
+    <div class="codepath" id="step-codepath">—</div>
+    <div class="desc" id="step-desc">—</div>
+    <div class="io">
+      <div class="box">
+        <div class="box-label">Input</div>
+        <pre id="step-in">—</pre>
+      </div>
+      <div class="box">
+        <div class="box-label">Output</div>
+        <pre id="step-out">—</pre>
+      </div>
+    </div>
+  </section>
+
+  <aside class="panel arch">
+    <h2>Architecture</h2>
+    <div id="layer-ingest" class="layer-box">
+      <div class="name">1 · Ingestion</div>
+      <div class="sub">Log sources → uniform LogEvent shape</div>
+      <div class="nodes">
+        <span class="node-pill" data-node="ingest">SimulatedLogSource</span>
+        <span class="node-pill" data-node="ingest">CloudWatch (prod)</span>
+        <span class="node-pill" data-node="ingest">GitHub issues harvester</span>
+      </div>
+    </div>
+    <div id="layer-detection" class="layer-box">
+      <div class="name">2 · Detection</div>
+      <div class="sub">Fingerprint clustering · PII scan · threshold</div>
+      <div class="nodes">
+        <span class="node-pill" data-node="cluster">cluster_events</span>
+        <span class="node-pill" data-node="pii">PII regex</span>
+        <span class="node-pill" data-node="threshold">ThresholdEngine</span>
+      </div>
+    </div>
+    <div id="layer-agent" class="layer-box">
+      <div class="name">3 · Agentic reasoning</div>
+      <div class="sub">LangGraph state machine · hybrid LLM router</div>
+      <div class="nodes">
+        <span class="node-pill" data-node="investigate">investigate</span>
+        <span class="node-pill" data-node="reason">reason_root_cause</span>
+        <span class="node-pill" data-node="gate">confidence_gate</span>
+        <span class="node-pill" data-node="fix">generate_fix</span>
+        <span class="node-pill" data-node="draft">draft_pr</span>
+      </div>
+    </div>
+    <div id="layer-output" class="layer-box">
+      <div class="name">4 · Output</div>
+      <div class="sub">GitHub PR (draft) · audit log · Slack</div>
+      <div class="nodes">
+        <span class="node-pill" data-node="open">open_pr (or dry-run)</span>
+        <span class="node-pill" data-node="audit">audit → OpenSearch</span>
+        <span class="node-pill" data-node="notify">slack notify</span>
+      </div>
+    </div>
+
+    <h2 style="margin-top:14px">Routing decisions this run</h2>
+    <div id="routing-log" class="routing-log">
+      <div class="entry"><span class="task">—</span><span class="reason">No decisions yet. Press <b>Play</b>.</span></div>
+    </div>
+  </aside>
+
+  <div class="controls">
+    <div class="left">
+      <button id="btn-restart">⟲ Restart</button>
+      <button id="btn-prev">◀ Step back</button>
+      <button id="btn-next" class="primary">Step forward ▶</button>
+      <button id="btn-play">▶ Auto-play</button>
+    </div>
+    <div class="stepno"><span id="stepno-text">0 / 0</span></div>
+  </div>
+</div>
+
+<footer>
+  Backed by the real code at <code>src/tvastr/pipeline.py</code> · sample data from <code>data/sample_logs/llamaindex_failures.jsonl</code>.
+  Open <code>docs/design-doc.md</code> for the full architecture write-up.
+</footer>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// The story this visualizer tells:
+//   15 LlamaIndex-flavoured failure events arrive → cluster into 6 patterns →
+//   3 clear the recurrence threshold → the agent picks the
+//   ModuleNotFoundError pattern (post-v0.10 namespace split) → investigates →
+//   reasons via Claude → confidence gate passes → generates a real
+//   search/replace fix → drafts a PR → dry-run intercepts the actual GitHub
+//   call → Slack notify.
+//
+// Each step below mirrors the real call sequence and surfaces the data that
+// the actual Python pipeline produces. Routing decisions are added to the
+// log exactly when the real router would emit them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SAMPLE_EVENT = {
+  timestamp: "2026-05-24T09:01:12Z",
+  service: "llamaindex-app",
+  severity: "error",
+  message: "ModuleNotFoundError: No module named 'llama_index.llms.openai'",
+  stack_trace:
+    "Traceback (most recent call last):\n" +
+    "  File \"app/rag.py\", line 12, in <module>\n" +
+    "    from llama_index.llms.openai import OpenAI\n" +
+    "ModuleNotFoundError: No module named 'llama_index.llms.openai'",
+  attributes: { phase: "import", v0_10_split: "true" },
+  source: "simulated"
+};
+
+const STEPS = [
+  {
+    id: "ingest",
+    layer: "1 · Ingestion",
+    nodes: ["ingest"],
+    title: "Ingest log events from the source",
+    codepath: "src/tvastr/ingestion/simulated.py · SimulatedLogSource.read()",
+    desc: "The <b>SimulatedLogSource</b> replays a bundled JSONL of LlamaIndex-flavoured failures. In production the source is a Lambda fed by CloudWatch → EventBridge → SQS. Either way the rest of the pipeline sees a uniform <b>LogEvent</b>.",
+    input: "data/sample_logs/llamaindex_failures.jsonl  (15 lines)",
+    output: JSON.stringify(SAMPLE_EVENT, null, 2),
+    routing: []
+  },
+  {
+    id: "cluster",
+    layer: "2 · Detection",
+    nodes: ["cluster"],
+    title: "Fingerprint + cluster recurring failures",
+    codepath: "src/tvastr/detection/clustering.py · cluster_events()",
+    desc: "Each event's message is normalised (UUIDs, hex, numbers, quoted literals stripped) and hashed with <b>service | exception_type | normalised_message</b>. The same failure with different runtime IDs collapses into one <b>FailurePattern</b>.",
+    input: "15 LogEvents (3× ModuleNotFoundError, 4× RateLimitError, 3× ServiceContext, 2× ValidationError, 2× dim mismatch, 1× event-loop, 1× PII conn error)",
+    output:
+`6 FailurePatterns:
+  • ModuleNotFoundError in llamaindex-app          count=3
+  • RateLimitError in llamaindex-llm               count=4
+  • DeprecationWarning in llamaindex-settings      count=3
+  • ValidationError in llamaindex-query            count=2
+  • ValueError(dim mismatch) in llamaindex-vector  count=2
+  • RuntimeError(event-loop) in llamaindex-agent   count=1`,
+    routing: [
+      { task: "log_parsing", target: "local", reason: "sensitive data, runs on Ollama — never crosses the boundary" }
+    ]
+  },
+  {
+    id: "pii",
+    layer: "2 · Detection",
+    nodes: ["pii"],
+    title: "PII regex tags one pattern as SENSITIVE",
+    codepath: "src/tvastr/pii/redaction.py · contains_pii()",
+    desc: "One event in this batch carries an email + an API-key-shaped string. The regex PII scan marks its pattern as <b>Sensitivity.SENSITIVE</b>; this becomes the input to the hybrid router. (A local-model classifier will replace the regex in a later milestone.)",
+    input:
+`"ConnectionError: failed to connect to OpenSearch at
+ https://user@search.internal:9200 for user
+ jane.doe@example.com token sk-ant-REDACTEDABC123"`,
+    output:
+`Pattern flagged SENSITIVE; redacted payload:
+  "ConnectionError: failed to connect to OpenSearch at
+   <CREDENTIAL_URL> for user <EMAIL> token <API_KEY>"
+Detected: EMAIL, API_KEY, CREDENTIAL_URL, IP`,
+    routing: []
+  },
+  {
+    id: "threshold",
+    layer: "2 · Detection",
+    nodes: ["threshold"],
+    title: "Threshold engine picks recurring patterns",
+    codepath: "src/tvastr/detection/threshold.py · ThresholdEngine.select()",
+    desc: "Only patterns recurring ≥ <b>3</b> times in the dedup window are escalated to the agent. Singletons (one event-loop bug) and below-threshold patterns (dim mismatch ×2) are held back; previously-handled patterns are tracked so the agent doesn't re-fix what's already in flight.",
+    input: "6 FailurePatterns, recurrence_threshold=3",
+    output:
+`3 patterns selected:
+  • ModuleNotFoundError in llamaindex-app   (3×)
+  • RateLimitError in llamaindex-llm        (4×)
+  • DeprecationWarning in llamaindex-settings (3×)`,
+    routing: [
+      { task: "threshold_check", target: "rule", reason: "deterministic count comparison; no LLM needed" }
+    ]
+  },
+  {
+    id: "investigate",
+    layer: "3 · Agentic reasoning",
+    nodes: ["investigate"],
+    title: "Investigate: extract files, fetch source",
+    codepath: "src/tvastr/agent/graph.py · RemediationAgent._investigate()",
+    desc: "We pick the <b>ModuleNotFoundError</b> pattern to drill into. <b>extract_stack_files()</b> regex-parses the stack trace to find suspected files; <b>get_file()</b> reads each one from GitHub (mock paths shown here; live mode calls PyGithub).",
+    input:
+`Pattern: ModuleNotFoundError in llamaindex-app
+Stack: File "app/rag.py", line 12
+       from llama_index.llms.openai import OpenAI`,
+    output:
+`suspected_files: ["app/rag.py"]
+code_files (1 file retrieved from run-llama/llama_index):
+  app/rag.py
+    """RAG entry point."""
+    from llama_index.llms.openai import OpenAI
+    from llama_index.core import VectorStoreIndex
+    ...`,
+    routing: []
+  },
+  {
+    id: "reason",
+    layer: "3 · Agentic reasoning",
+    nodes: ["reason"],
+    title: "Reason about root cause (Claude)",
+    codepath: "src/tvastr/agent/graph.py · RemediationAgent._reason_root_cause()",
+    desc: "The agent sends the pattern + the retrieved source to <b>Claude</b> via the hybrid router. Sensitivity here is INTERNAL → the router escalates to cloud. Confidence is set high (0.8) because the stack trace produced concrete suspected files.",
+    input:
+`Prompt to Claude:
+  Title: ModuleNotFoundError in llamaindex-app
+  Message: ModuleNotFoundError: No module named 'llama_index.llms.openai'
+  Suspected files: app/rag.py
+  Code context: <retrieved source>
+  Explain the most likely root cause in 2-3 sentences.`,
+    output:
+`RootCause(
+  summary="LlamaIndex's v0.10 split moved provider integrations into
+    separate subpackages (\`llama-index-llms-openai\`, etc.). The legacy
+    import path \`from llama_index.llms.openai import OpenAI\` only
+    works if that package is installed; the bare-metal \`llama-index\`
+    install no longer ships it.",
+  confidence=0.8,
+  suspected_files=["app/rag.py"]
+)`,
+    routing: [
+      { task: "root_cause", target: "cloud", reason: "complex multi-step reasoning, redacted payload" }
+    ]
+  },
+  {
+    id: "gate",
+    layer: "3 · Agentic reasoning",
+    nodes: ["gate"],
+    title: "Confidence gate decides act vs. skip",
+    codepath: "src/tvastr/agent/graph.py · _confidence_gate()",
+    desc: "If confidence is below <b>min_confidence (0.5)</b> the agent escalates to a human via Slack instead of opening a PR — the safety valve that keeps low-quality fixes off the queue. Here 0.8 ≥ 0.5 so we proceed to fix generation.",
+    input: "confidence = 0.8, min_confidence = 0.5",
+    output: "→ act  (proceed to generate_fix)",
+    routing: []
+  },
+  {
+    id: "fix",
+    layer: "3 · Agentic reasoning",
+    nodes: ["fix"],
+    title: "Generate fix as structured JSON, apply, diff",
+    codepath: "src/tvastr/agent/tools/fix_generation.py · generate_fix()",
+    desc: "Claude is asked for JSON with <b>{path, search, replace, rationale}</b> ops. Each op is validated (search string must appear exactly once in the retrieved file), applied via <b>str.replace</b>, and rendered as a unified diff via <b>difflib</b>. The pipeline degrades to a placeholder if anything fails — it never crashes on a bad model response.",
+    input:
+`Asked Claude for surgical search/replace ops on app/rag.py.
+Response (JSON):
+{
+  "summary": "Migrate the OpenAI LLM import to the post-v0.10
+              subpackage path.",
+  "changes": [
+    {
+      "path": "app/rag.py",
+      "search": "from llama_index.llms.openai import OpenAI",
+      "replace": "# requires \`pip install llama-index-llms-openai\`\\nfrom llama_index.llms.openai import OpenAI",
+      "rationale": "Document the install requirement at the import site."
+    }
+  ],
+  "test_plan": "Run the RAG entrypoint in a clean venv after \`pip install llama-index llama-index-llms-openai\`."
+}`,
+    output:
+`Validated 1/1 ops. Applied to app/rag.py. Diff:
+  <span class="hunk">--- a/app/rag.py</span>
+  <span class="hunk">+++ b/app/rag.py</span>
+  <span class="hunk">@@ -10,3 +10,4 @@</span>
+   """RAG entry point."""
+  <span class="sub">-from llama_index.llms.openai import OpenAI</span>
+  <span class="add">+# requires \`pip install llama-index-llms-openai\`</span>
+  <span class="add">+from llama_index.llms.openai import OpenAI</span>
+   from llama_index.core import VectorStoreIndex`,
+    outputHtml: true,
+    routing: [
+      { task: "fix_generation", target: "cloud", reason: "code generation needs frontier-model accuracy" }
+    ]
+  },
+  {
+    id: "draft",
+    layer: "3 · Agentic reasoning",
+    nodes: ["draft"],
+    title: "Draft the pull request",
+    codepath: "src/tvastr/agent/graph.py · RemediationAgent._draft_pr()",
+    desc: "Claude writes the PR body; the pipeline templates it with the root cause and test plan, sets a deterministic branch name keyed off the failure fingerprint, and packages everything as a <b>PullRequestDraft</b>.",
+    input: "FixProposal + RootCause + pattern title",
+    output:
+`PullRequestDraft(
+  title="fix: ModuleNotFoundError in llamaindex-app",
+  branch="tvastr/fix-70cb97c0b79c",
+  base="main",
+  body="""## Summary
+Migrate the OpenAI LLM import to the post-v0.10 subpackage path so
+the entrypoint works on a fresh \`pip install llama-index\` without
+silently relying on a legacy import.
+
+## Root cause
+LlamaIndex's v0.10 split moved provider integrations into separate
+subpackages…
+
+## Test plan
+Run the RAG entrypoint in a clean venv after
+\`pip install llama-index llama-index-llms-openai\`.
+
+---
+_Opened automatically by tvastr from 3 recurring failures
+(fingerprint \`70cb97c0b79c\`)._"""
+)`,
+    routing: [
+      { task: "pr_description", target: "cloud", reason: "natural-language quality matters" }
+    ]
+  },
+  {
+    id: "open",
+    layer: "4 · Output",
+    nodes: ["open"],
+    title: "Open PR — intercepted by dry-run",
+    codepath: "src/tvastr/integrations/github.py · DryRunCodeHost.open_pull_request()",
+    desc: "Because <b>TVASTR_DRY_RUN=true</b>, the <b>DryRunCodeHost</b> decorator intercepts the call. Reads (search_code, get_file) passed through to the real code host; only the <b>create_pull</b> side-effect is suppressed. The draft is captured for inspection and a sentinel result is returned.",
+    input: "PullRequestDraft (from previous step)",
+    output:
+`PullRequestResult(
+  url="dry-run://run-llama/llama_index/tvastr/fix-70cb97c0b79c",
+  branch="tvastr/fix-70cb97c0b79c",
+  created=False,
+  dry_run=True,
+)
+→ outcome = "dry_run"   (no branch, no commit, no PR was created)`,
+    routing: []
+  },
+  {
+    id: "notify",
+    layer: "4 · Output",
+    nodes: ["notify", "audit"],
+    title: "Audit + Slack notify",
+    codepath: "src/tvastr/pipeline.py · AuditRecord saved · slack_notify.send_notification()",
+    desc: "Every routing decision and outcome is persisted to OpenSearch as an immutable <b>AuditRecord</b>. Slack gets a one-liner that makes the dry-run obvious so reviewers don't mistake it for a real PR.",
+    input: "AuditRecord + outcome",
+    output:
+`audit.save  → outcome=dry_run, pull_request_url=None
+slack.notify → :construction: tvastr [DRY-RUN] would open PR for
+               *ModuleNotFoundError in llamaindex-app* — 1 file(s):
+               app/rag.py
+
+Pipeline complete. Re-run without --dry-run to go live (against your fork).`,
+    routing: []
+  }
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Render
+// ─────────────────────────────────────────────────────────────────────────────
+
+const $ = (id) => document.getElementById(id);
+const strip = $("strip");
+const log = $("routing-log");
+
+let stepIdx = 0;
+let playTimer = null;
+let cumulativeRouting = [];
+
+function buildStrip() {
+  strip.innerHTML = "";
+  STEPS.forEach((s, i) => {
+    const pill = document.createElement("div");
+    pill.className = "pill";
+    pill.dataset.idx = i;
+    pill.innerHTML = `${s.id}<span class="layer-tag">${s.layer.split(" · ")[0]}</span>`;
+    pill.addEventListener("click", () => goTo(i));
+    strip.appendChild(pill);
+  });
+}
+
+function setHotLayer(layerName) {
+  ["ingest", "detection", "agent", "output"].forEach((k) => {
+    const el = $(`layer-${k}`);
+    if (!el) return;
+    el.classList.toggle("hot", layerName.startsWith(k === "ingest" ? "1" : k === "detection" ? "2" : k === "agent" ? "3" : "4"));
+  });
+}
+
+function setHotNodes(nodes) {
+  document.querySelectorAll(".node-pill").forEach((p) => {
+    p.classList.toggle("hot", nodes.includes(p.dataset.node));
+  });
+}
+
+function rebuildRoutingLog() {
+  log.innerHTML = "";
+  if (cumulativeRouting.length === 0) {
+    log.innerHTML = `<div class="entry"><span class="task">—</span><span class="reason">No decisions yet. Press <b>Step forward</b>.</span></div>`;
+    return;
+  }
+  cumulativeRouting.forEach((r) => {
+    const entry = document.createElement("div");
+    entry.className = "entry";
+    entry.innerHTML = `
+      <span class="task"><span class="route ${r.target}"><span class="dot"></span>${r.target}</span></span>
+      <span class="reason"><b>${r.task}</b> — ${r.reason}</span>
+    `;
+    log.appendChild(entry);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+
+function render() {
+  const s = STEPS[stepIdx];
+  $("step-layer").textContent = s.layer;
+  $("step-title").textContent = s.title;
+  $("step-codepath").textContent = s.codepath;
+  $("step-desc").innerHTML = s.desc;
+  $("step-in").textContent = s.input;
+  if (s.outputHtml) {
+    $("step-out").innerHTML = s.output;
+    $("step-out").classList.add("diff");
+  } else {
+    $("step-out").textContent = s.output;
+    $("step-out").classList.remove("diff");
+  }
+
+  setHotLayer(s.layer);
+  setHotNodes(s.nodes || []);
+
+  // Pipeline strip
+  document.querySelectorAll(".strip .pill").forEach((p, i) => {
+    p.classList.toggle("active", i === stepIdx);
+    p.classList.toggle("done", i < stepIdx);
+  });
+
+  // Routing log (cumulative through this step)
+  cumulativeRouting = [];
+  STEPS.slice(0, stepIdx + 1).forEach((s) => {
+    (s.routing || []).forEach((r) => cumulativeRouting.push(r));
+  });
+  rebuildRoutingLog();
+
+  // Step counter + button state
+  $("stepno-text").textContent = `${stepIdx + 1} / ${STEPS.length}`;
+  $("btn-prev").disabled = stepIdx === 0;
+  $("btn-next").disabled = stepIdx === STEPS.length - 1;
+}
+
+function goTo(i) {
+  stepIdx = Math.max(0, Math.min(STEPS.length - 1, i));
+  render();
+}
+
+function stopPlay() {
+  if (playTimer) {
+    clearInterval(playTimer);
+    playTimer = null;
+    $("btn-play").textContent = "▶ Auto-play";
+  }
+}
+
+$("btn-prev").addEventListener("click", () => { stopPlay(); goTo(stepIdx - 1); });
+$("btn-next").addEventListener("click", () => { stopPlay(); goTo(stepIdx + 1); });
+$("btn-restart").addEventListener("click", () => { stopPlay(); goTo(0); });
+$("btn-play").addEventListener("click", () => {
+  if (playTimer) { stopPlay(); return; }
+  $("btn-play").textContent = "⏸ Pause";
+  playTimer = setInterval(() => {
+    if (stepIdx >= STEPS.length - 1) { stopPlay(); return; }
+    goTo(stepIdx + 1);
+  }, 2400);
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowRight") { stopPlay(); goTo(stepIdx + 1); }
+  if (e.key === "ArrowLeft")  { stopPlay(); goTo(stepIdx - 1); }
+  if (e.key === " ")          { e.preventDefault(); $("btn-play").click(); }
+  if (e.key === "r" || e.key === "R") { stopPlay(); goTo(0); }
+});
+
+buildStrip();
+render();
+</script>
+
+</body>
+</html>

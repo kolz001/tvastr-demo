@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tvastr — issue triage & live pipeline</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1419; --surface: #161b22; --surface-2: #1c232c; --surface-3: #232a35;
+    --border: #2a3340; --text: #d8dde6; --text-dim: #8b96a6;
+    --accent: #58c8b0; --cloud: #7aa7ff; --local: #c195e8; --rule: #8b96a6;
+    --error: #ef6f6f; --ok: #58c8b0; --warn: #f0b86e;
+    --mono: ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans: -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans)}
+  body{min-height:100vh;padding:16px}
+  a{color:var(--accent)}
+  button{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 12px;font:600 12px var(--sans);cursor:pointer;transition:all .12s ease}
+  button:hover{background:var(--border)}
+  button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+  button.primary:hover{background:#69d1bb;border-color:#69d1bb}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  input,select{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 10px;font:13px var(--sans)}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .max{max-width:1400px;margin:0 auto}
+
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+  header h1{margin:0;font-size:18px;letter-spacing:-.01em}
+  header .badges{display:flex;gap:6px}
+  .badge{font:600 10px var(--mono);padding:3px 7px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em;border:1px solid var(--border);background:var(--surface)}
+  .badge.live{color:var(--accent);border-color:var(--accent)}
+  .badge.mock{color:var(--warn);border-color:var(--warn)}
+  .badge.dry{color:var(--cloud);border-color:var(--cloud)}
+  .badge.subtle{color:var(--text-dim)}
+
+  .tabs{display:flex;gap:4px;margin-bottom:12px}
+  .tab{font:600 12px var(--sans);padding:6px 14px;cursor:pointer;border-radius:5px;background:transparent;color:var(--text-dim);border:1px solid transparent}
+  .tab:hover{color:var(--text)}
+  .tab.active{background:var(--surface);color:var(--text);border-color:var(--border)}
+
+  .toolbar{display:flex;gap:8px;align-items:center;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;flex-wrap:wrap}
+  .toolbar label{font:600 11px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em}
+  .toolbar input[name=repo]{min-width:260px}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:12px}
+  @media(max-width:1024px){.grid{grid-template-columns:1fr}}
+
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .panel h2{margin:0;padding:10px 14px;font:600 12px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface)}
+
+  .issues{max-height:78vh;overflow-y:auto}
+  .issue{padding:12px 14px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:6px;cursor:pointer;transition:background .12s ease}
+  .issue:hover{background:var(--surface-2)}
+  .issue.selected{background:var(--surface-3);border-left:3px solid var(--accent);padding-left:11px}
+  .issue .top{display:flex;align-items:flex-start;gap:10px;justify-content:space-between}
+  .issue .title{font:600 13.5px var(--sans);line-height:1.35}
+  .issue .num{font:600 11px var(--mono);color:var(--text-dim);white-space:nowrap}
+  .issue .meta{display:flex;gap:10px;align-items:center;font:11px var(--mono);color:var(--text-dim);flex-wrap:wrap}
+  .issue .stat{display:inline-flex;align-items:center;gap:3px}
+  .issue .label{font:600 9px var(--mono);padding:1px 5px;border-radius:3px;background:var(--surface-3);color:var(--text-dim);text-transform:uppercase}
+  .issue .preview{color:var(--text-dim);font-size:12px;line-height:1.45;max-height:36px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .issue .actions{display:flex;gap:6px;margin-top:4px}
+
+  .pipeline{max-height:78vh;overflow-y:auto;padding:10px 12px}
+  .stage-strip{display:flex;gap:4px;padding:6px 12px;background:var(--surface-2);border-bottom:1px solid var(--border);overflow-x:auto;flex-wrap:wrap}
+  .stage-pill{flex:0 0 auto;display:flex;align-items:center;gap:5px;padding:4px 9px;font:600 10px var(--mono);color:var(--text-dim);border-radius:3px;border:1px solid transparent;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+  .stage-pill.done{color:var(--text)}
+  .stage-pill.done::before{content:"✓";color:var(--ok)}
+  .stage-pill.active{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+  .stage-pill.active::before{content:"▶"}
+  .stage-pill.error{color:var(--error);border-color:var(--error)}
+
+  .event{margin-bottom:8px;border:1px solid var(--border);border-left:3px solid var(--border);border-radius:6px;background:var(--surface-2);overflow:hidden}
+  .event.layer-ingestion{border-left-color:#8b96a6}
+  .event.layer-detection{border-left-color:var(--warn)}
+  .event.layer-agent{border-left-color:var(--accent)}
+  .event.layer-output{border-left-color:var(--cloud)}
+  .event .head{padding:8px 12px;display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+  .event .head:hover{background:var(--surface-3)}
+  .event .type{font:600 10px var(--mono);color:var(--text);padding:2px 6px;border-radius:3px;background:var(--surface-3);text-transform:uppercase;letter-spacing:.04em;min-width:120px;text-align:center}
+  .event.layer-ingestion .type{background:rgba(139,150,166,.15);color:#a8b3c4}
+  .event.layer-detection .type{background:rgba(240,184,110,.13);color:var(--warn)}
+  .event.layer-agent .type{background:rgba(88,200,176,.12);color:var(--accent)}
+  .event.layer-output .type{background:rgba(122,167,255,.12);color:var(--cloud)}
+  .event .step{font:600 12px var(--sans);color:var(--text);flex:1}
+  .event .ts{font:11px var(--mono);color:var(--text-dim)}
+  .event .summary{font:12px var(--sans);color:var(--text-dim);padding:0 12px 8px;line-height:1.45}
+  .event .body{padding:0 12px 10px;display:none}
+  .event.expanded .body{display:block}
+  .event.expanded .head .chevron{transform:rotate(90deg)}
+  .chevron{display:inline-block;transition:transform .15s ease;font:10px var(--mono);color:var(--text-dim);width:10px}
+  .event .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font:12px var(--mono);margin-top:6px}
+  .event .kv .k{color:var(--text-dim)}
+  .event .kv .v{color:var(--text);word-break:break-word}
+  .event pre{margin:6px 0 0;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font:11.5px/1.5 var(--mono);color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow:auto}
+  .event pre.diff .add{color:#98c379}
+  .event pre.diff .sub{color:#ef6f6f}
+  .event pre.diff .hunk{color:var(--text-dim)}
+  .route{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;font:600 10px var(--mono);border-radius:3px;text-transform:uppercase;letter-spacing:.04em}
+  .route.local{background:rgba(193,149,232,.13);color:var(--local);border:1px solid rgba(193,149,232,.3)}
+  .route.cloud{background:rgba(122,167,255,.13);color:var(--cloud);border:1px solid rgba(122,167,255,.3)}
+  .route.rule{background:rgba(139,150,166,.13);color:var(--rule);border:1px solid rgba(139,150,166,.3)}
+
+  /* Verification chip + result badges */
+  .verify-chip{display:inline-block;font:600 9px var(--mono);padding:1px 4px;border-radius:3px;background:rgba(122,167,255,.18);color:var(--cloud);border:1px solid rgba(122,167,255,.4);margin-right:6px;text-transform:uppercase;letter-spacing:.05em}
+  .verdict{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;font:600 11px var(--mono);border-radius:4px;text-transform:uppercase;letter-spacing:.05em}
+  .verdict.green{background:rgba(88,200,176,.12);color:var(--accent);border:1px solid rgba(88,200,176,.4)}
+  .verdict.yellow{background:rgba(240,184,110,.12);color:var(--warn);border:1px solid rgba(240,184,110,.4)}
+  .verdict.red{background:rgba(239,111,111,.12);color:var(--error);border:1px solid rgba(239,111,111,.4)}
+  .verify-cta{margin:12px 14px;padding:10px 14px;background:var(--surface-2);border:1px dashed var(--accent);border-radius:6px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-dim)}
+  .verify-cta button{margin-left:auto}
+  .empty{padding:30px;text-align:center;color:var(--text-dim);font-size:13px}
+  .runs-table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .runs-table th,.runs-table td{padding:8px 12px;border-bottom:1px solid var(--border);text-align:left}
+  .runs-table th{color:var(--text-dim);font:600 10px var(--mono);text-transform:uppercase;letter-spacing:.05em;background:var(--surface-2)}
+  .runs-table tr{cursor:pointer}
+  .runs-table tr:hover{background:var(--surface-2)}
+
+  footer{max-width:1400px;margin:18px auto 0;text-align:center;color:var(--text-dim);font-size:11px}
+  footer code{font:10px var(--mono);background:var(--surface);padding:2px 5px;border-radius:3px;color:var(--text)}
+</style>
+</head>
+<body>
+
+<div class="max">
+  <header>
+    <h1>tvastr — issue triage &amp; live pipeline</h1>
+    <div class="badges">
+      <span id="mode-badge" class="badge subtle">…</span>
+      <span class="badge dry">DRY-RUN</span>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="triage">Triage</div>
+    <div class="tab" data-tab="runs">Past runs</div>
+  </div>
+
+  <!-- TRIAGE TAB -->
+  <div id="tab-triage">
+    <div class="toolbar">
+      <label>Repo</label>
+      <input name="repo" value="run-llama/llama_index">
+      <label>Sort</label>
+      <select name="sort">
+        <option value="reactions-+1">👍 thumbs-up</option>
+        <option value="comments">💬 comments</option>
+        <option value="interactions">interactions (👍+💬)</option>
+        <option value="reactions">total reactions</option>
+        <option value="created">most recent</option>
+      </select>
+      <label>Label</label>
+      <input name="label" value="bug" style="width:80px">
+      <label>Limit</label>
+      <input name="limit" type="number" value="20" min="1" max="100" style="width:60px">
+      <button class="primary" id="btn-fetch">Fetch top N</button>
+      <span id="issues-status" style="margin-left:auto;color:var(--text-dim);font-size:12px"></span>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <h2>Issues</h2>
+        <div id="issues" class="issues">
+          <div class="empty">Click <b>Fetch top N</b> to load issues.</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2 id="pipeline-title">Pipeline</h2>
+        <div id="stage-strip" class="stage-strip" style="display:none"></div>
+        <div id="pipeline" class="pipeline">
+          <div class="empty">Pick an issue and click <b>Apply fix</b> to stream the pipeline.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RUNS TAB -->
+  <div id="tab-runs" style="display:none">
+    <div class="toolbar">
+      <button id="btn-refresh-runs">⟲ Refresh</button>
+      <span id="runs-status" style="margin-left:auto;color:var(--text-dim);font-size:12px"></span>
+    </div>
+    <div class="panel">
+      <h2>Persisted runs</h2>
+      <div id="runs-table-wrap">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>Backed by <code>src/tvastr/pipeline.py</code> · events at <code>data/runs/&lt;run_id&gt;.jsonl</code> · see <code>docs/design-doc.md</code>.</footer>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// State + helpers
+// ─────────────────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const html = (s) => s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let selectedIssue = null;
+let activeEventSource = null;
+let currentRunId = null;
+let runHasFix = false;
+const STAGES = ["ingest","cluster","threshold","investigate","reason_root_cause","confidence_gate","generate_fix","draft_pr","open_pr","notify","audit"];
+const VERIFY_TYPES = new Set([
+  "verify.start","verify.repro_synth","verify.baseline",
+  "verify.patch_applied","verify.rerun","verify.regression","verify.result"
+]);
+const VERDICT_BADGE = {
+  verified_via_reproducer:   { kind:"green",  label:"verified · reproducer" },
+  verified_via_scoped_tests: { kind:"green",  label:"verified · scoped tests" },
+  unverified_smoke_import_only: { kind:"yellow", label:"unverified · smoke import only" },
+  no_repro:               { kind:"yellow", label:"no repro" },
+  still_broken:           { kind:"red",    label:"still broken" },
+  regression:             { kind:"red",    label:"regression" },
+  environmental_error:    { kind:"yellow", label:"env error" },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab switching
+// ─────────────────────────────────────────────────────────────────────────────
+document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  tab.classList.add("active");
+  const which = tab.dataset.tab;
+  $("tab-triage").style.display = which === "triage" ? "" : "none";
+  $("tab-runs").style.display = which === "runs" ? "" : "none";
+  if (which === "runs") loadRuns();
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fetch issues
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchIssues() {
+  const repo = document.querySelector("input[name=repo]").value.trim();
+  const sort = document.querySelector("select[name=sort]").value;
+  const label = document.querySelector("input[name=label]").value.trim();
+  const limit = document.querySelector("input[name=limit]").value;
+  $("issues-status").textContent = "loading…";
+  $("issues").innerHTML = `<div class="empty">Fetching…</div>`;
+  try {
+    const url = `/api/issues?repo=${encodeURIComponent(repo)}&sort=${encodeURIComponent(sort)}&label=${encodeURIComponent(label)}&limit=${limit}`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    renderIssues(data);
+    $("mode-badge").textContent = data.mode.toUpperCase();
+    $("mode-badge").className = "badge " + (data.mode === "live" ? "live" : "mock");
+    $("issues-status").textContent = `${data.issues.length} issues · sort: ${data.sort}`;
+  } catch (e) {
+    $("issues").innerHTML = `<div class="empty">Error: ${html(String(e))}</div>`;
+    $("issues-status").textContent = "";
+  }
+}
+
+function renderIssues(data) {
+  if (!data.issues.length) {
+    $("issues").innerHTML = `<div class="empty">No issues matched.</div>`;
+    return;
+  }
+  $("issues").innerHTML = data.issues.map((iss, i) => `
+    <div class="issue" data-num="${iss.number}">
+      <div class="top">
+        <div>
+          <div class="title">${i+1}. ${html(iss.title)}</div>
+        </div>
+        <div class="num">#${iss.number}</div>
+      </div>
+      <div class="preview">${html(iss.body_preview || '(no body)')}</div>
+      <div class="meta">
+        <span class="stat">👍 ${iss.thumbs_up}</span>
+        <span class="stat">💬 ${iss.comments}</span>
+        <span class="stat">∑ ${iss.reactions}</span>
+        ${iss.labels.slice(0,3).map(l => `<span class="label">${html(l)}</span>`).join("")}
+        <a href="${iss.url}" target="_blank" rel="noopener" style="margin-left:auto">view on github ↗</a>
+      </div>
+      <div class="actions">
+        <button class="apply-fix">Apply fix (dry-run)</button>
+      </div>
+    </div>
+  `).join("");
+
+  document.querySelectorAll(".issue").forEach(el => {
+    el.addEventListener("click", (e) => {
+      if (e.target.tagName === "A") return;
+      document.querySelectorAll(".issue").forEach(x => x.classList.remove("selected"));
+      el.classList.add("selected");
+      selectedIssue = { repo: data.repo, number: parseInt(el.dataset.num, 10) };
+    });
+    el.querySelector(".apply-fix").addEventListener("click", (e) => {
+      e.stopPropagation();
+      document.querySelectorAll(".issue").forEach(x => x.classList.remove("selected"));
+      el.classList.add("selected");
+      const number = parseInt(el.dataset.num, 10);
+      runPipeline({ repo: data.repo, issue_number: number, dry_run: true });
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Run pipeline via SSE
+// ─────────────────────────────────────────────────────────────────────────────
+async function runPipeline(req) {
+  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
+  currentRunId = null;
+  runHasFix = false;
+
+  $("pipeline").innerHTML = "";
+  $("stage-strip").style.display = "flex";
+  $("stage-strip").innerHTML = STAGES.map(s =>
+    `<span class="stage-pill" data-stage="${s}">${s}</span>`
+  ).join("");
+  $("pipeline-title").textContent = `Pipeline — issue #${req.issue_number}`;
+
+  // SSE doesn't support POST natively in the browser. So: POST first, then the
+  // server returns a streaming text/event-stream response. We use fetch() with
+  // a reader to parse SSE manually.
+  let resp;
+  try {
+    resp = await fetch("/api/run", {
+      method: "POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify(req),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    currentRunId = resp.headers.get("X-Tvastr-Run-Id");
+  } catch (e) {
+    appendEvent({
+      type: "error", layer: "output", step: "fetch",
+      payload: {error: String(e)}, timestamp: new Date().toISOString()
+    });
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE: events separated by blank lines (\n\n)
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const chunk = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const dataLine = chunk.split("\n").find(l => l.startsWith("data: "));
+      if (!dataLine) continue;
+      try {
+        const event = JSON.parse(dataLine.slice(6));
+        appendEvent(event);
+      } catch {}
+    }
+  }
+  finalizeRun();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Render an event card
+// ─────────────────────────────────────────────────────────────────────────────
+const STAGE_FOR_TYPE = {
+  "pipeline.start": null, "ingest.read": "ingest",
+  "detect.cluster": "cluster", "detect.pii": "cluster", "threshold.select": "threshold",
+  "agent.start": null,
+  // node.start uses payload.step or event.step
+  "fix.generated": "generate_fix", "pr.drafted": "draft_pr",
+  "pr.dry_run": "open_pr", "pr.opened": "open_pr", "pr.failed": "open_pr",
+  "notify.sent": "notify", "audit.saved": "audit",
+};
+function stageFor(event) {
+  if (event.type === "agent.node.start") return event.step;
+  return STAGE_FOR_TYPE[event.type] || null;
+}
+
+function setStage(stage, state) {
+  if (!stage) return;
+  const pill = document.querySelector(`.stage-pill[data-stage="${stage}"]`);
+  if (!pill) return;
+  // mark previous as done, this one as active
+  document.querySelectorAll(".stage-pill.active").forEach(p => {
+    p.classList.remove("active");
+    p.classList.add("done");
+  });
+  if (state === "active") pill.classList.add("active");
+  if (state === "error")  pill.classList.add("error");
+}
+
+function summarize(event) {
+  const p = event.payload || {};
+  switch (event.type) {
+    case "pipeline.start": return `${p.repo || ""} #${p.issue_number || "?"} · ${p.issue_title || ""}`;
+    case "ingest.read":     return `${p.count} event(s) from ${(p.services||[]).join(", ")}`;
+    case "detect.cluster":  return `${p.patterns} pattern(s)`;
+    case "detect.pii":      return `${p.count} pattern(s) flagged sensitive`;
+    case "threshold.select":return `selected: ${(p.selected||[]).join("; ") || "(none)"}`;
+    case "agent.start":     return `${p.title || ""}`;
+    case "agent.node.start":return event.step;
+    case "agent.node.end":  return event.step;
+    case "tool.call":       return `${event.step}(${describe(p)})`;
+    case "router.decide":   return `${p.task} → ${p.target} · ${p.reason}`;
+    case "llm.call":        return `${p.task} · ${p.target} · ${p.model}${p.elapsed_ms!=null?` · ${p.elapsed_ms}ms`:""}${p.mocked?" · mock":""}`;
+    case "fix.generated":   return `${(p.files||[]).length} file(s) · ${p.summary || ""}`.slice(0,160);
+    case "pr.drafted":      return `${p.title} → ${p.branch}`;
+    case "pr.dry_run":      return `[dry-run] ${p.url}`;
+    case "pr.opened":       return `#${p.number} → ${p.url}`;
+    case "pr.failed":       return p.reason || "failed";
+    case "notify.sent":     return `${p.channel}: ${p.message}`.slice(0,160);
+    case "audit.saved":     return `outcome=${p.outcome}`;
+    case "pipeline.end":    return `outcome=${p.outcome} · ${p.selected} pattern(s) selected`;
+    case "verify.start":    return `sandbox=${p.sandbox}`;
+    case "verify.repro_synth": return `reproducer from ${p.source}${p.expected_exception?` · expecting ${p.expected_exception}`:""}`;
+    case "verify.baseline": return `baseline exit=${p.exit_code} · original_exception_seen=${p.original_exception_seen}`;
+    case "verify.patch_applied": return `${(p.files||[]).length} file(s) patched`;
+    case "verify.rerun":    return `rerun exit=${p.exit_code} · original_exception_seen=${p.original_exception_seen}`;
+    case "verify.regression": return `${p.passed||0} passed · ${p.failed||0} failed · ${p.errors||0} errors · ${(p.scope||[]).length} scoped`;
+    case "verify.result":   return `verdict=${p.verdict} · oracle=${p.oracle} · ${p.elapsed_s}s`;
+    case "error":           return p.error ? `${p.error}: ${p.message}` : (p.reason || "error");
+    default: return JSON.stringify(p).slice(0, 200);
+  }
+}
+function describe(p) {
+  if (p.paths) return `→ ${p.paths.length} path(s)`;
+  if (p.query) return `query=${p.query}`;
+  if (p.retrieved != null) return `retrieved=${p.retrieved}/${p.requested}`;
+  return "";
+}
+
+function appendEvent(event) {
+  const stage = stageFor(event);
+  const isError = event.type === "error";
+  if (isError) setStage(stage, "error");
+  else if (stage) setStage(stage, "active");
+
+  // Watch for events that gate the Verify CTA.
+  if (event.type === "fix.generated") runHasFix = true;
+  if (event.type === "pipeline.start" && event.payload?.run_id) {
+    currentRunId = event.payload.run_id;
+  }
+
+  const ts = (event.timestamp || "").split("T")[1]?.split(".")[0] || "";
+  const layer = event.layer || "agent";
+  const isVerify = VERIFY_TYPES.has(event.type);
+  const chip = isVerify ? `<span class="verify-chip">verify</span>` : "";
+
+  const card = document.createElement("div");
+  card.className = `event layer-${layer}`;
+  let extraHead = "";
+  if (event.type === "verify.result") {
+    const meta = VERDICT_BADGE[event.payload?.verdict] || { kind:"yellow", label:event.payload?.verdict || "?" };
+    extraHead = ` <span class="verdict ${meta.kind}">${html(meta.label)}</span>`;
+  }
+  card.innerHTML = `
+    <div class="head">
+      <span class="chevron">▶</span>
+      ${chip}<span class="type">${html(event.type)}</span>
+      <span class="step">${html(summarize(event))}${extraHead}</span>
+      <span class="ts">${html(ts)}</span>
+    </div>
+    <div class="body">${renderBody(event)}</div>
+  `;
+  card.querySelector(".head").addEventListener("click", () => card.classList.toggle("expanded"));
+  $("pipeline").appendChild(card);
+
+  // Once the agent's PR is captured (dry-run sentinel), offer to verify.
+  if (event.type === "pr.dry_run" && currentRunId && runHasFix) {
+    showVerifyCTA(currentRunId);
+  }
+
+  $("pipeline").parentElement.scrollTop = $("pipeline").parentElement.scrollHeight;
+}
+
+function showVerifyCTA(runId) {
+  if (document.querySelector(`.verify-cta[data-run="${runId}"]`)) return;  // dedupe
+  const cta = document.createElement("div");
+  cta.className = "verify-cta";
+  cta.dataset.run = runId;
+  cta.innerHTML = `
+    Verify this fix in a sandbox? Re-creates the failure, applies the patch, re-runs.
+    Costs ~1 Claude call + ~30s in Docker (or longer cold).
+    <button class="primary">▶ Verify this fix</button>
+  `;
+  cta.querySelector("button").addEventListener("click", () => {
+    cta.querySelector("button").disabled = true;
+    cta.querySelector("button").textContent = "Verifying…";
+    streamVerify(runId);
+  });
+  $("pipeline").appendChild(cta);
+}
+
+async function streamVerify(runId) {
+  let resp;
+  try {
+    resp = await fetch(`/api/runs/${runId}/verify`, {
+      method: "POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify({}),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  } catch (e) {
+    appendEvent({
+      type: "error", layer: "output", step: "verify",
+      payload: {error: String(e)}, timestamp: new Date().toISOString()
+    });
+    return;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const chunk = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const dataLine = chunk.split("\n").find(l => l.startsWith("data: "));
+      if (!dataLine) continue;
+      try {
+        const event = JSON.parse(dataLine.slice(6));
+        appendEvent(event);
+      } catch {}
+    }
+  }
+}
+
+function colorizeDiff(diff) {
+  return html(diff).split("\n").map(l => {
+    if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("@@")) return `<span class="hunk">${l}</span>`;
+    if (l.startsWith("+")) return `<span class="add">${l}</span>`;
+    if (l.startsWith("-")) return `<span class="sub">${l}</span>`;
+    return l;
+  }).join("\n");
+}
+
+function renderBody(event) {
+  const p = event.payload || {};
+  const parts = [];
+
+  // Routing decisions: render a colored badge.
+  if (event.type === "router.decide") {
+    parts.push(`<div class="kv"><span class="k">target</span><span class="v"><span class="route ${p.target}">${p.target}</span></span></div>`);
+  }
+  // LLM call: full prompt + response.
+  if (event.type === "llm.call") {
+    if (p.system) parts.push(`<div class="kv"><span class="k">system</span><span class="v">${html(p.system)}</span></div>`);
+    if (p.prompt) parts.push(`<div class="kv"><span class="k">prompt</span><span class="v"></span></div><pre>${html(p.prompt)}</pre>`);
+    if (p.response) parts.push(`<div class="kv"><span class="k">response</span><span class="v"></span></div><pre>${html(p.response)}</pre>`);
+  }
+  // Fix generated: diffs.
+  if (event.type === "fix.generated" && p.diffs) {
+    for (const [path, diff] of Object.entries(p.diffs)) {
+      parts.push(`<div class="kv"><span class="k">${html(path)}</span><span class="v"></span></div><pre class="diff">${colorizeDiff(diff)}</pre>`);
+    }
+  }
+  // PR drafted: full body.
+  if (event.type === "pr.drafted" && p.body) {
+    parts.push(`<pre>${html(p.body)}</pre>`);
+  }
+  // Reproducer source.
+  if (event.type === "verify.repro_synth" && p.code) {
+    parts.push(`<div class="kv"><span class="k">repro.py</span><span class="v"></span></div><pre>${html(p.code)}</pre>`);
+  }
+  // Sandbox run output tails.
+  if ((event.type === "verify.baseline" || event.type === "verify.rerun") && p.stderr_tail) {
+    parts.push(`<div class="kv"><span class="k">stderr (tail)</span><span class="v"></span></div><pre>${html(p.stderr_tail)}</pre>`);
+  }
+  // Generic key/value pairs for everything else.
+  const skip = new Set(["prompt","response","system","body","diffs","target","message"]);
+  const kvs = Object.entries(p).filter(([k]) => !skip.has(k));
+  if (kvs.length) {
+    parts.push(`<div class="kv">${kvs.map(([k,v]) =>
+      `<span class="k">${html(k)}</span><span class="v">${html(typeof v === "string" ? v : JSON.stringify(v))}</span>`
+    ).join("")}</div>`);
+  }
+  return parts.join("") || `<div class="kv"><span class="k">payload</span><span class="v">(empty)</span></div>`;
+}
+
+function finalizeRun() {
+  document.querySelectorAll(".stage-pill.active").forEach(p => {
+    p.classList.remove("active"); p.classList.add("done");
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Past runs
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadRuns() {
+  $("runs-status").textContent = "loading…";
+  $("runs-table-wrap").innerHTML = `<div class="empty">Loading…</div>`;
+  const resp = await fetch("/api/runs");
+  const runs = await resp.json();
+  $("runs-status").textContent = `${runs.length} run(s)`;
+  if (!runs.length) {
+    $("runs-table-wrap").innerHTML = `<div class="empty">No persisted runs yet. Apply a fix from the Triage tab.</div>`;
+    return;
+  }
+  $("runs-table-wrap").innerHTML = `
+    <table class="runs-table">
+      <thead><tr><th>Started</th><th>Repo</th><th>Issue</th><th>Outcome</th><th>Verified?</th><th>Events</th><th>Run ID</th></tr></thead>
+      <tbody>${runs.map(r => {
+        const v = r.verdict ? (VERDICT_BADGE[r.verdict] || { kind:"yellow", label:r.verdict }) : null;
+        const vCell = v ? `<span class="verdict ${v.kind}">${html(v.label)}</span>` : "—";
+        return `
+        <tr data-run="${r.run_id}">
+          <td>${html((r.started_at||"").replace("T"," ").split(".")[0])}</td>
+          <td>${html(r.repo || "—")}</td>
+          <td>${r.issue_number ? `#${r.issue_number} ${html(r.issue_title||"")}` : "—"}</td>
+          <td>${html(r.outcome || "—")}</td>
+          <td>${vCell}</td>
+          <td>${r.event_count}</td>
+          <td><code style="font:11px var(--mono);color:var(--text-dim)">${r.run_id}</code></td>
+        </tr>`;
+      }).join("")}
+      </tbody>
+    </table>`;
+  document.querySelectorAll(".runs-table tr[data-run]").forEach(tr => {
+    tr.addEventListener("click", () => replayRun(tr.dataset.run));
+  });
+}
+
+async function replayRun(runId) {
+  // Jump to triage tab so the user sees the pipeline pane.
+  document.querySelector('.tab[data-tab="triage"]').click();
+  $("pipeline").innerHTML = "";
+  $("stage-strip").style.display = "flex";
+  $("stage-strip").innerHTML = STAGES.map(s =>
+    `<span class="stage-pill" data-stage="${s}">${s}</span>`
+  ).join("");
+  $("pipeline-title").textContent = `Pipeline — replay ${runId}`;
+  const resp = await fetch(`/api/runs/${runId}`);
+  const events = await resp.json();
+  for (const ev of events) appendEvent(ev);
+  finalizeRun();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wire up
+// ─────────────────────────────────────────────────────────────────────────────
+$("btn-fetch").addEventListener("click", fetchIssues);
+$("btn-refresh-runs").addEventListener("click", loadRuns);
+fetchIssues();  // auto-load on page open
+</script>
+
+</body>
+</html>

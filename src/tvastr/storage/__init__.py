@@ -5,6 +5,13 @@ The audit trail is first-class: every remediation run records where data flowed
 """
 
 from tvastr.storage.audit import AuditStore, InMemoryAuditStore, build_audit_store
+from tvastr.storage.file_audit import FileAuditStore
 from tvastr.storage.opensearch import OpenSearchAuditStore
 
-__all__ = ["AuditStore", "InMemoryAuditStore", "OpenSearchAuditStore", "build_audit_store"]
+__all__ = [
+    "AuditStore",
+    "FileAuditStore",
+    "InMemoryAuditStore",
+    "OpenSearchAuditStore",
+    "build_audit_store",
+]

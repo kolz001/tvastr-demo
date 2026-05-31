@@ -17,10 +17,12 @@ cloud backend, so raw sensitive data never crosses the local boundary.
 
 from __future__ import annotations
 
+import time
 from enum import StrEnum
 
 from tvastr.config import Settings
 from tvastr.domain import RoutingDecision, Sensitivity
+from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.llm.base import LLMClient, LLMResponse
 from tvastr.llm.claude import ClaudeClient, MockClaudeClient
 from tvastr.llm.local import MockOllamaClient, OllamaClient
@@ -44,9 +46,18 @@ _LOCAL_TASKS = {TaskType.LOG_PARSING, TaskType.SUMMARIZATION}
 class HybridRouter:
     """Routes a task+payload to the appropriate backend and records the decision."""
 
-    def __init__(self, local: LLMClient, cloud: LLMClient) -> None:
+    def __init__(
+        self,
+        local: LLMClient,
+        cloud: LLMClient,
+        *,
+        event_sink: EventSink | None = None,
+        run_id: str | None = None,
+    ) -> None:
         self.local = local
         self.cloud = cloud
+        self.event_sink: EventSink = event_sink or NullEventSink()
+        self.run_id = run_id
 
     def route_target(self, task: TaskType, sensitivity: Sensitivity) -> str:
         """Decide ``"local"`` vs ``"cloud"`` for a task at a sensitivity level."""
@@ -68,11 +79,13 @@ class HybridRouter:
 
         payload = prompt
         reason: str
+        redacted_fields: list[str] = []
         if target == "local":
             reason = "kept local — sensitive data must not leave the boundary"
         else:
             redacted, found = redact(prompt)
             payload = redacted
+            redacted_fields = list(found)
             if found:
                 reason = f"escalated to cloud after redacting {', '.join(found)}"
             elif sensitivity is Sensitivity.SENSITIVE:
@@ -94,7 +107,43 @@ class HybridRouter:
             model=client.model,
             sensitivity=sensitivity.value,
         )
+        self.event_sink.emit(
+            PipelineEvent(
+                type="router.decide",
+                layer="agent",
+                step=task.value,
+                run_id=self.run_id,
+                payload={
+                    "task": task.value,
+                    "target": target,
+                    "model": client.model,
+                    "sensitivity": sensitivity.value,
+                    "reason": reason,
+                    "redacted_fields": redacted_fields,
+                },
+            )
+        )
+        started = time.perf_counter()
         response = client.complete(payload, system=system)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.event_sink.emit(
+            PipelineEvent(
+                type="llm.call",
+                layer="agent",
+                step=task.value,
+                run_id=self.run_id,
+                payload={
+                    "task": task.value,
+                    "target": target,
+                    "model": client.model,
+                    "elapsed_ms": elapsed_ms,
+                    "mocked": getattr(response, "mocked", False),
+                    "prompt": payload,
+                    "system": system,
+                    "response": response.text,
+                },
+            )
+        )
         return response, decision
 
 

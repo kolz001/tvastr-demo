@@ -26,6 +26,8 @@ htmlcov/
 # Local data / artifacts
 *.log
 data/opensearch/
+data/audit/
+data/runs/
 .tvastr/
 
 # IDE / OS

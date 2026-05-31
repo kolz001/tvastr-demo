@@ -137,7 +137,7 @@ class _ScriptedLLM:
 
 
 def _ctx_with_llm(llm: _ScriptedLLM) -> AgentContext:
-    settings = Settings(use_mocks=True)
+    settings = Settings(use_mocks=True, audit_backend="memory")
     router = build_router(settings)
     router.cloud = llm
     return AgentContext(
@@ -211,7 +211,7 @@ def test_generate_fix_falls_back_when_search_strings_are_invalid() -> None:
 
 def test_generate_fix_with_mock_claude_produces_applicable_change() -> None:
     """The MockClaudeClient should return JSON that actually validates and applies."""
-    settings = Settings(use_mocks=True)
+    settings = Settings(use_mocks=True, audit_backend="memory")
     router = build_router(settings)
     ctx = AgentContext(
         router=router,

@@ -1,4 +1,4 @@
-"""Audit store interface and the in-memory implementation used for local dev."""
+"""Audit store interface and the in-memory implementation used for tests."""
 
 from __future__ import annotations
 
@@ -18,22 +18,40 @@ class AuditStore(Protocol):
 
 
 class InMemoryAuditStore:
-    """Keeps audit records in a list — perfect for tests, demos, and offline runs."""
+    """Keeps audit records in a list — perfect for tests and ephemeral runs."""
 
     def __init__(self) -> None:
         self._records: list[AuditRecord] = []
 
     def save(self, record: AuditRecord) -> None:
         self._records.append(record)
-        log.info("audit.save", pattern=record.pattern_id, outcome=record.outcome, mocked=True)
+        log.info(
+            "audit.save",
+            pattern=record.pattern_id,
+            outcome=record.outcome,
+            backend="memory",
+        )
 
     def all(self) -> list[AuditRecord]:
         return list(self._records)
 
 
 def build_audit_store(settings: Settings) -> AuditStore:
-    if settings.use_mocks:
-        return InMemoryAuditStore()
-    from tvastr.storage.opensearch import OpenSearchAuditStore
+    """Build the audit store selected by ``settings.audit_backend``.
 
-    return OpenSearchAuditStore(settings)
+    Decoupled from ``use_mocks`` so a user running with mock LLM/GitHub clients
+    can still get persistent audit on disk — and conversely, a live run can opt
+    into an ephemeral in-memory store for ad-hoc debugging.
+    """
+    backend = settings.audit_backend
+    if backend == "memory":
+        return InMemoryAuditStore()
+    if backend == "file":
+        from tvastr.storage.file_audit import FileAuditStore
+
+        return FileAuditStore(settings.audit_file_path)
+    if backend == "opensearch":
+        from tvastr.storage.opensearch import OpenSearchAuditStore
+
+        return OpenSearchAuditStore(settings)
+    raise ValueError(f"Unknown audit backend: {backend!r}")

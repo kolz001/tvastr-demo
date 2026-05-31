@@ -7,11 +7,11 @@ for the agent's test cases.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 from pathlib import Path
 
 from tvastr.domain import LogEvent
+from tvastr.ingestion.base import parse_jsonl_events
 from tvastr.logging import get_logger
 
 log = get_logger(__name__)
@@ -38,11 +38,4 @@ class SimulatedLogSource:
             raise FileNotFoundError(f"Sample log file not found: {self.path}")
         log.info("ingest.read", source=self.name, path=str(self.path))
         with self.path.open("r", encoding="utf-8") as fh:
-            for line_no, raw in enumerate(fh, start=1):
-                raw = raw.strip()
-                if not raw or raw.startswith("#"):
-                    continue
-                try:
-                    yield LogEvent.model_validate(json.loads(raw))
-                except (json.JSONDecodeError, ValueError) as exc:
-                    log.warning("ingest.skip_malformed", line=line_no, error=str(exc))
+            yield from parse_jsonl_events(fh, source_name=self.name)

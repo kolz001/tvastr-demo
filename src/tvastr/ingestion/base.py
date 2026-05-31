@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Iterator
 from typing import Protocol, runtime_checkable
 
 from tvastr.domain import LogEvent
+from tvastr.logging import get_logger
+
+log = get_logger(__name__)
 
 
 @runtime_checkable
@@ -32,3 +36,22 @@ def collect(source: LogSource, limit: int | None = None) -> list[LogEvent]:
         if limit is not None and len(events) >= limit:
             break
     return events
+
+
+def parse_jsonl_events(lines: Iterable[str], *, source_name: str) -> Iterable[LogEvent]:
+    """Parse an iterable of JSONL lines into ``LogEvent``s.
+
+    Skips blank lines and ``#`` comments; logs and skips lines that fail to
+    parse rather than aborting the whole stream — a single garbled line in a
+    file or stdin shouldn't kill the pipeline.
+    """
+    for line_no, raw in enumerate(lines, start=1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            yield LogEvent.model_validate(json.loads(stripped))
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning(
+                "ingest.skip_malformed", source=source_name, line=line_no, error=str(exc)
+            )

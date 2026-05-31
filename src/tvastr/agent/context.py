@@ -7,10 +7,11 @@ right shape — real or mock — satisfies the contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from tvastr.domain import PullRequestDraft, PullRequestResult
+from tvastr.events import EventSink, NullEventSink
 from tvastr.llm.router import HybridRouter
 
 
@@ -44,3 +45,5 @@ class AgentContext:
     code_host: CodeHost
     notifier: Notifier
     min_confidence: float = 0.5
+    event_sink: EventSink = field(default_factory=NullEventSink)
+    run_id: str | None = None

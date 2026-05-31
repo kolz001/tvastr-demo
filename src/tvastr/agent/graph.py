@@ -27,6 +27,7 @@ from tvastr.agent.tools import (
     send_notification,
 )
 from tvastr.domain import PullRequestDraft, RootCause, RoutingDecision
+from tvastr.events import PipelineEvent
 from tvastr.llm.router import TaskType
 from tvastr.logging import get_logger
 
@@ -43,6 +44,17 @@ class RemediationAgent:
     def __init__(self, ctx: AgentContext) -> None:
         self.ctx = ctx
         self.graph = self._build()
+
+    def _emit(self, type_: str, step: str, **payload: object) -> None:
+        self.ctx.event_sink.emit(
+            PipelineEvent(
+                type=type_,  # type: ignore[arg-type]
+                layer="agent",
+                step=step,
+                run_id=self.ctx.run_id,
+                payload=dict(payload),
+            )
+        )
 
     def _build(self):
         g: StateGraph = StateGraph(AgentState)
@@ -71,10 +83,39 @@ class RemediationAgent:
     def _investigate(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
         events = state.get("sample_events", [])
+        self._emit("agent.node.start", "investigate", pattern=pattern.fingerprint)
+
         suspected = extract_stack_files(events)
-        if not suspected and pattern.exception_type:
+        if suspected:
+            self._emit(
+                "tool.call",
+                "extract_stack_files",
+                source="stack_trace",
+                paths=suspected,
+            )
+        elif pattern.exception_type:
             suspected = search_codebase(self.ctx, pattern.exception_type)
+            self._emit(
+                "tool.call",
+                "search_codebase",
+                query=pattern.exception_type,
+                paths=suspected,
+            )
+
         code_files = retrieve_code_files(self.ctx, suspected)
+        self._emit(
+            "tool.call",
+            "retrieve_code_files",
+            requested=len(suspected),
+            retrieved=len(code_files),
+            paths=list(code_files.keys()),
+        )
+        self._emit(
+            "agent.node.end",
+            "investigate",
+            suspected_files=suspected,
+            files_retrieved=len(code_files),
+        )
         return {
             "suspected_files": suspected,
             "code_files": code_files,
@@ -84,6 +125,7 @@ class RemediationAgent:
     def _reason_root_cause(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
         suspected = state.get("suspected_files", [])
+        self._emit("agent.node.start", "reason_root_cause", pattern=pattern.fingerprint)
         prompt = (
             f"A recurring failure has been detected ({pattern.count} occurrences).\n"
             f"Title: {pattern.title}\n"
@@ -103,18 +145,45 @@ class RemediationAgent:
             confidence=confidence,
             reasoning=response.text,
         )
+        self._emit(
+            "agent.node.end",
+            "reason_root_cause",
+            confidence=confidence,
+            summary=root_cause.summary,
+        )
         return {"root_cause": root_cause, "routing": _append_routing(state, decision)}
 
     def _confidence_gate(self, state: AgentState) -> str:
         root_cause = state.get("root_cause")
-        if root_cause and root_cause.confidence >= self.ctx.min_confidence:
-            return "act"
-        return "skip"
+        confidence = root_cause.confidence if root_cause else 0.0
+        decision = "act" if confidence >= self.ctx.min_confidence else "skip"
+        self._emit(
+            "agent.node.start",
+            "confidence_gate",
+            confidence=confidence,
+            threshold=self.ctx.min_confidence,
+            decision=decision,
+        )
+        return decision
 
     def _generate_fix(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
+        self._emit("agent.node.start", "generate_fix", pattern=pattern.fingerprint)
         fix, decision = generate_fix(
             self.ctx, pattern, state["root_cause"], state.get("code_files", {})
+        )
+        self._emit(
+            "fix.generated",
+            "generate_fix",
+            files=[c.path for c in fix.changes],
+            summary=fix.summary,
+            test_plan=fix.test_plan,
+            diffs={c.path: c.diff for c in fix.changes if c.diff},
+            # Patched content + rationales travel in the event payload so the
+            # verifier can reconstruct the full FixProposal from a persisted run
+            # without re-running the agent.
+            patched_files={c.path: c.patched_content for c in fix.changes},
+            rationales={c.path: c.rationale for c in fix.changes},
         )
         return {"fix": fix, "routing": _append_routing(state, decision)}
 
@@ -122,6 +191,7 @@ class RemediationAgent:
         pattern = state["pattern"]
         root_cause = state["root_cause"]
         fix = state["fix"]
+        self._emit("agent.node.start", "draft_pr", pattern=pattern.fingerprint)
         prompt = (
             f"Write a clear, professional pull request description for this fix.\n"
             f"Failure: {pattern.title}\nRoot cause: {root_cause.summary}\n"
@@ -144,21 +214,34 @@ class RemediationAgent:
             branch=f"tvastr/fix-{pattern.fingerprint}",
             changes=fix.changes,
         )
+        self._emit(
+            "pr.drafted",
+            "draft_pr",
+            title=draft.title,
+            branch=draft.branch,
+            files=[c.path for c in draft.changes],
+            body=body,
+        )
         return {"pr_draft": draft, "routing": _append_routing(state, decision)}
 
     def _open_pr(self, state: AgentState) -> AgentState:
+        self._emit("agent.node.start", "open_pr", branch=state["pr_draft"].branch)
         result = open_pull_request(self.ctx, state["pr_draft"])
         if result.dry_run:
             outcome = "dry_run"
+            self._emit("pr.dry_run", "open_pr", url=result.url, branch=result.branch)
         elif result.created:
             outcome = "pr_opened"
+            self._emit("pr.opened", "open_pr", url=result.url, number=result.number)
         else:
             outcome = "failed"
+            self._emit("pr.failed", "open_pr", reason="create_pull returned created=False")
         return {"pr_result": result, "outcome": outcome}
 
     def _notify(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
         outcome = state.get("outcome", "skipped")
+        self._emit("agent.node.start", "notify", outcome=outcome)
         if outcome == "pr_opened" and (result := state.get("pr_result")):
             message = f":wrench: tvastr opened a PR for *{pattern.title}* → {result.url}"
             notes = f"PR opened: {result.url}"
@@ -176,6 +259,7 @@ class RemediationAgent:
             )
             notes = "Escalated to human (low confidence)."
         send_notification(self.ctx, message)
+        self._emit("notify.sent", "notify", channel="slack", message=message)
         return {"outcome": outcome, "notes": notes}
 
     # --- Entry point ---
