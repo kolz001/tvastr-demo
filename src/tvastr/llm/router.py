@@ -39,6 +39,7 @@ class TaskType(StrEnum):
     FIX_GENERATION = "fix_generation"
     PR_DESCRIPTION = "pr_description"
     PR_ANALYSIS = "pr_analysis"
+    FIX_COMPARISON = "fix_comparison"
 
 
 _LOCAL_TASKS = {TaskType.LOG_PARSING, TaskType.SUMMARIZATION}
