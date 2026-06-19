@@ -38,6 +38,7 @@ class TaskType(StrEnum):
     ROOT_CAUSE = "root_cause"
     FIX_GENERATION = "fix_generation"
     PR_DESCRIPTION = "pr_description"
+    PR_ANALYSIS = "pr_analysis"
 
 
 _LOCAL_TASKS = {TaskType.LOG_PARSING, TaskType.SUMMARIZATION}
