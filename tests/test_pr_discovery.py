@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import httpx
 
-from tvastr.analysis.pr_discovery import PullRequestRef, PrDiff, discover_pr, fetch_pr_diff  # noqa: F401
+from tvastr.analysis.pr_discovery import (  # noqa: F401
+    PrDiff,
+    PullRequestRef,
+    discover_pr,
+    fetch_pr_diff,
+)
 
 
 def _search_response(items):
@@ -76,3 +81,20 @@ def test_fetch_pr_diff_caps_total_lines():
     diff = fetch_pr_diff("o/r", 30, token="t", transport=transport)
     assert diff.truncated is True
     assert sum(f.patch.count("\n") + 1 for f in diff.files) <= 1500 + 5
+
+
+def test_fetch_pr_diff_handles_missing_patch():
+    files = [
+        {
+            "filename": "img.png",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "patch": None,
+        }
+    ]
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json=files))
+    diff = fetch_pr_diff("o/r", 30, token="t", transport=transport)
+    assert diff.files[0].filename == "img.png"
+    assert diff.files[0].patch == ""
+    assert diff.truncated is False

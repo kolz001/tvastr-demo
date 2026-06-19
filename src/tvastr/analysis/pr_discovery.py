@@ -154,26 +154,25 @@ def fetch_pr_diff(
         raw = resp.json()
 
     files: list[PrFile] = []
-    truncated = len(raw) > _MAX_DIFF_FILES
+    truncated = len(raw) > _MAX_DIFF_FILES  # file-count cap
     total_lines = 0
     for item in raw[:_MAX_DIFF_FILES]:
         patch = str(item.get("patch") or "")
         lines = patch.count("\n") + 1 if patch else 0
+        pr_file_kwargs = {
+            "filename": str(item.get("filename", "")),
+            "status": str(item.get("status", "")),
+            "additions": int(item.get("additions", 0)),
+            "deletions": int(item.get("deletions", 0)),
+        }
         if total_lines + lines > _MAX_DIFF_LINES:
+            # Line budget exhausted: clip this patch, flag truncation, and stop
+            # — any files after this one are intentionally dropped.
             remaining = max(0, _MAX_DIFF_LINES - total_lines)
             patch = "\n".join(patch.splitlines()[:remaining]) + "\n… (diff truncated)"
+            files.append(PrFile(patch=patch, **pr_file_kwargs))
             truncated = True
-        total_lines += lines
-        files.append(
-            PrFile(
-                filename=str(item.get("filename", "")),
-                status=str(item.get("status", "")),
-                additions=int(item.get("additions", 0)),
-                deletions=int(item.get("deletions", 0)),
-                patch=patch,
-            )
-        )
-        if total_lines >= _MAX_DIFF_LINES:
-            truncated = truncated or len(raw) > len(files)
             break
+        total_lines += lines
+        files.append(PrFile(patch=patch, **pr_file_kwargs))
     return PrDiff(files=files, truncated=truncated)
