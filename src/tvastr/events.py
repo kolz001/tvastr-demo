@@ -51,6 +51,8 @@ EventType = Literal[
     "verify.rerun",
     "verify.regression",
     "verify.result",
+    "benchmark.compared",
+    "benchmark.skipped",
     "error",
 ]
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from tvastr.analysis.fix_comparison import FixComparison
+from tvastr.analysis.pr_discovery import PrDiff, PullRequestRef
 from tvastr.domain import (
     FailurePattern,
     FixProposal,
@@ -25,6 +27,7 @@ class AgentState(TypedDict, total=False):
     code_context: str
     code_files: dict[str, str]
     suspected_files: list[str]
+    evidence_source: str  # stack_trace | search | none — how suspected_files were found
     root_cause: RootCause
     fix: FixProposal
     pr_draft: PullRequestDraft
@@ -32,3 +35,6 @@ class AgentState(TypedDict, total=False):
     routing: list[RoutingDecision]
     outcome: str  # pr_opened | dry_run | skipped | failed
     notes: str
+    pr_ref: PullRequestRef | None
+    pr_diff: PrDiff | None
+    fix_comparison: FixComparison | None
