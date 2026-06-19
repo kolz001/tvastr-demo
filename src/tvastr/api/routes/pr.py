@@ -64,14 +64,19 @@ def issue_pr(repo: str, number: int) -> IssuePrOut:
 @router.post("/api/pr-analysis", response_model=PrAnalysisOut)
 def pr_analysis(req: PrAnalysisRequest) -> PrAnalysisOut:
     s = get_settings()
-    ref = discover_pr(req.repo, req.number, token=s.github_token, use_mocks=s.use_mocks)
-    if ref is None:
+    if s.use_mocks or not s.github_token:
         return PrAnalysisOut(pr=None)
 
-    diff = fetch_pr_diff(req.repo, ref.number, token=s.github_token)
-    body = fetch_issue_body(req.repo, req.number, token=s.github_token)
-    router_ = build_router(s)
-    analysis, _ = analyze_pr(f"#{req.number}", body, ref, diff, router_)
+    try:
+        ref = discover_pr(req.repo, req.number, token=s.github_token, use_mocks=s.use_mocks)
+        if ref is None:
+            return PrAnalysisOut(pr=None)
+        diff = fetch_pr_diff(req.repo, ref.number, token=s.github_token)
+        body = fetch_issue_body(req.repo, req.number, token=s.github_token)
+        router_ = build_router(s)
+        analysis, _ = analyze_pr(f"#{req.number}", body, ref, diff, router_)
+    except Exception:
+        return PrAnalysisOut(pr=None)
     return PrAnalysisOut(
         pr=PrRefOut(
             number=ref.number,
