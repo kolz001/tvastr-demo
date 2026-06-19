@@ -120,3 +120,60 @@ def discover_pr(
         state=ref.state,
     )
     return ref
+
+
+@dataclass(frozen=True)
+class PrFile:
+    filename: str
+    status: str
+    additions: int
+    deletions: int
+    patch: str
+
+
+@dataclass(frozen=True)
+class PrDiff:
+    files: list[PrFile]
+    truncated: bool = False
+
+
+def fetch_pr_diff(
+    repo: str,
+    pr_number: int,
+    *,
+    token: str | None,
+    transport: object | None = None,
+) -> PrDiff:
+    """Fetch a PR's changed files, capped at 30 files / 1500 patch lines."""
+    import httpx
+
+    url = f"{API_ROOT}/repos/{repo}/pulls/{pr_number}/files"
+    with httpx.Client(timeout=20.0, transport=transport) as client:  # type: ignore[arg-type]
+        resp = client.get(url, headers=github_headers(token), params={"per_page": "100"})
+        resp.raise_for_status()
+        raw = resp.json()
+
+    files: list[PrFile] = []
+    truncated = len(raw) > _MAX_DIFF_FILES
+    total_lines = 0
+    for item in raw[:_MAX_DIFF_FILES]:
+        patch = str(item.get("patch") or "")
+        lines = patch.count("\n") + 1 if patch else 0
+        if total_lines + lines > _MAX_DIFF_LINES:
+            remaining = max(0, _MAX_DIFF_LINES - total_lines)
+            patch = "\n".join(patch.splitlines()[:remaining]) + "\n… (diff truncated)"
+            truncated = True
+        total_lines += lines
+        files.append(
+            PrFile(
+                filename=str(item.get("filename", "")),
+                status=str(item.get("status", "")),
+                additions=int(item.get("additions", 0)),
+                deletions=int(item.get("deletions", 0)),
+                patch=patch,
+            )
+        )
+        if total_lines >= _MAX_DIFF_LINES:
+            truncated = truncated or len(raw) > len(files)
+            break
+    return PrDiff(files=files, truncated=truncated)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from tvastr.analysis.pr_discovery import PullRequestRef, discover_pr  # noqa: F401
+from tvastr.analysis.pr_discovery import PullRequestRef, PrDiff, discover_pr, fetch_pr_diff  # noqa: F401
 
 
 def _search_response(items):
@@ -46,3 +46,33 @@ def test_discover_marks_merged():
     transport = httpx.MockTransport(lambda req: _search_response(items))
     ref = discover_pr("o/r", 1, token="t", transport=transport)
     assert ref.merged is True
+
+
+def _file(name, patch, status="modified", add=1, dele=0):
+    return {"filename": name, "status": status, "additions": add, "deletions": dele, "patch": patch}
+
+
+def test_fetch_pr_diff_returns_files():
+    files = [_file("a.py", "@@ -1 +1 @@\n-old\n+new")]
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json=files))
+    diff = fetch_pr_diff("o/r", 30, token="t", transport=transport)
+    assert isinstance(diff, PrDiff)
+    assert diff.files[0].filename == "a.py"
+    assert diff.truncated is False
+
+
+def test_fetch_pr_diff_caps_file_count():
+    files = [_file(f"f{i}.py", "@@\n+x") for i in range(40)]
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json=files))
+    diff = fetch_pr_diff("o/r", 30, token="t", transport=transport)
+    assert len(diff.files) == 30
+    assert diff.truncated is True
+
+
+def test_fetch_pr_diff_caps_total_lines():
+    big = "\n".join("+line" for _ in range(2000))
+    files = [_file("big.py", big)]
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json=files))
+    diff = fetch_pr_diff("o/r", 30, token="t", transport=transport)
+    assert diff.truncated is True
+    assert sum(f.patch.count("\n") + 1 for f in diff.files) <= 1500 + 5
