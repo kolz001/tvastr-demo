@@ -4,7 +4,6 @@ issue, and the approach. One cloud call; tolerant of unparseable responses."""
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 
 from tvastr.analysis.pr_discovery import PrDiff, PullRequestRef
@@ -50,14 +49,15 @@ def _diff_blob(diff: PrDiff) -> str:
 
 
 def _extract_json(text: str) -> dict | None:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return None
-    try:
-        obj = json.loads(match.group(0))
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+    return None
 
 
 def analyze_pr(

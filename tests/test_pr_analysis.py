@@ -54,3 +54,31 @@ def test_analyze_pr_tolerates_unparseable_response():
     analysis, _ = analyze_pr("t", "b", _ref(), _diff(), StubRouter("not json"))
     assert analysis.addresses_issue == "unknown"
     assert analysis.pr_number == 30
+
+
+def test_analyze_pr_parses_json_wrapped_in_prose():
+    payload = (
+        "Sure! Here is the analysis: "
+        '{"addresses_issue": "partial", "approach_summary": "x", '
+        '"key_files": ["a.py"], "root_cause": "y"} Hope this helps!'
+    )
+    analysis, _ = analyze_pr("t", "b", _ref(), _diff(), StubRouter(payload))
+    assert analysis.addresses_issue == "partial"
+    assert analysis.key_files == ["a.py"]
+
+
+def test_analyze_pr_includes_truncation_note_when_diff_truncated():
+    from tvastr.analysis.pr_discovery import PrDiff, PrFile
+
+    diff = PrDiff(files=[PrFile("a.py", "modified", 1, 0, "@@\n+x")], truncated=True)
+    payload = json.dumps(
+        {
+            "addresses_issue": "yes",
+            "approach_summary": "",
+            "key_files": [],
+            "root_cause": "",
+        }
+    )
+    router = StubRouter(payload)
+    analyze_pr("t", "b", _ref(), diff, router)
+    assert "truncated" in router.last_prompt.lower()
