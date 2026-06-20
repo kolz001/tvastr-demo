@@ -151,6 +151,7 @@ def _start_pipeline_thread(
             pipeline.run(
                 events=events,
                 run_meta={
+                    "run_id": run_id,
                     "repo": repo,
                     "issue_number": issue.number,
                     "issue_title": issue.title,
@@ -208,23 +209,10 @@ async def run_pipeline(request: RunRequest) -> StreamingResponse:
     )
 
     async def event_stream() -> AsyncIterator[str]:
-        # Initial event with the run_id so the client can subscribe / link.
-        opener = PipelineEvent(
-            type="pipeline.start",
-            layer="ingestion",
-            step="run.opened",
-            run_id=run_id,
-            payload={
-                "run_id": run_id,
-                "repo": request.repo,
-                "issue_number": issue.number,
-                "issue_title": issue.title,
-                "issue_url": issue.url,
-                "dry_run": request.dry_run,
-            },
-        )
-        yield _event_to_sse(opener)
-
+        # The pipeline's own pipeline.start (emitted via the sink) carries the
+        # run_id in its payload, so the client gets it from the first streamed
+        # event — no separate synthetic opener needed. This keeps the live
+        # stream identical to the persisted/replayed one.
         loop = asyncio.get_event_loop()
         while True:
             item = await loop.run_in_executor(None, q.get)

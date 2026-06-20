@@ -63,9 +63,12 @@ def test_run_streams_full_pipeline_events() -> None:
 
     events = _parse_sse(resp.text)
     types = [e["type"] for e in events]
-    # At minimum: the synthetic opener + a real pipeline.start emitted by the
-    # pipeline + ingest + cluster + threshold + agent + router + llm + fix + pr.
-    assert types.count("pipeline.start") >= 1
+    # Exactly one pipeline.start (carrying run_id in its payload) followed by
+    # ingest + cluster + threshold + agent + router + llm + fix + pr. The live
+    # stream mirrors the persisted run — no separate synthetic opener.
+    assert types.count("pipeline.start") == 1
+    start = next(e for e in events if e["type"] == "pipeline.start")
+    assert start["payload"]["run_id"]
     assert "ingest.read" in types
     assert "detect.cluster" in types
     assert "threshold.select" in types
