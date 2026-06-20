@@ -26,6 +26,7 @@ from tvastr.agent.tools import (
     search_codebase,
     send_notification,
 )
+from tvastr.analysis.fix_comparison import compare_fix_to_pr
 from tvastr.domain import PullRequestDraft, RootCause, RoutingDecision
 from tvastr.events import PipelineEvent
 from tvastr.llm.router import TaskType
@@ -74,6 +75,7 @@ class RemediationAgent:
         g.add_node("investigate", self._investigate)
         g.add_node("reason_root_cause", self._reason_root_cause)
         g.add_node("generate_fix", self._generate_fix)
+        g.add_node("compare_to_pr", self._compare_to_pr)
         g.add_node("draft_pr", self._draft_pr)
         g.add_node("open_pr", self._open_pr)
         g.add_node("notify", self._notify)
@@ -85,7 +87,8 @@ class RemediationAgent:
             self._confidence_gate,
             {"act": "generate_fix", "skip": "notify"},
         )
-        g.add_edge("generate_fix", "draft_pr")
+        g.add_edge("generate_fix", "compare_to_pr")
+        g.add_edge("compare_to_pr", "draft_pr")
         g.add_edge("draft_pr", "open_pr")
         g.add_edge("open_pr", "notify")
         g.add_edge("notify", END)
@@ -214,6 +217,43 @@ class RemediationAgent:
             rationales={c.path: c.rationale for c in fix.changes},
         )
         return {"fix": fix, "routing": _append_routing(state, decision)}
+
+    def _compare_to_pr(self, state: AgentState) -> AgentState:
+        pattern = state["pattern"]
+        pr_ref = state.get("pr_ref")
+        pr_diff = state.get("pr_diff")
+        if pr_ref is None or pr_diff is None:
+            self._emit("benchmark.skipped", "compare_to_pr", reason="no upstream PR found")
+            return {}
+        self._emit("agent.node.start", "compare_to_pr", pr=pr_ref.number)
+        try:
+            comparison, decision = compare_fix_to_pr(
+                pattern.title,
+                state["root_cause"].summary,
+                state["fix"],
+                pr_ref,
+                pr_diff,
+                self.ctx.router,
+            )
+        except Exception as exc:  # never crash the run
+            log.warning("agent.compare_to_pr.failed", error=str(exc))
+            self._emit("benchmark.skipped", "compare_to_pr", reason=f"comparison error: {exc}")
+            return {}
+        self._emit(
+            "benchmark.compared",
+            "compare_to_pr",
+            verdict=comparison.verdict,
+            same_root_cause=comparison.same_root_cause,
+            equivalence=comparison.equivalence,
+            files_both=comparison.files_both,
+            files_ours_only=comparison.files_ours_only,
+            files_theirs_only=comparison.files_theirs_only,
+            rationale=comparison.rationale,
+            confidence=comparison.confidence,
+            pr_number=pr_ref.number,
+            pr_url=pr_ref.url,
+        )
+        return {"fix_comparison": comparison, "routing": _append_routing(state, decision)}
 
     def _draft_pr(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
