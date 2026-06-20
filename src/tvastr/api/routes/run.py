@@ -113,9 +113,7 @@ def _start_pipeline_thread(
     q: queue.Queue[object],
 ) -> threading.Thread:
     """Run the pipeline in a background thread; emit events onto ``q`` via ``sink``."""
-    settings = get_settings().model_copy(
-        update={"dry_run": dry_run} if dry_run else {}
-    )
+    settings = get_settings().model_copy(update={"dry_run": dry_run} if dry_run else {})
 
     def _run() -> None:
         try:
@@ -136,6 +134,18 @@ def _start_pipeline_thread(
                     )
                 )
                 return
+            from tvastr.analysis.pr_discovery import discover_pr, fetch_pr_diff
+
+            pr_ref = discover_pr(
+                repo, issue.number, token=settings.github_token, use_mocks=settings.use_mocks
+            )
+            pr_diff = None
+            if pr_ref is not None:
+                try:
+                    pr_diff = fetch_pr_diff(repo, pr_ref.number, token=settings.github_token)
+                except Exception as exc:
+                    log.warning("run.pr_diff_failed", error=str(exc))
+                    pr_ref = None
             # Single-issue mode: bypass the recurrence threshold (the user has
             # explicitly picked this issue; the threshold is for autonomous mode).
             settings_for_run = settings.model_copy(update={"recurrence_threshold": 1})
@@ -159,6 +169,8 @@ def _start_pipeline_thread(
                     "dry_run": dry_run,
                     "mode": "mock" if settings.use_mocks else "live",
                 },
+                pr_ref=pr_ref,
+                pr_diff=pr_diff,
             )
         except Exception as exc:
             log.exception("run.failed", run_id=run_id)
