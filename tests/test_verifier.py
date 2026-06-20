@@ -163,6 +163,68 @@ def test_verdict_still_broken_when_rerun_still_raises() -> None:
     assert not result.is_green
 
 
+def test_verdict_repro_broken_when_rerun_raises_different_exception() -> None:
+    """Real case from run-llama/llama_index: rerun fails with TypeError(unexpected
+    keyword argument) instead of the original. The reproducer is wrong, not the
+    fix — surface it as REPRO_BROKEN so the UI re-arms the verify button."""
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+            RunResult(
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "TypeError: MutableMappingKVStore.__init__() got an "
+                    "unexpected keyword argument 'mutable_mapping_factory'"
+                ),
+            ),
+        ]
+    )
+    verifier = Verifier(_ctx(), sandbox)
+    result = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.REPRO_BROKEN
+    assert not result.is_green
+    assert "different exception" in result.evidence["hint"]
+
+
+def test_repro_broken_skips_scoped_tests(monkeypatch, tmp_path: Path) -> None:
+    """A broken rerun gives no fix signal — don't spend a scoped-test run on it
+    (and never let a scoped failure masquerade as REGRESSION)."""
+    import tvastr.verification.verifier as vmod
+
+    monkeypatch.setattr(vmod, "discover_scoped_tests", lambda changes, root: ["tests/test_x.py"])
+    scoped_calls: list[list[str]] = []
+
+    def _run_scoped(handle, scoped):
+        scoped_calls.append(scoped)
+        return RunResult(exit_code=1, stdout="", stderr=""), {"failed": 1}
+
+    monkeypatch.setattr(vmod, "run_scoped_tests", _run_scoped)
+
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+            RunResult(exit_code=1, stdout="", stderr="TypeError: nope"),
+        ]
+    )
+    verifier = Verifier(_ctx(), sandbox, project_root=tmp_path)
+    result = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.REPRO_BROKEN
+    assert scoped_calls == []
+
+
+def test_verdict_environmental_error_on_rerun_timeout() -> None:
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+            RunResult(exit_code=-1, stdout="", stderr="", timed_out=True),
+        ]
+    )
+    verifier = Verifier(_ctx(), sandbox)
+    result = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.ENVIRONMENTAL_ERROR
+
+
 def test_verdict_no_repro_when_baseline_already_passes() -> None:
     sandbox = _FakeSandbox([RunResult(exit_code=0, stdout="ok", stderr="")])
     verifier = Verifier(_ctx(), sandbox)

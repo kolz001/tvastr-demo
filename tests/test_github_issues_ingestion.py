@@ -36,6 +36,44 @@ def test_feature_request_without_error_is_skipped() -> None:
     assert issue_to_events(rec, default_service="llama_index") == []
 
 
+def test_non_crashing_bug_gets_synthetic_event() -> None:
+    """Bug-labeled issues without an exception still produce one event so the
+    agent's confidence gate can decide whether to act."""
+    rec = _record(
+        19293,
+        "[Bug]: No Input/Output Token count for Gemini 2.5 models",
+        "When using Gemini 2.5, prompt and completion token counts come back as None.",
+        ["bug"],
+    )
+    events = issue_to_events(rec, default_service="llama_index")
+    assert len(events) == 1
+    assert events[0].message.startswith("UnexpectedBehavior:")
+    # The [Bug]: prefix should be stripped from the cleaned title.
+    assert "No Input/Output Token count" in events[0].message
+    assert events[0].attributes["non_crashing"] == "true"
+    assert events[0].attributes["issue_body_excerpt"].startswith("When using Gemini")
+
+
+def test_bug_titled_without_label_still_produces_synthetic_event() -> None:
+    """[Bug]: prefix alone is sufficient; many real repos don't use a bug label."""
+    rec = _record(99, "[Bug]: something flaky", "Sometimes the output is wrong.", [])
+    events = issue_to_events(rec, default_service="llama_index")
+    assert len(events) == 1
+    assert events[0].attributes["non_crashing"] == "true"
+
+
+def test_bug_prefix_requires_word_boundary() -> None:
+    """'Buggy …' is not a '[Bug]' prefix — without a label it's skipped, and
+    with one the title must survive un-mangled (no 'gy output …')."""
+    rec = _record(100, "Buggy output when streaming", "Sometimes wrong.", ["question"])
+    assert issue_to_events(rec, default_service="llama_index") == []
+
+    labeled = _record(101, "Buggy output when streaming", "Sometimes wrong.", ["bug"])
+    events = issue_to_events(labeled, default_service="llama_index")
+    assert len(events) == 1
+    assert events[0].message == "UnexpectedBehavior: Buggy output when streaming"
+
+
 def test_service_picks_up_topic_label() -> None:
     rec = _record(3, "boom", "RuntimeError: boom", ["bug", "topic:vector_stores"])
     events = issue_to_events(rec, default_service="llama_index")

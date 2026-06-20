@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from tvastr.domain import LogEvent, Severity
+from tvastr.ingestion.github_api import github_headers, parse_iso
 from tvastr.logging import get_logger
 
 log = get_logger(__name__)
@@ -77,37 +78,80 @@ def _service_from_labels(labels: list[str], default: str) -> str:
     return default
 
 
+_BUG_TITLE_PREFIX_RE = re.compile(r"^\s*\[?\s*bug\b\s*\]?\s*[:\-]?\s*", re.IGNORECASE)
+
+
+def _is_bug_issue(issue: IssueRecord) -> bool:
+    """Heuristic for 'is this a bug report (vs. feature request / question)?'."""
+    if any(
+        lbl.lower() in {"bug", "kind/bug", "type:bug", "type/bug"}
+        or lbl.lower().startswith("bug:")
+        for lbl in issue.labels
+    ):
+        return True
+    return bool(_BUG_TITLE_PREFIX_RE.match(issue.title))
+
+
 def issue_to_events(issue: IssueRecord, *, default_service: str) -> list[LogEvent]:
     """Convert one issue into zero-or-more ``LogEvent``s.
 
-    An issue with no error-shaped line is skipped (returns ``[]``) — the agent
-    needs an exception signature to cluster on, so titles like "feature request:
-    add foo" aren't useful here.
+    Three shapes:
+      - **Crashing bug** (has ``SomeError: ...`` in title or body) → one or
+        more ``LogEvent``s with the actual exception class. Strongest signal.
+      - **Non-crashing bug** (labeled bug, ``[Bug]:`` prefix, but no exception
+        text) → one synthetic ``UnexpectedBehavior: <cleaned title>`` event,
+        marked with ``non_crashing=true`` in attributes. The agent's
+        confidence gate decides whether to act or escalate.
+      - **Not a bug** (feature request, doc, question) → ``[]``. The triage
+        UI surfaces the skip with a clear reason.
     """
     service = _service_from_labels(issue.labels, default_service)
     signatures = _extract_error_signatures(f"{issue.title}\n{issue.body}")
-    if not signatures:
+
+    if signatures:
+        events: list[LogEvent] = []
+        for exc, tail in signatures:
+            message = f"{exc}: {tail}"[:400]
+            events.append(
+                LogEvent(
+                    timestamp=issue.created_at,
+                    service=service,
+                    severity=Severity.ERROR,
+                    message=message,
+                    stack_trace=None,
+                    attributes={
+                        "issue_number": str(issue.number),
+                        "issue_url": issue.url,
+                        "issue_title": issue.title[:160],
+                    },
+                    source="github_issues",
+                )
+            )
+        return events
+
+    if not _is_bug_issue(issue):
         return []
 
-    events: list[LogEvent] = []
-    for exc, tail in signatures:
-        message = f"{exc}: {tail}"[:400]
-        events.append(
-            LogEvent(
-                timestamp=issue.created_at,
-                service=service,
-                severity=Severity.ERROR,
-                message=message,
-                stack_trace=None,
-                attributes={
-                    "issue_number": str(issue.number),
-                    "issue_url": issue.url,
-                    "issue_title": issue.title[:160],
-                },
-                source="github_issues",
-            )
+    # Synthetic event for non-crashing bug reports. Confidence gate handles
+    # the "should I try?" decision downstream — this layer just stops refusing.
+    cleaned = _BUG_TITLE_PREFIX_RE.sub("", issue.title).strip() or "unspecified behavior"
+    return [
+        LogEvent(
+            timestamp=issue.created_at,
+            service=service,
+            severity=Severity.WARNING,
+            message=f"UnexpectedBehavior: {cleaned}"[:400],
+            stack_trace=None,
+            attributes={
+                "issue_number": str(issue.number),
+                "issue_url": issue.url,
+                "issue_title": issue.title[:160],
+                "issue_body_excerpt": (issue.body or "")[:500],
+                "non_crashing": "true",
+            },
+            source="github_issues",
         )
-    return events
+    ]
 
 
 def write_jsonl(events: Iterable[LogEvent], path: Path) -> int:
@@ -163,12 +207,7 @@ class GitHubIssuesFetcher:
         import httpx
 
         query = f"repo:{self.repo} is:issue is:open label:{label}"
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        headers = github_headers(self.token)
         params = {
             "q": query,
             "sort": sort,
@@ -190,7 +229,7 @@ class GitHubIssuesFetcher:
                     number=int(item["number"]),
                     title=item.get("title") or "",
                     body=item.get("body") or "",
-                    created_at=_parse_iso(item.get("created_at")) or datetime.now(UTC),
+                    created_at=parse_iso(item.get("created_at")) or datetime.now(UTC),
                     url=item.get("html_url") or "",
                     labels=[
                         lab["name"]
@@ -242,15 +281,6 @@ class GitHubIssuesFetcher:
             if len(records) >= limit:
                 break
         return records
-
-
-def _parse_iso(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 class MockGitHubIssuesFetcher:

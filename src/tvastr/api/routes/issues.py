@@ -6,12 +6,14 @@ Sort options mirror the GitHub Search API. Falls back to the mock fetcher when
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Literal
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from tvastr.config import get_settings
+from tvastr.ingestion.comments import assess_issue
 from tvastr.ingestion.github_issues import (
     GitHubIssuesFetcher,
     IssueRecord,
@@ -82,3 +84,32 @@ def list_issues(
         mode="mock" if use_mock else "live",
         issues=[_to_out(r) for r in records],
     )
+
+
+class ResolutionOut(BaseModel):
+    confidence: Literal["high", "medium", "low", "none"]
+    label: str
+    signals: list[str]
+    comment_count: int
+    days_since_last_comment: int | None
+
+
+@router.get("/api/resolution", response_model=ResolutionOut)
+def issue_resolution(
+    repo: str = Query(...),
+    number: int = Query(..., ge=1),
+) -> ResolutionOut:
+    """Return a cheap heuristic assessment of whether an open issue looks
+    resolved per comments. Powers the triage UI's chip.
+
+    Mock mode (no token) always returns ``confidence='none'`` because the
+    issue list is synthetic and there are no real comments to assess.
+    """
+    settings = get_settings()
+    assessment = assess_issue(
+        repo,
+        number,
+        token=settings.github_token,
+        use_mocks=settings.use_mocks,
+    )
+    return ResolutionOut(**asdict(assessment))

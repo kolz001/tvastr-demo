@@ -57,8 +57,10 @@ def fingerprint(event: LogEvent) -> str:
 
 
 def _title(event: LogEvent, exc: str | None) -> str:
-    head = event.message.split(":", 1)[0] if ":" in event.message else event.message
-    base = exc or head
+    # Without an exception type the head alone is too generic (every synthetic
+    # "UnexpectedBehavior: <issue title>" event would share one title), so keep
+    # the full message to stay distinguishable in the UI and PR titles.
+    base = exc or event.message
     return f"{base} in {event.service}"[:120]
 
 

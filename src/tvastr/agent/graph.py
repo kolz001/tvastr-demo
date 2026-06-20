@@ -38,6 +38,19 @@ def _append_routing(state: AgentState, decision: RoutingDecision) -> list[Routin
     return [*state.get("routing", []), decision]
 
 
+_EVIDENCE_CONFIDENCE = {"stack_trace": 0.8, "search": 0.6}
+
+
+def _search_query_from_message(message: str) -> str:
+    """Search terms for a pattern with no exception type.
+
+    Synthetic non-crashing events look like ``UnexpectedBehavior: <issue
+    title>`` — the part after the colon is what's worth grepping for.
+    """
+    tail = message.split(":", 1)[-1].strip()
+    return tail[:120]
+
+
 class RemediationAgent:
     """Compiles and runs the remediation graph for a single failure pattern."""
 
@@ -85,22 +98,33 @@ class RemediationAgent:
         events = state.get("sample_events", [])
         self._emit("agent.node.start", "investigate", pattern=pattern.fingerprint)
 
+        evidence_source = "none"
         suspected = extract_stack_files(events)
         if suspected:
+            evidence_source = "stack_trace"
             self._emit(
                 "tool.call",
                 "extract_stack_files",
                 source="stack_trace",
                 paths=suspected,
             )
-        elif pattern.exception_type:
-            suspected = search_codebase(self.ctx, pattern.exception_type)
-            self._emit(
-                "tool.call",
-                "search_codebase",
-                query=pattern.exception_type,
-                paths=suspected,
+        else:
+            # No stack trace: grep for the exception type, or — for
+            # non-crashing reports (synthetic "UnexpectedBehavior: <title>"
+            # events) — for the behavior description after the colon.
+            query = pattern.exception_type or _search_query_from_message(
+                pattern.representative_message
             )
+            if query:
+                suspected = search_codebase(self.ctx, query)
+                if suspected:
+                    evidence_source = "search"
+                self._emit(
+                    "tool.call",
+                    "search_codebase",
+                    query=query,
+                    paths=suspected,
+                )
 
         code_files = retrieve_code_files(self.ctx, suspected)
         self._emit(
@@ -118,6 +142,7 @@ class RemediationAgent:
         )
         return {
             "suspected_files": suspected,
+            "evidence_source": evidence_source,
             "code_files": code_files,
             "code_context": format_code_for_prompt(code_files),
         }
@@ -137,7 +162,10 @@ class RemediationAgent:
         response, decision = self.ctx.router.run(
             TaskType.ROOT_CAUSE, prompt, sensitivity=pattern.sensitivity
         )
-        confidence = 0.8 if suspected else 0.3
+        # Confidence tracks evidence strength: a stack trace pins the file
+        # (0.8); a code-search hit is circumstantial (0.6 — still above the
+        # default 0.5 gate, but honest about it); nothing found escalates (0.3).
+        confidence = _EVIDENCE_CONFIDENCE.get(state.get("evidence_source", "none"), 0.3)
         root_cause = RootCause(
             pattern_id=pattern.id,
             summary=response.text,
