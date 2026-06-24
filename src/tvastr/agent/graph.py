@@ -353,9 +353,10 @@ class RemediationAgent:
             return {}
         grounded_summary = response.text.strip() or root_cause.summary
         changed = grounded_summary != root_cause.summary
-        new_root_cause = root_cause.model_copy(
-            update={"summary": grounded_summary, "reasoning": response.text}
-        )
+        update: dict = {"summary": grounded_summary}
+        if changed:
+            update["reasoning"] = response.text
+        new_root_cause = root_cause.model_copy(update=update)
         self._emit(
             "doc.grounded",
             "ground_root_cause",

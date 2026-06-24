@@ -92,3 +92,12 @@ def test_act_path_routes_through_ground_root_cause():
     agent.run({"pattern": _pattern(), "sample_events": []})
     steps = [e.step for e in sink.events if e.type == "agent.node.start"]
     assert "ground_root_cause" in steps
+
+
+def test_ground_skips_when_root_cause_missing():
+    sink = ListEventSink()
+    agent = _agent(sink, _GroundingRouter(), doc_grounding=True)
+    out = agent._ground_root_cause({"pattern": _pattern()})  # no root_cause in state
+    assert out == {}
+    assert any(e.type == "doc.skipped" for e in sink.events)
+    assert not any(e.type == "doc.grounded" for e in sink.events)
