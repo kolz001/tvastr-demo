@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LLMResponse(BaseModel):
@@ -12,6 +12,7 @@ class LLMResponse(BaseModel):
     model: str
     target: str  # "local" | "cloud"
     mocked: bool = False
+    sources: list[str] = Field(default_factory=list)  # citation URLs (web_search)
 
 
 @runtime_checkable
