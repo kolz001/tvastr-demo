@@ -40,6 +40,24 @@ def test_parse_reasoning_handles_partial_json():
     assert targets == {"queries": [], "paths": []}
 
 
+def test_parse_reasoning_empty_root_cause_falls_back():
+    # JSON present but root_cause is empty -> malformed -> single-pass fallback.
+    text = '{"root_cause": "", "need_more_context": true, "next_targets": {"queries": ["x"]}}'
+    summary, need_more, targets = _parse_reasoning(text)
+    assert summary == text
+    assert need_more is False
+    assert targets == {"queries": [], "paths": []}
+
+
+def test_parse_reasoning_defaults_missing_paths_key():
+    # next_targets with only queries -> paths defaults to [].
+    text = '{"root_cause": "rc", "need_more_context": true, "next_targets": {"queries": ["y"]}}'
+    summary, need_more, targets = _parse_reasoning(text)
+    assert summary == "rc"
+    assert need_more is True
+    assert targets == {"queries": ["y"], "paths": []}
+
+
 def _ctx(sink, router):
     settings = Settings(use_mocks=True, audit_backend="memory")
     return AgentContext(

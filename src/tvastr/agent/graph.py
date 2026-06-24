@@ -67,9 +67,9 @@ def _parse_reasoning(text: str) -> tuple[str, bool, dict]:
     """
     empty = {"queries": [], "paths": []}
     parsed = extract_json(text)
-    if not parsed or "root_cause" not in parsed:
+    if not parsed or not parsed.get("root_cause"):
         return text, False, empty
-    summary = str(parsed.get("root_cause") or text)
+    summary = str(parsed["root_cause"])
     need_more = bool(parsed.get("need_more_context", False))
     targets = parsed.get("next_targets") or {}
     queries = [str(q) for q in (targets.get("queries") or []) if q]
