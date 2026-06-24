@@ -28,6 +28,8 @@ class AgentState(TypedDict, total=False):
     code_files: dict[str, str]
     suspected_files: list[str]
     evidence_source: str  # stack_trace | search | none — how suspected_files were found
+    need_more_context: bool  # reasoning asked for another retrieval round
+    next_targets: dict  # {"queries": list[str], "paths": list[str]} from reasoning
     root_cause: RootCause
     fix: FixProposal
     pr_draft: PullRequestDraft

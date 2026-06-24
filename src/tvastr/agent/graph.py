@@ -30,6 +30,7 @@ from tvastr.agent.tools import (
     search_codebase,
     send_notification,
 )
+from tvastr.analysis._jsonutil import extract_json
 from tvastr.analysis.fix_comparison import compare_fix_to_pr
 from tvastr.domain import PullRequestDraft, RootCause, RoutingDecision
 from tvastr.events import PipelineEvent
@@ -54,6 +55,26 @@ def _search_query_from_message(message: str) -> str:
     """
     tail = message.split(":", 1)[-1].strip()
     return tail[:120]
+
+
+def _parse_reasoning(text: str) -> tuple[str, bool, dict]:
+    """Split a reasoning response into (summary, need_more_context, next_targets).
+
+    The reasoning LLM is asked for JSON {"root_cause", "need_more_context",
+    "next_targets": {"queries", "paths"}}. If no such object is present (e.g. a
+    prose mock response), fall back to (text, False, empty) — a single pass,
+    exactly the pre-loop behavior.
+    """
+    empty = {"queries": [], "paths": []}
+    parsed = extract_json(text)
+    if not parsed or "root_cause" not in parsed:
+        return text, False, empty
+    summary = str(parsed.get("root_cause") or text)
+    need_more = bool(parsed.get("need_more_context", False))
+    targets = parsed.get("next_targets") or {}
+    queries = [str(q) for q in (targets.get("queries") or []) if q]
+    paths = [str(p) for p in (targets.get("paths") or []) if p]
+    return summary, need_more, {"queries": queries, "paths": paths}
 
 
 class RemediationAgent:
@@ -164,18 +185,25 @@ class RemediationAgent:
             f"Message: {pattern.representative_message}\n"
             f"Suspected files: {', '.join(suspected) or 'unknown'}\n\n"
             f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
-            "Explain the most likely root cause in 2-3 sentences."
+            "Diagnose the root cause. If the code context is insufficient to pinpoint "
+            "the bug (the real fault may be in a file you have not seen yet), say so and "
+            "propose where to look next.\n\n"
+            'Respond ONLY with JSON: {"root_cause": "2-3 sentence explanation", '
+            '"need_more_context": true|false, "next_targets": '
+            '{"queries": ["code-search terms"], "paths": ["repo/file/paths"]}}. '
+            "Set need_more_context to false and leave next_targets empty when the "
+            "current context is enough to write the fix."
         )
         response, decision = self.ctx.router.run(
             TaskType.ROOT_CAUSE, prompt, sensitivity=pattern.sensitivity
         )
-        # Confidence tracks evidence strength: a stack trace pins the file
-        # (0.8); a code-search hit is circumstantial (0.6 — still above the
-        # default 0.5 gate, but honest about it); nothing found escalates (0.3).
+        summary, need_more, next_targets = _parse_reasoning(response.text)
+        # Confidence is unchanged: it tracks how the FIRST evidence was found
+        # (stack trace 0.8 / search 0.6 / none 0.3), not the loop.
         confidence = _EVIDENCE_CONFIDENCE.get(state.get("evidence_source", "none"), 0.3)
         root_cause = RootCause(
             pattern_id=pattern.id,
-            summary=response.text,
+            summary=summary,
             suspected_files=suspected,
             confidence=confidence,
             reasoning=response.text,
@@ -185,8 +213,14 @@ class RemediationAgent:
             "reason_root_cause",
             confidence=confidence,
             summary=root_cause.summary,
+            need_more_context=need_more,
         )
-        return {"root_cause": root_cause, "routing": _append_routing(state, decision)}
+        return {
+            "root_cause": root_cause,
+            "need_more_context": need_more,
+            "next_targets": next_targets,
+            "routing": _append_routing(state, decision),
+        }
 
     def _confidence_gate(self, state: AgentState) -> str:
         root_cause = state.get("root_cause")
