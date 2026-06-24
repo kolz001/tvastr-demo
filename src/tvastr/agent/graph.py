@@ -45,6 +45,8 @@ def _append_routing(state: AgentState, decision: RoutingDecision) -> list[Routin
 
 
 _EVIDENCE_CONFIDENCE = {"stack_trace": 0.8, "search": 0.6}
+_MAX_EXPANSIONS = 2  # extra retrieval rounds beyond the first investigate pass
+_MAX_CONTEXT_FILES = 12  # cap on accumulated code_files
 
 
 def _search_query_from_message(message: str) -> str:
@@ -173,6 +175,7 @@ class RemediationAgent:
             "evidence_source": evidence_source,
             "code_files": code_files,
             "code_context": format_code_for_prompt(code_files),
+            "retrieved_paths": set(suspected),
         }
 
     def _reason_root_cause(self, state: AgentState) -> AgentState:
@@ -221,6 +224,54 @@ class RemediationAgent:
             "next_targets": next_targets,
             "routing": _append_routing(state, decision),
         }
+
+    def _expand_context(self, state: AgentState) -> AgentState:
+        pattern = state["pattern"]
+        iteration = state.get("retrieval_iterations", 0) + 1
+        targets = state.get("next_targets") or {"queries": [], "paths": []}
+        seen = set(state.get("retrieved_paths", set()))
+        code_files = dict(state.get("code_files", {}))
+        self._emit("agent.node.start", "expand_context", pattern=pattern.fingerprint, iteration=iteration)
+        try:
+            # New paths come from fresh searches + the LLM's explicit path picks.
+            new_paths: list[str] = []
+            for query in targets["queries"]:
+                if query in seen:
+                    continue
+                seen.add(query)
+                hits = search_codebase(self.ctx, query)
+                self._emit("tool.call", "search_codebase", query=query, paths=hits)
+                for hit in hits:
+                    if hit not in seen and hit not in code_files and hit not in new_paths:
+                        new_paths.append(hit)
+            for path in targets["paths"]:
+                if path not in seen and path not in code_files and path not in new_paths:
+                    new_paths.append(path)
+
+            budget = max(0, _MAX_CONTEXT_FILES - len(code_files))
+            to_fetch = new_paths[:budget]
+            fetched = retrieve_code_files(self.ctx, to_fetch, max_files=budget) if to_fetch else {}
+            missing = [p for p in to_fetch if p not in fetched]
+            self._emit(
+                "tool.call", "retrieve_code_files",
+                requested=len(to_fetch), retrieved=len(fetched), paths=list(fetched.keys()),
+            )
+            code_files.update(fetched)
+            seen.update(to_fetch)
+            self._emit(
+                "agent.node.end", "expand_context",
+                files_added=len(fetched), missing_paths=missing, total_files=len(code_files),
+            )
+            return {
+                "code_files": code_files,
+                "code_context": format_code_for_prompt(code_files),
+                "retrieved_paths": seen,
+                "retrieval_iterations": iteration,
+            }
+        except Exception as exc:  # never crash the run — bump the counter so the cap stops us
+            log.warning("agent.expand_context.failed", error=str(exc))
+            self._emit("agent.node.end", "expand_context", files_added=0, missing_paths=[], error=str(exc))
+            return {"retrieval_iterations": iteration}
 
     def _confidence_gate(self, state: AgentState) -> str:
         root_cause = state.get("root_cause")

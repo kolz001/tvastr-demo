@@ -30,6 +30,8 @@ class AgentState(TypedDict, total=False):
     evidence_source: str  # stack_trace | search | none — how suspected_files were found
     need_more_context: bool  # reasoning asked for another retrieval round
     next_targets: dict  # {"queries": list[str], "paths": list[str]} from reasoning
+    retrieval_iterations: int  # number of expand_context rounds run
+    retrieved_paths: set[str]  # paths fetched + queries issued, for cross-round dedup
     root_cause: RootCause
     fix: FixProposal
     pr_draft: PullRequestDraft
