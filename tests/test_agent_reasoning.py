@@ -81,7 +81,8 @@ def test_reason_node_writes_directives(scripted_reasoning):
          '"next_targets": {"queries": ["candidates_token_count"], "paths": []}}'],
     )
     agent = RemediationAgent(_ctx(ListEventSink(), router))
-    out = agent._reason_root_cause({"pattern": _pattern(), "suspected_files": [], "code_context": ""})
+    state = {"pattern": _pattern(), "suspected_files": [], "code_context": ""}
+    out = agent._reason_root_cause(state)
     assert out["need_more_context"] is True
     assert out["next_targets"]["queries"] == ["candidates_token_count"]
     assert out["root_cause"].summary == "parser ignores renamed field"
@@ -91,6 +92,7 @@ def test_reason_node_prose_response_is_single_pass():
     # The default MockClaudeClient returns prose -> no directives -> need_more False.
     settings = Settings(use_mocks=True, audit_backend="memory")
     agent = RemediationAgent(_ctx(ListEventSink(), build_router(settings)))
-    out = agent._reason_root_cause({"pattern": _pattern(), "suspected_files": [], "code_context": ""})
+    state = {"pattern": _pattern(), "suspected_files": [], "code_context": ""}
+    out = agent._reason_root_cause(state)
     assert out["need_more_context"] is False
     assert out["next_targets"] == {"queries": [], "paths": []}

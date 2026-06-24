@@ -6,6 +6,9 @@ Flow::
         high → generate_fix → compare_to_pr → draft_pr → open_pr → notify → END
         low  → notify (skipped) → END
 
+    reason_root_cause may loop through expand_context (bounded to 2 extra
+    rounds) to fetch code its own analysis asked for before the gate fires.
+
     compare_to_pr benchmarks the agent's fix against the upstream PR (the
     ground-truth oracle) when one was discovered; it emits benchmark.compared
     or benchmark.skipped and never blocks the act path.
@@ -101,6 +104,7 @@ class RemediationAgent:
         g: StateGraph = StateGraph(AgentState)
         g.add_node("investigate", self._investigate)
         g.add_node("reason_root_cause", self._reason_root_cause)
+        g.add_node("expand_context", self._expand_context)
         g.add_node("generate_fix", self._generate_fix)
         g.add_node("compare_to_pr", self._compare_to_pr)
         g.add_node("draft_pr", self._draft_pr)
@@ -111,9 +115,10 @@ class RemediationAgent:
         g.add_edge("investigate", "reason_root_cause")
         g.add_conditional_edges(
             "reason_root_cause",
-            self._confidence_gate,
-            {"act": "generate_fix", "skip": "notify"},
+            self._after_reason,
+            {"expand": "expand_context", "act": "generate_fix", "skip": "notify"},
         )
+        g.add_edge("expand_context", "reason_root_cause")
         g.add_edge("generate_fix", "compare_to_pr")
         g.add_edge("compare_to_pr", "draft_pr")
         g.add_edge("draft_pr", "open_pr")
@@ -231,7 +236,10 @@ class RemediationAgent:
         targets = state.get("next_targets") or {"queries": [], "paths": []}
         seen = set(state.get("retrieved_paths", set()))
         code_files = dict(state.get("code_files", {}))
-        self._emit("agent.node.start", "expand_context", pattern=pattern.fingerprint, iteration=iteration)
+        self._emit(
+            "agent.node.start", "expand_context",
+            pattern=pattern.fingerprint, iteration=iteration,
+        )
         try:
             # New paths come from fresh searches + the LLM's explicit path picks.
             new_paths: list[str] = []
@@ -270,8 +278,22 @@ class RemediationAgent:
             }
         except Exception as exc:  # never crash the run — bump the counter so the cap stops us
             log.warning("agent.expand_context.failed", error=str(exc))
-            self._emit("agent.node.end", "expand_context", files_added=0, missing_paths=[], error=str(exc))
+            self._emit(
+                "agent.node.end", "expand_context",
+                files_added=0, missing_paths=[], error=str(exc),
+            )
             return {"retrieval_iterations": iteration}
+
+    def _should_expand(self, state: AgentState) -> bool:
+        if not state.get("need_more_context"):
+            return False
+        return state.get("retrieval_iterations", 0) < _MAX_EXPANSIONS
+
+    def _after_reason(self, state: AgentState) -> str:
+        """Route out of reasoning: loop to expand_context, or run the gate."""
+        if self._should_expand(state):
+            return "expand"
+        return self._confidence_gate(state)
 
     def _confidence_gate(self, state: AgentState) -> str:
         root_cause = state.get("root_cause")

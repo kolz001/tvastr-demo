@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tvastr.agent.context import AgentContext
 from tvastr.agent.graph import RemediationAgent
 from tvastr.config import Settings
@@ -100,3 +98,86 @@ def test_expand_records_missing_path_and_survives():
     assert out["code_files"] == {}        # no crash; nothing added
     ends = [e for e in sink.events if e.type == "agent.node.end" and e.step == "expand_context"]
     assert ends and ends[-1].payload["missing_paths"] == ["ghost.py"]
+
+
+def _loop_agent(host, router, sink):
+    settings = Settings(use_mocks=True, audit_backend="memory")
+    ctx = AgentContext(
+        router=router, code_host=host, notifier=build_notifier(settings),
+        event_sink=sink, run_id="t",
+    )
+    return RemediationAgent(ctx)
+
+
+def _directive(need_more, queries=(), paths=()):
+    import json
+    return json.dumps({
+        "root_cause": "analysis", "need_more_context": need_more,
+        "next_targets": {"queries": list(queries), "paths": list(paths)},
+    })
+
+
+def test_loop_converges_then_proceeds(scripted_reasoning):
+    settings = Settings(use_mocks=True, audit_backend="memory")
+    host = _FakeHost(
+        search_map={"candidates_token_count": ["core/token_counting.py"]},
+        files={"core/token_counting.py": "real parser code"},
+    )
+    # Pass 0 asks for more; pass 1 is satisfied.
+    router = scripted_reasoning(settings, [
+        _directive(True, queries=["candidates_token_count"]),
+        _directive(False),
+    ])
+    sink = ListEventSink()
+    agent = _loop_agent(host, router, sink)
+    pattern = FailurePattern(
+        fingerprint="f", title="No token count",
+        representative_message="UnexpectedBehavior: No token count",
+    )
+    agent.run({"pattern": pattern, "sample_events": []})
+    expands = [
+        e for e in sink.events
+        if e.type == "agent.node.start" and e.step == "expand_context"
+    ]
+    assert len(expands) == 1                       # exactly one extra round
+    assert "core/token_counting.py" in host.fetched  # it reached the real file
+
+
+def test_loop_stops_at_hard_cap(scripted_reasoning):
+    settings = Settings(use_mocks=True, audit_backend="memory")
+    host = _FakeHost(
+        search_map={"q": ["a.py", "b.py", "c.py", "d.py"]},
+        files=dict.fromkeys(["a.py", "b.py", "c.py", "d.py"], "c"),
+    )
+    # Always asks for more, with a NEW query each round so dedup never stops it.
+    router = scripted_reasoning(settings, [
+        _directive(True, queries=["q"]),
+        _directive(True, paths=["b.py"]),
+        _directive(True, paths=["c.py"]),
+        _directive(True, paths=["d.py"]),
+    ])
+    sink = ListEventSink()
+    agent = _loop_agent(host, router, sink)
+    pattern = FailurePattern(fingerprint="f", title="t", representative_message="m")
+    agent.run({"pattern": pattern, "sample_events": []})
+    expands = [
+        e for e in sink.events
+        if e.type == "agent.node.start" and e.step == "expand_context"
+    ]
+    assert len(expands) == 2                        # _MAX_EXPANSIONS, no infinite loop
+
+
+def test_loop_back_compat_single_pass_on_prose():
+    # Real mock router returns prose -> need_more False -> no expansion at all.
+    from tvastr.llm.router import build_router
+    settings = Settings(use_mocks=True, audit_backend="memory")
+    host = MockGitHubClient()
+    sink = ListEventSink()
+    agent = _loop_agent(host, build_router(settings), sink)
+    pattern = FailurePattern(
+        fingerprint="f", title="ModuleNotFoundError in x",
+        representative_message="ModuleNotFoundError: no mod",
+    )
+    agent.run({"pattern": pattern, "sample_events": []})
+    expands = [e for e in sink.events if e.step == "expand_context"]
+    assert expands == []

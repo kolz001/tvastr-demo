@@ -110,7 +110,10 @@ def scripted_reasoning():
                         task=task.value, target="cloud", model="mock",
                         sensitivity=Sensitivity.INTERNAL, reason="scripted",
                     )
-                    return LLMResponse(text=text, model="mock", target="cloud", mocked=True), decision
+                    return (
+                        LLMResponse(text=text, model="mock", target="cloud", mocked=True),
+                        decision,
+                    )
                 return real.run(task, prompt, **kwargs)
 
         return _Router()
