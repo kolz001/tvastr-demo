@@ -145,26 +145,40 @@ def test_loop_converges_then_proceeds(scripted_reasoning):
 
 def test_loop_stops_at_hard_cap(scripted_reasoning):
     settings = Settings(use_mocks=True, audit_backend="memory")
-    host = _FakeHost(
-        search_map={"q": ["a.py", "b.py", "c.py", "d.py"]},
-        files=dict.fromkeys(["a.py", "b.py", "c.py", "d.py"], "c"),
-    )
-    # Always asks for more, with a NEW query each round so dedup never stops it.
+    host = _FakeHost(files={f"f{i}.py": "c" for i in range(10)})
+    # A NEW path each round (never the no-new-targets guard) — only the hard cap stops it.
     router = scripted_reasoning(settings, [
-        _directive(True, queries=["q"]),
-        _directive(True, paths=["b.py"]),
-        _directive(True, paths=["c.py"]),
-        _directive(True, paths=["d.py"]),
+        _directive(True, paths=["f0.py"]),
+        _directive(True, paths=["f1.py"]),
+        _directive(True, paths=["f2.py"]),
+        _directive(True, paths=["f3.py"]),
     ])
     sink = ListEventSink()
     agent = _loop_agent(host, router, sink)
     pattern = FailurePattern(fingerprint="f", title="t", representative_message="m")
     agent.run({"pattern": pattern, "sample_events": []})
     expands = [
-        e for e in sink.events
-        if e.type == "agent.node.start" and e.step == "expand_context"
+        e for e in sink.events if e.type == "agent.node.start" and e.step == "expand_context"
     ]
-    assert len(expands) == 2                        # _MAX_EXPANSIONS, no infinite loop
+    assert len(expands) == 2  # _MAX_EXPANSIONS — fresh targets each round, so the CAP stops it
+
+
+def test_loop_stops_when_no_new_targets(scripted_reasoning):
+    settings = Settings(use_mocks=True, audit_backend="memory")
+    host = _FakeHost(files={"a.py": "c"})
+    # Round 1 fetches a.py; round 2 re-requests only a.py (already seen) -> stop.
+    router = scripted_reasoning(settings, [
+        _directive(True, paths=["a.py"]),
+        _directive(True, paths=["a.py"]),
+    ])
+    sink = ListEventSink()
+    agent = _loop_agent(host, router, sink)
+    pattern = FailurePattern(fingerprint="f", title="t", representative_message="m")
+    agent.run({"pattern": pattern, "sample_events": []})
+    expands = [
+        e for e in sink.events if e.type == "agent.node.start" and e.step == "expand_context"
+    ]
+    assert len(expands) == 1  # second round blocked by the no-new-targets guard
 
 
 def test_loop_back_compat_single_pass_on_prose():

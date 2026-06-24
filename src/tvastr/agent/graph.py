@@ -287,7 +287,12 @@ class RemediationAgent:
     def _should_expand(self, state: AgentState) -> bool:
         if not state.get("need_more_context"):
             return False
-        return state.get("retrieval_iterations", 0) < _MAX_EXPANSIONS
+        if state.get("retrieval_iterations", 0) >= _MAX_EXPANSIONS:
+            return False
+        targets = state.get("next_targets") or {"queries": [], "paths": []}
+        seen = state.get("retrieved_paths", set())
+        fresh = [t for t in (targets["queries"] + targets["paths"]) if t not in seen]
+        return bool(fresh)
 
     def _after_reason(self, state: AgentState) -> str:
         """Route out of reasoning: loop to expand_context, or run the gate."""
