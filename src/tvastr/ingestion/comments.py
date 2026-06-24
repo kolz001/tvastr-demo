@@ -59,13 +59,18 @@ class ResolutionAssessment:
 
 # --- Detector --------------------------------------------------------------
 
+# A real version token: a "v"-prefixed number (v3, v0.10) or a dotted number
+# (3.2.1). Deliberately NOT bare "\d+" so "fixed in 3 places" / "fixed in 2024"
+# don't read as version references.
+_VER = r"(?:v\d+(?:\.\d+)*|\d+(?:\.\d+)+)"
+
 # Each tuple: (regex, short human label). Compiled lazily for clarity.
 _RESOLVED_PATTERNS: list[tuple[str, str]] = [
     # "fixed/resolved/addressed in <version-or-PR>"
-    (r"\bfixed in\b\s+v?[\d\.]+", "fixed in version"),
-    (r"\bresolved in\b\s+v?[\d\.]+", "resolved in version"),
-    (r"\breleased in\b\s+v?[\d\.]+", "released in version"),
-    (r"\bavailable in\b\s+v?[\d\.]+", "available in version"),
+    (rf"\bfixed in\b\s+{_VER}", "fixed in version"),
+    (rf"\bresolved in\b\s+{_VER}", "resolved in version"),
+    (rf"\breleased in\b\s+{_VER}", "released in version"),
+    (rf"\bavailable in\b\s+{_VER}", "available in version"),
     (r"\bfixed in\b\s+(?:PR\s+)?#\d+", "fixed in PR"),
     (r"\bresolved in\b\s+(?:PR\s+)?#\d+", "resolved in PR"),
     (r"\baddressed in\b\s+(?:PR\s+)?#\d+", "addressed in PR"),
@@ -321,7 +326,16 @@ def assess_issue(
     if cached := _cache_get(key):
         return cached
 
-    comments = fetch_recent_comments(repo, number, token=token, transport=transport)
+    try:
+        comments = fetch_recent_comments(repo, number, token=token, transport=transport)
+    except Exception as exc:
+        # A comments-fetch failure (rate limit, 5xx, 404) must not 500 the
+        # resolution endpoint — degrade to no comments and still assess the
+        # body. Mirrors the body-fetch guard below and the rest of the slice.
+        log.warning(
+            "ingest.comments.fetch_failed", repo=repo, number=number, error=str(exc)
+        )
+        comments = []
     if issue_body is None:
         try:
             issue_body = fetch_issue_body(repo, number, token=token, transport=transport)

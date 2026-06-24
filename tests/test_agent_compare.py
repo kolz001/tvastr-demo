@@ -52,3 +52,4 @@ def test_compare_emits_compared_with_pr_ref():
     diff = PrDiff(files=[PrFile("x.py", "modified", 1, 0, "@@\n+x")])
     agent.run({"pattern": pattern, "sample_events": [], "pr_ref": ref, "pr_diff": diff})
     assert any(e.type == "benchmark.compared" for e in sink.events)
+    assert not any(e.type == "benchmark.skipped" for e in sink.events)

@@ -214,7 +214,9 @@ class Verifier:
                 return self._finish(
                     handle,
                     Verdict.REPRO_BROKEN,
-                    "reproducer",
+                    # The reproducer is exactly what's untrustworthy here, so the
+                    # oracle of record is "none" — matching the timeout branch.
+                    "none",
                     started,
                     {
                         "rerun_exit_code": rerun.exit_code,

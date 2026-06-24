@@ -62,6 +62,14 @@ def test_random_user_fixed_in_is_only_medium() -> None:
     assert r.confidence == "medium"
 
 
+def test_fixed_in_bare_ordinal_is_not_a_version_signal() -> None:
+    """'fixed in 3 places' / 'fixed in 2024' must not read as 'fixed in <version>'
+    — a version token requires a v-prefix or a dotted number."""
+    r = detect_resolution([_comment("I fixed in 3 places but it still breaks")])
+    assert r.confidence == "none"
+    assert "fixed in version" not in r.signals
+
+
 def test_fixed_in_pr_with_hedging_phrase_matches() -> None:
     """Real comment from run-llama/llama_index#19293 — the prompt for this feature."""
     body = (
@@ -260,6 +268,21 @@ def test_assess_live_uses_issue_body_signals_and_caches() -> None:
     second = assess_issue("foo/bar", 7042, token="t", transport=transport)
     assert second == first
     assert calls["n"] == calls_after_first  # served from cache, no new requests
+
+
+def test_assess_degrades_when_comments_fetch_fails() -> None:
+    """A GitHub failure on the comments call must not propagate (which would 500
+    the resolution endpoint) — degrade to no comments and still assess the body."""
+    import httpx
+
+    def handler(request):
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(503, json={"message": "rate limited"})
+        return httpx.Response(200, json={"body": "still investigating, no fix yet"})
+
+    out = assess_issue("foo/bar", 9001, token="t", transport=httpx.MockTransport(handler))
+    assert isinstance(out, ResolutionAssessment)
+    assert out.confidence == "none"
 
 
 # --- API endpoint --------------------------------------------------------

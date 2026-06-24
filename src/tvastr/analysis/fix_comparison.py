@@ -6,9 +6,9 @@ agreement, functional equivalence, the overall verdict, and a rationale.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+from tvastr.analysis._jsonutil import extract_json
 from tvastr.analysis.pr_discovery import PrDiff, PullRequestRef
 from tvastr.domain import FixProposal, RoutingDecision, Sensitivity
 from tvastr.llm.router import TaskType
@@ -48,16 +48,6 @@ class FixComparison:
     confidence: float
 
 
-def _extract_json(text: str) -> dict | None:
-    decoder = json.JSONDecoder()
-    idx = text.find("{")
-    while idx != -1:
-        try:
-            obj, _ = decoder.raw_decode(text[idx:])
-            return obj if isinstance(obj, dict) else None
-        except json.JSONDecodeError:
-            idx = text.find("{", idx + 1)
-    return None
 
 
 def compare_fix_to_pr(
@@ -89,7 +79,7 @@ def compare_fix_to_pr(
     response, decision = router.run(
         TaskType.FIX_COMPARISON, prompt, sensitivity=Sensitivity.INTERNAL, system=_SYSTEM
     )
-    parsed = _extract_json(response.text)
+    parsed = extract_json(response.text)
     if parsed is None:
         log.warning("analysis.compare.unparseable", pr=pr_ref.number)
         return (

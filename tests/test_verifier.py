@@ -184,6 +184,7 @@ def test_verdict_repro_broken_when_rerun_raises_different_exception() -> None:
     result = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
     assert result.verdict == Verdict.REPRO_BROKEN
     assert not result.is_green
+    assert result.oracle == "none"  # the reproducer is what's untrustworthy
     assert "different exception" in result.evidence["hint"]
 
 

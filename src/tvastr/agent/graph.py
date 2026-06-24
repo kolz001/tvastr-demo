@@ -3,8 +3,12 @@
 Flow::
 
     START -> investigate -> reason_root_cause -> (confidence gate)
-        high → generate_fix → draft_pr → open_pr → notify → END
+        high → generate_fix → compare_to_pr → draft_pr → open_pr → notify → END
         low  → notify (skipped) → END
+
+    compare_to_pr benchmarks the agent's fix against the upstream PR (the
+    ground-truth oracle) when one was discovered; it emits benchmark.compared
+    or benchmark.skipped and never blocks the act path.
 
 The confidence gate is the ReAct-style decision point: the agent only acts (opens a
 PR) when its root-cause analysis is confident enough; otherwise it escalates to a

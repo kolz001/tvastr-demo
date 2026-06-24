@@ -3,9 +3,9 @@ issue, and the approach. One cloud call; tolerant of unparseable responses."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+from tvastr.analysis._jsonutil import extract_json
 from tvastr.analysis.pr_discovery import PrDiff, PullRequestRef
 from tvastr.domain import RoutingDecision, Sensitivity
 from tvastr.llm.router import TaskType
@@ -48,18 +48,6 @@ def _diff_blob(diff: PrDiff) -> str:
     return blob
 
 
-def _extract_json(text: str) -> dict | None:
-    decoder = json.JSONDecoder()
-    idx = text.find("{")
-    while idx != -1:
-        try:
-            obj, _ = decoder.raw_decode(text[idx:])
-            return obj if isinstance(obj, dict) else None
-        except json.JSONDecodeError:
-            idx = text.find("{", idx + 1)
-    return None
-
-
 def analyze_pr(
     issue_title: str,
     issue_body: str | None,
@@ -75,7 +63,7 @@ def analyze_pr(
     response, decision = router.run(
         TaskType.PR_ANALYSIS, prompt, sensitivity=Sensitivity.INTERNAL, system=_SYSTEM
     )
-    parsed = _extract_json(response.text)
+    parsed = extract_json(response.text)
     if parsed is None:
         log.warning("analysis.analyze_pr.unparseable", pr=pr_ref.number)
         analysis = PrAnalysis(
