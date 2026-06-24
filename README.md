@@ -77,6 +77,20 @@ make test                # run the test suite (69+ tests, <1s)
 make run                 # start the server  (visit /app for the triage UI, /docs for OpenAPI)
 ```
 
+**Optional — local NER for PII:** the boundary redactor runs on a deterministic
+regex floor out of the box. To also catch unstructured PII (names, locations,
+orgs) with a local model, install the `pii` extra and a spaCy model, then set
+`TVASTR_PII_LOCAL_MODEL=true`:
+
+```bash
+uv sync --extra pii
+uv run python -m spacy download en_core_web_lg
+```
+
+It's strictly additive and fail-open: the regex floor still applies, and any
+model/dependency issue silently falls back to regex-only — redaction never does
+*less* than the floor guarantees. Detection stays entirely on-device.
+
 `make demo` ingests sample LlamaIndex failure logs, clusters them, selects the
 recurring ones, runs the agent on each, and prints the routing decisions and the
 (mock) pull request it would open.

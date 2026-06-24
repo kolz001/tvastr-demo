@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = False
 
+    # --- PII redaction ---
+    # When true, the regex redactor is augmented with a local Presidio (spaCy
+    # NER) layer that catches unstructured PII (names, locations, orgs). Off by
+    # default: requires the ``pii`` extra + a spaCy model; absent either, or on
+    # any model failure, redaction falls back to the regex floor (fail-open).
+    pii_local_model: bool = False
+
     # --- Local LLM (Ollama) ---
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.1"

@@ -10,6 +10,10 @@ import os
 os.environ["TVASTR_USE_MOCKS"] = "true"
 os.environ["TVASTR_AUDIT_BACKEND"] = "memory"
 os.environ["TVASTR_RECURRENCE_THRESHOLD"] = "3"
+# Seal off the optional local-NER layer too: a developer's .env may enable it,
+# which would make redaction non-deterministic across machines (and require the
+# pii extra installed). Tests that exercise it opt in by monkeypatching.
+os.environ["TVASTR_PII_LOCAL_MODEL"] = "false"
 # Pin dry_run=false so tests start from the autonomous-mode baseline. Tests
 # that need dry-run behaviour pass ``Settings(..., dry_run=True)`` explicitly.
 os.environ["TVASTR_DRY_RUN"] = "false"
