@@ -3,7 +3,7 @@
 Flow::
 
     START -> investigate -> reason_root_cause -> (confidence gate)
-        high → generate_fix → compare_to_pr → draft_pr → open_pr → notify → END
+        high → ground_root_cause → generate_fix → compare_to_pr → draft_pr → open_pr → notify → END
         low  → notify (skipped) → END
 
     reason_root_cause may loop through expand_context (bounded to 2 extra
@@ -12,6 +12,9 @@ Flow::
     compare_to_pr benchmarks the agent's fix against the upstream PR (the
     ground-truth oracle) when one was discovered; it emits benchmark.compared
     or benchmark.skipped and never blocks the act path.
+
+    ground_root_cause (live + TVASTR_DOC_GROUNDING only) validates the diagnosis
+    against external docs via web_search before the fix; it never blocks the run.
 
 The confidence gate is the ReAct-style decision point: the agent only acts (opens a
 PR) when its root-cause analysis is confident enough; otherwise it escalates to a
@@ -41,6 +44,10 @@ from tvastr.llm.router import TaskType
 from tvastr.logging import get_logger
 
 log = get_logger(__name__)
+
+_DOC_GROUNDING_SYSTEM = (
+    "You validate a bug diagnosis against authoritative external documentation."
+)
 
 
 def _append_routing(state: AgentState, decision: RoutingDecision) -> list[RoutingDecision]:
@@ -105,6 +112,7 @@ class RemediationAgent:
         g.add_node("investigate", self._investigate)
         g.add_node("reason_root_cause", self._reason_root_cause)
         g.add_node("expand_context", self._expand_context)
+        g.add_node("ground_root_cause", self._ground_root_cause)
         g.add_node("generate_fix", self._generate_fix)
         g.add_node("compare_to_pr", self._compare_to_pr)
         g.add_node("draft_pr", self._draft_pr)
@@ -116,9 +124,10 @@ class RemediationAgent:
         g.add_conditional_edges(
             "reason_root_cause",
             self._after_reason,
-            {"expand": "expand_context", "act": "generate_fix", "skip": "notify"},
+            {"expand": "expand_context", "act": "ground_root_cause", "skip": "notify"},
         )
         g.add_edge("expand_context", "reason_root_cause")
+        g.add_edge("ground_root_cause", "generate_fix")
         g.add_edge("generate_fix", "compare_to_pr")
         g.add_edge("compare_to_pr", "draft_pr")
         g.add_edge("draft_pr", "open_pr")
@@ -312,6 +321,53 @@ class RemediationAgent:
             decision=decision,
         )
         return decision
+
+    def _ground_root_cause(self, state: AgentState) -> AgentState:
+        pattern = state["pattern"]
+        root_cause = state.get("root_cause")
+        if not self.ctx.doc_grounding or root_cause is None:
+            self._emit("doc.skipped", "ground_root_cause", reason="grounding disabled")
+            return {}
+        self._emit("agent.node.start", "ground_root_cause", pattern=pattern.fingerprint)
+        prompt = (
+            f"Failure: {pattern.title}\n"
+            f"Current diagnosis: {root_cause.summary}\n\n"
+            f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
+            "Validate this diagnosis against authoritative external documentation. "
+            "Use web_search ONLY if the root cause depends on third-party API/library "
+            "behavior (e.g. a renamed field or changed return shape in a dependency). "
+            "Return ONLY the corrected root-cause summary in 2-4 sentences; if the "
+            "original was correct, restate it concisely."
+        )
+        try:
+            response, decision = self.ctx.router.run(
+                TaskType.DOC_GROUNDING,
+                prompt,
+                sensitivity=pattern.sensitivity,
+                system=_DOC_GROUNDING_SYSTEM,
+                web_search=True,
+            )
+        except Exception as exc:  # never crash the run
+            log.warning("agent.ground_root_cause.failed", error=str(exc))
+            self._emit("doc.skipped", "ground_root_cause", reason=f"grounding error: {exc}")
+            return {}
+        grounded_summary = response.text.strip() or root_cause.summary
+        changed = grounded_summary != root_cause.summary
+        new_root_cause = root_cause.model_copy(
+            update={"summary": grounded_summary, "reasoning": response.text}
+        )
+        self._emit(
+            "doc.grounded",
+            "ground_root_cause",
+            searched=bool(response.sources),
+            changed=changed,
+            sources=response.sources,
+        )
+        return {
+            "root_cause": new_root_cause,
+            "doc_sources": response.sources,
+            "routing": _append_routing(state, decision),
+        }
 
     def _generate_fix(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
