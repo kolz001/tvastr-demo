@@ -33,7 +33,8 @@ def test_claude_client_web_search_adds_tool_and_extracts_citations(monkeypatch):
             self.citations = citations
 
     class _Msg:
-        content = [_Block("grounded answer", [_Cit("https://docs.example/api")])]
+        def __init__(self):
+            self.content = [_Block("grounded answer", [_Cit("https://docs.example/api")])]
 
     class _Messages:
         def create(self, **kwargs):
@@ -66,7 +67,8 @@ def test_claude_client_without_web_search_passes_no_tools(monkeypatch):
         citations = None
 
     class _Msg:
-        content = [_Block()]
+        def __init__(self):
+            self.content = [_Block()]
 
     class _Messages:
         def create(self, **kwargs):

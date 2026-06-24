@@ -29,12 +29,12 @@ class ClaudeClient:
 
         client = anthropic.Anthropic(api_key=self.api_key)
         log.info("llm.cloud.complete", model=self.model, web_search=web_search)
-        kwargs: dict = dict(
-            model=self.model,
-            max_tokens=2048,
-            system=system or "You are a senior software engineer fixing production bugs.",
-            messages=[{"role": "user", "content": prompt}],
-        )
+        kwargs: dict = {
+            "model": self.model,
+            "max_tokens": 2048,
+            "system": system or "You are a senior software engineer fixing production bugs.",
+            "messages": [{"role": "user", "content": prompt}],
+        }
         if web_search:
             kwargs["tools"] = [_WEB_SEARCH_TOOL]
         message = client.messages.create(**kwargs)
