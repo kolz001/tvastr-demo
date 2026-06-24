@@ -42,6 +42,7 @@ class IssueList(BaseModel):
     sort: SortKey
     label: str
     mode: Literal["live", "mock"]
+    auto_analyze_prs: bool  # whether the UI should auto-analyze the top-5 PRs on load
     issues: list[IssueOut]
 
 
@@ -82,6 +83,7 @@ def list_issues(
         sort=sort,
         label=label,
         mode="mock" if use_mock else "live",
+        auto_analyze_prs=settings.auto_analyze_prs,
         issues=[_to_out(r) for r in records],
     )
 
