@@ -13,6 +13,7 @@ class Verdict(StrEnum):
     VERIFIED_VIA_REPRODUCER = "verified_via_reproducer"
     VERIFIED_VIA_SCOPED_TESTS = "verified_via_scoped_tests"
     UNVERIFIED_SMOKE_IMPORT_ONLY = "unverified_smoke_import_only"
+    REPRO_BROKEN = "repro_broken"
     NO_REPRO = "no_repro"
     STILL_BROKEN = "still_broken"
     REGRESSION = "regression"

@@ -1,7 +1,9 @@
+import typing
 from pathlib import Path
 
 from tvastr.config import Settings
 from tvastr.events import (
+    EventType,
     FanoutEventSink,
     JsonlEventSink,
     ListEventSink,
@@ -112,3 +114,9 @@ def test_list_runs_summarises_persisted_streams(tmp_path: Path) -> None:
     assert summary.issue_title == "Boom"
     assert summary.outcome == "dry_run"
     assert summary.event_count == 3
+
+
+def test_benchmark_event_types_exist() -> None:
+    args = typing.get_args(EventType)
+    assert "benchmark.compared" in args
+    assert "benchmark.skipped" in args

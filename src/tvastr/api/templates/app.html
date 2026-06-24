@@ -103,6 +103,11 @@
   .route.cloud{background:rgba(122,167,255,.13);color:var(--cloud);border:1px solid rgba(122,167,255,.3)}
   .route.rule{background:rgba(139,150,166,.13);color:var(--rule);border:1px solid rgba(139,150,166,.3)}
 
+  /* Resolution chip on issue cards */
+  .res-chip{display:inline-flex;align-items:center;gap:4px;font:600 9px var(--mono);padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em;cursor:help}
+  .res-chip.high{background:rgba(239,111,111,.13);color:var(--error);border:1px solid rgba(239,111,111,.35)}
+  .res-chip.medium{background:rgba(240,184,110,.13);color:var(--warn);border:1px solid rgba(240,184,110,.35)}
+  .res-chip.low{background:var(--surface-3);color:var(--text-dim);border:1px solid var(--border)}
   /* Verification chip + result badges */
   .verify-chip{display:inline-block;font:600 9px var(--mono);padding:1px 4px;border-radius:3px;background:rgba(122,167,255,.18);color:var(--cloud);border:1px solid rgba(122,167,255,.4);margin-right:6px;text-transform:uppercase;letter-spacing:.05em}
   .verdict{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;font:600 11px var(--mono);border-radius:4px;text-transform:uppercase;letter-spacing:.05em}
@@ -120,6 +125,18 @@
 
   footer{max-width:1400px;margin:18px auto 0;text-align:center;color:var(--text-dim);font-size:11px}
   footer code{font:10px var(--mono);background:var(--surface);padding:2px 5px;border-radius:3px;color:var(--text)}
+
+  /* PR chip, analysis, and spinner */
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid #888;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .pr-chip{font-size:12px;padding:2px 6px;border-radius:4px;background:#23304a;color:var(--cloud);border:1px solid rgba(122,167,255,.3);text-decoration:none;display:inline-flex;align-items:center;gap:3px}
+  .pr-chip:hover{background:#2a3d5c}
+  .pr-analyze{font-size:12px;margin-left:6px}
+  .pr-analysis{font-size:12px;margin-top:4px;color:var(--text-dim);line-height:1.45}
+  .pr-analysis .muted{color:var(--text-dim);font:11px var(--mono)}
+  .pr-verdict.yes{color:#4ade80}.pr-verdict.no{color:#f87171}
+  .pr-verdict.partial,.pr-verdict.unknown{color:#fbbf24}
+  .pr-slot{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:2px}
 </style>
 </head>
 <body>
@@ -204,7 +221,7 @@ let selectedIssue = null;
 let activeEventSource = null;
 let currentRunId = null;
 let runHasFix = false;
-const STAGES = ["ingest","cluster","threshold","investigate","reason_root_cause","confidence_gate","generate_fix","draft_pr","open_pr","notify","audit"];
+const STAGES = ["ingest","cluster","threshold","investigate","reason_root_cause","confidence_gate","generate_fix","compare_to_pr","draft_pr","open_pr","notify","audit"];
 const VERIFY_TYPES = new Set([
   "verify.start","verify.repro_synth","verify.baseline",
   "verify.patch_applied","verify.rerun","verify.regression","verify.result"
@@ -213,6 +230,7 @@ const VERDICT_BADGE = {
   verified_via_reproducer:   { kind:"green",  label:"verified · reproducer" },
   verified_via_scoped_tests: { kind:"green",  label:"verified · scoped tests" },
   unverified_smoke_import_only: { kind:"yellow", label:"unverified · smoke import only" },
+  repro_broken:           { kind:"yellow", label:"repro broken · retry" },
   no_repro:               { kind:"yellow", label:"no repro" },
   still_broken:           { kind:"red",    label:"still broken" },
   regression:             { kind:"red",    label:"regression" },
@@ -271,6 +289,7 @@ function renderIssues(data) {
       </div>
       <div class="preview">${html(iss.body_preview || '(no body)')}</div>
       <div class="meta">
+        <span class="res-chip-slot"></span>
         <span class="stat">👍 ${iss.thumbs_up}</span>
         <span class="stat">💬 ${iss.comments}</span>
         <span class="stat">∑ ${iss.reactions}</span>
@@ -280,8 +299,49 @@ function renderIssues(data) {
       <div class="actions">
         <button class="apply-fix">Apply fix (dry-run)</button>
       </div>
+      <div class="pr-slot"></div>
     </div>
   `).join("");
+
+  // Lazy-load the resolution assessment per card. Live mode only — in mock
+  // mode the endpoint short-circuits to confidence='none' anyway.
+  if (data.mode === "live") {
+    document.querySelectorAll(".issue").forEach(el => {
+      const num = parseInt(el.dataset.num, 10);
+      fetch(`/api/resolution?repo=${encodeURIComponent(data.repo)}&number=${num}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(res => {
+          if (!res || res.confidence === "none") return;
+          const slot = el.querySelector(".res-chip-slot");
+          const tooltip = res.signals.length
+            ? `Signals: ${res.signals.join("; ")}\nComments: ${res.comment_count}`
+            + (res.days_since_last_comment != null
+                ? `\nLast comment: ${res.days_since_last_comment}d ago` : "")
+            : `Comments: ${res.comment_count}`;
+          slot.innerHTML = `<span class="res-chip ${html(res.confidence)}" title="${html(tooltip)}">${html(res.label)}</span>`;
+        })
+        .catch(() => { /* silent — resolution chips are best-effort */ });
+    });
+  }
+
+  // Lazy-load PR chip per card. Live mode only — in mock mode the endpoint
+  // returns {pr:null} for every issue so no chips appear (expected).
+  if (data.mode === "live") {
+    let autoBudget = 5;
+    document.querySelectorAll(".issue").forEach(el => {
+      const num = parseInt(el.dataset.num, 10);
+      const slot = el.querySelector(".pr-slot");
+      fetch(`/api/issue-pr?repo=${encodeURIComponent(data.repo)}&number=${num}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(body => {
+          if (!body || !body.pr) return;
+          const auto = autoBudget > 0;
+          if (auto) autoBudget--;
+          loadPrForCardWithRef(data.repo, num, slot, body.pr, auto);
+        })
+        .catch(() => { /* silent — PR chips are best-effort */ });
+    });
+  }
 
   document.querySelectorAll(".issue").forEach(el => {
     el.addEventListener("click", (e) => {
@@ -298,6 +358,51 @@ function renderIssues(data) {
       runPipeline({ repo: data.repo, issue_number: number, dry_run: true });
     });
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR chip + analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Render the PR chip + Analyze button into slot, given the already-fetched pr object.
+function loadPrForCardWithRef(repo, number, slot, pr, autoAnalyze) {
+  slot.innerHTML =
+    `<a class="pr-chip" href="${html(pr.url)}" target="_blank" rel="noopener">PR #${html(String(pr.number))} · ${html(pr.state)} ↗</a>` +
+    `<button class="pr-analyze">Analyze PR</button>` +
+    `<div class="pr-analysis"></div>`;
+  const btn = slot.querySelector(".pr-analyze");
+  const out = slot.querySelector(".pr-analysis");
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    analyzePr(repo, number, btn, out);
+  });
+  if (autoAnalyze) analyzePr(repo, number, btn, out);
+}
+
+async function analyzePr(repo, number, btn, out) {
+  btn.disabled = true;
+  out.innerHTML = `<span class="spinner"></span> analyzing PR…`;
+  try {
+    const r = await fetch("/api/pr-analysis", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ repo, number }),
+    });
+    if (!r.ok) { out.textContent = "analysis unavailable"; return; }
+    const a = await r.json();
+    if (!a.pr || !a.addresses_issue) {
+      out.textContent = "analysis unavailable";
+      return;
+    }
+    out.innerHTML =
+      `<div class="pr-verdict ${html(a.addresses_issue)}">addresses issue: ${html(a.addresses_issue)}</div>` +
+      `<div>${html(a.approach_summary || "")}</div>` +
+      `<div class="muted">files: ${html((a.key_files || []).join(", "))}</div>`;
+  } catch (e) {
+    out.textContent = "analysis failed";
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -417,6 +522,8 @@ function summarize(event) {
     case "verify.rerun":    return `rerun exit=${p.exit_code} · original_exception_seen=${p.original_exception_seen}`;
     case "verify.regression": return `${p.passed||0} passed · ${p.failed||0} failed · ${p.errors||0} errors · ${(p.scope||[]).length} scoped`;
     case "verify.result":   return `verdict=${p.verdict} · oracle=${p.oracle} · ${p.elapsed_s}s`;
+    case "benchmark.compared": return `verdict=${p.verdict} · same root cause=${p.same_root_cause} · PR #${p.pr_number}`;
+    case "benchmark.skipped":  return p.reason || "no upstream PR";
     case "error":           return p.error ? `${p.error}: ${p.message}` : (p.reason || "error");
     default: return JSON.stringify(p).slice(0, 200);
   }
@@ -452,6 +559,10 @@ function appendEvent(event) {
     const meta = VERDICT_BADGE[event.payload?.verdict] || { kind:"yellow", label:event.payload?.verdict || "?" };
     extraHead = ` <span class="verdict ${meta.kind}">${html(meta.label)}</span>`;
   }
+  if (event.type === "benchmark.compared") {
+    const kind = { match: "green", partial: "yellow", divergent: "red" }[event.payload?.verdict] || "yellow";
+    extraHead = ` <span class="verdict ${kind}">${html(event.payload?.verdict || "?")}</span>`;
+  }
   card.innerHTML = `
     <div class="head">
       <span class="chevron">▶</span>
@@ -472,25 +583,49 @@ function appendEvent(event) {
   $("pipeline").parentElement.scrollTop = $("pipeline").parentElement.scrollHeight;
 }
 
-function showVerifyCTA(runId) {
-  if (document.querySelector(`.verify-cta[data-run="${runId}"]`)) return;  // dedupe
-  const cta = document.createElement("div");
-  cta.className = "verify-cta";
-  cta.dataset.run = runId;
-  cta.innerHTML = `
-    Verify this fix in a sandbox? Re-creates the failure, applies the patch, re-runs.
-    Costs ~1 Claude call + ~30s in Docker (or longer cold).
-    <button class="primary">▶ Verify this fix</button>
-  `;
+function showVerifyCTA(runId, opts) {
+  opts = opts || {};
+  let cta = document.querySelector(`.verify-cta[data-run="${runId}"]`);
+  // Dedupe: a plain trigger (duplicate pr.dry_run, replay) must not clobber an
+  // existing CTA — it may be mid-verification or locked green. Only the
+  // post-stream re-arm (opts.lastVerdict set) may rebuild it.
+  if (cta && !opts.lastVerdict) return;
+  if (!cta) {
+    cta = document.createElement("div");
+    cta.className = "verify-cta";
+    cta.dataset.run = runId;
+    cta.dataset.attempt = "0";
+    $("pipeline").appendChild(cta);
+  }
+  const attempt = parseInt(cta.dataset.attempt, 10);
+  let blurb;
+  let btnLabel;
+  if (opts.lastVerdict) {
+    const meta = VERDICT_BADGE[opts.lastVerdict] || { kind:"yellow", label:opts.lastVerdict };
+    blurb = `Last attempt: <span class="verdict ${meta.kind}">${html(meta.label)}</span> · re-run to retry (synthesizes a new reproducer + fresh sandbox).`;
+    btnLabel = "↻ Verify again";
+  } else {
+    blurb = "Verify this fix in a sandbox? Re-creates the failure, applies the patch, re-runs. Costs ~1 Claude call + ~30s in Docker (or longer cold).";
+    btnLabel = "▶ Verify this fix";
+  }
+  cta.innerHTML = `${blurb}<button class="primary">${btnLabel}</button>`;
   cta.querySelector("button").addEventListener("click", () => {
+    cta.dataset.attempt = String(attempt + 1);
     cta.querySelector("button").disabled = true;
     cta.querySelector("button").textContent = "Verifying…";
-    streamVerify(runId);
+    streamVerify(runId, attempt + 1);
   });
-  $("pipeline").appendChild(cta);
 }
 
-async function streamVerify(runId) {
+function appendVerifyAttemptDivider(n) {
+  const d = document.createElement("div");
+  d.style.cssText = "margin:10px 14px 4px;padding:4px 10px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-top:1px dashed var(--border)";
+  d.textContent = `Verification attempt ${n}`;
+  $("pipeline").appendChild(d);
+}
+
+async function streamVerify(runId, attempt) {
+  if (attempt && attempt > 1) appendVerifyAttemptDivider(attempt);
   let resp;
   try {
     resp = await fetch(`/api/runs/${runId}/verify`, {
@@ -504,11 +639,14 @@ async function streamVerify(runId) {
       type: "error", layer: "output", step: "verify",
       payload: {error: String(e)}, timestamp: new Date().toISOString()
     });
+    // Re-enable the CTA so the user can try again.
+    showVerifyCTA(runId, { lastVerdict: "environmental_error" });
     return;
   }
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let lastVerdict = null;
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -522,8 +660,27 @@ async function streamVerify(runId) {
       try {
         const event = JSON.parse(dataLine.slice(6));
         appendEvent(event);
+        if (event.type === "verify.result") {
+          lastVerdict = event.payload && event.payload.verdict;
+        }
       } catch {}
     }
+  }
+
+  // Post-stream: decide whether to re-enable the verify CTA.
+  // "Green" verdicts (reproducer / scoped tests) keep the button locked — the
+  // fix is verified. Everything else re-arms the CTA so the user can retry
+  // with a fresh reproducer + fresh sandbox.
+  const green = lastVerdict === "verified_via_reproducer" || lastVerdict === "verified_via_scoped_tests";
+  if (green) {
+    const cta = document.querySelector(`.verify-cta[data-run="${runId}"]`);
+    if (cta) {
+      const meta = VERDICT_BADGE[lastVerdict];
+      cta.innerHTML = `<span class="verdict green">✓ ${html(meta.label)}</span> <span style="color:var(--text-dim)">Run ${html(runId)} is verified.</span>`;
+    }
+  } else {
+    // Non-green or stream ended without a verdict → let them try again.
+    showVerifyCTA(runId, { lastVerdict: lastVerdict || "environmental_error" });
   }
 }
 

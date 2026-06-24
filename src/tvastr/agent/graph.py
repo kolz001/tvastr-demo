@@ -3,8 +3,12 @@
 Flow::
 
     START -> investigate -> reason_root_cause -> (confidence gate)
-        high → generate_fix → draft_pr → open_pr → notify → END
+        high → generate_fix → compare_to_pr → draft_pr → open_pr → notify → END
         low  → notify (skipped) → END
+
+    compare_to_pr benchmarks the agent's fix against the upstream PR (the
+    ground-truth oracle) when one was discovered; it emits benchmark.compared
+    or benchmark.skipped and never blocks the act path.
 
 The confidence gate is the ReAct-style decision point: the agent only acts (opens a
 PR) when its root-cause analysis is confident enough; otherwise it escalates to a
@@ -26,6 +30,7 @@ from tvastr.agent.tools import (
     search_codebase,
     send_notification,
 )
+from tvastr.analysis.fix_comparison import compare_fix_to_pr
 from tvastr.domain import PullRequestDraft, RootCause, RoutingDecision
 from tvastr.events import PipelineEvent
 from tvastr.llm.router import TaskType
@@ -36,6 +41,19 @@ log = get_logger(__name__)
 
 def _append_routing(state: AgentState, decision: RoutingDecision) -> list[RoutingDecision]:
     return [*state.get("routing", []), decision]
+
+
+_EVIDENCE_CONFIDENCE = {"stack_trace": 0.8, "search": 0.6}
+
+
+def _search_query_from_message(message: str) -> str:
+    """Search terms for a pattern with no exception type.
+
+    Synthetic non-crashing events look like ``UnexpectedBehavior: <issue
+    title>`` — the part after the colon is what's worth grepping for.
+    """
+    tail = message.split(":", 1)[-1].strip()
+    return tail[:120]
 
 
 class RemediationAgent:
@@ -61,6 +79,7 @@ class RemediationAgent:
         g.add_node("investigate", self._investigate)
         g.add_node("reason_root_cause", self._reason_root_cause)
         g.add_node("generate_fix", self._generate_fix)
+        g.add_node("compare_to_pr", self._compare_to_pr)
         g.add_node("draft_pr", self._draft_pr)
         g.add_node("open_pr", self._open_pr)
         g.add_node("notify", self._notify)
@@ -72,7 +91,8 @@ class RemediationAgent:
             self._confidence_gate,
             {"act": "generate_fix", "skip": "notify"},
         )
-        g.add_edge("generate_fix", "draft_pr")
+        g.add_edge("generate_fix", "compare_to_pr")
+        g.add_edge("compare_to_pr", "draft_pr")
         g.add_edge("draft_pr", "open_pr")
         g.add_edge("open_pr", "notify")
         g.add_edge("notify", END)
@@ -85,22 +105,33 @@ class RemediationAgent:
         events = state.get("sample_events", [])
         self._emit("agent.node.start", "investigate", pattern=pattern.fingerprint)
 
+        evidence_source = "none"
         suspected = extract_stack_files(events)
         if suspected:
+            evidence_source = "stack_trace"
             self._emit(
                 "tool.call",
                 "extract_stack_files",
                 source="stack_trace",
                 paths=suspected,
             )
-        elif pattern.exception_type:
-            suspected = search_codebase(self.ctx, pattern.exception_type)
-            self._emit(
-                "tool.call",
-                "search_codebase",
-                query=pattern.exception_type,
-                paths=suspected,
+        else:
+            # No stack trace: grep for the exception type, or — for
+            # non-crashing reports (synthetic "UnexpectedBehavior: <title>"
+            # events) — for the behavior description after the colon.
+            query = pattern.exception_type or _search_query_from_message(
+                pattern.representative_message
             )
+            if query:
+                suspected = search_codebase(self.ctx, query)
+                if suspected:
+                    evidence_source = "search"
+                self._emit(
+                    "tool.call",
+                    "search_codebase",
+                    query=query,
+                    paths=suspected,
+                )
 
         code_files = retrieve_code_files(self.ctx, suspected)
         self._emit(
@@ -118,6 +149,7 @@ class RemediationAgent:
         )
         return {
             "suspected_files": suspected,
+            "evidence_source": evidence_source,
             "code_files": code_files,
             "code_context": format_code_for_prompt(code_files),
         }
@@ -137,7 +169,10 @@ class RemediationAgent:
         response, decision = self.ctx.router.run(
             TaskType.ROOT_CAUSE, prompt, sensitivity=pattern.sensitivity
         )
-        confidence = 0.8 if suspected else 0.3
+        # Confidence tracks evidence strength: a stack trace pins the file
+        # (0.8); a code-search hit is circumstantial (0.6 — still above the
+        # default 0.5 gate, but honest about it); nothing found escalates (0.3).
+        confidence = _EVIDENCE_CONFIDENCE.get(state.get("evidence_source", "none"), 0.3)
         root_cause = RootCause(
             pattern_id=pattern.id,
             summary=response.text,
@@ -186,6 +221,43 @@ class RemediationAgent:
             rationales={c.path: c.rationale for c in fix.changes},
         )
         return {"fix": fix, "routing": _append_routing(state, decision)}
+
+    def _compare_to_pr(self, state: AgentState) -> AgentState:
+        pattern = state["pattern"]
+        pr_ref = state.get("pr_ref")
+        pr_diff = state.get("pr_diff")
+        if pr_ref is None or pr_diff is None:
+            self._emit("benchmark.skipped", "compare_to_pr", reason="no upstream PR found")
+            return {}
+        self._emit("agent.node.start", "compare_to_pr", pr=pr_ref.number)
+        try:
+            comparison, decision = compare_fix_to_pr(
+                pattern.title,
+                state["root_cause"].summary,
+                state["fix"],
+                pr_ref,
+                pr_diff,
+                self.ctx.router,
+            )
+        except Exception as exc:  # never crash the run
+            log.warning("agent.compare_to_pr.failed", error=str(exc))
+            self._emit("benchmark.skipped", "compare_to_pr", reason=f"comparison error: {exc}")
+            return {}
+        self._emit(
+            "benchmark.compared",
+            "compare_to_pr",
+            verdict=comparison.verdict,
+            same_root_cause=comparison.same_root_cause,
+            equivalence=comparison.equivalence,
+            files_both=comparison.files_both,
+            files_ours_only=comparison.files_ours_only,
+            files_theirs_only=comparison.files_theirs_only,
+            rationale=comparison.rationale,
+            confidence=comparison.confidence,
+            pr_number=pr_ref.number,
+            pr_url=pr_ref.url,
+        )
+        return {"fix_comparison": comparison, "routing": _append_routing(state, decision)}
 
     def _draft_pr(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]

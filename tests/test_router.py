@@ -24,3 +24,8 @@ def test_cloud_payload_is_redacted_before_escalation(settings):
     assert decision.target == "cloud"
     assert "redacting" in decision.reason
     assert "EMAIL" in decision.reason
+
+
+def test_pr_analysis_routes_to_cloud(settings):
+    router = build_router(settings)
+    assert router.route_target(TaskType.PR_ANALYSIS, Sensitivity.INTERNAL) == "cloud"

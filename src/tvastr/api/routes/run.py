@@ -113,9 +113,7 @@ def _start_pipeline_thread(
     q: queue.Queue[object],
 ) -> threading.Thread:
     """Run the pipeline in a background thread; emit events onto ``q`` via ``sink``."""
-    settings = get_settings().model_copy(
-        update={"dry_run": dry_run} if dry_run else {}
-    )
+    settings = get_settings().model_copy(update={"dry_run": dry_run} if dry_run else {})
 
     def _run() -> None:
         try:
@@ -136,6 +134,18 @@ def _start_pipeline_thread(
                     )
                 )
                 return
+            from tvastr.analysis.pr_discovery import discover_pr, fetch_pr_diff
+
+            pr_ref = discover_pr(
+                repo, issue.number, token=settings.github_token, use_mocks=settings.use_mocks
+            )
+            pr_diff = None
+            if pr_ref is not None:
+                try:
+                    pr_diff = fetch_pr_diff(repo, pr_ref.number, token=settings.github_token)
+                except Exception as exc:
+                    log.warning("run.pr_diff_failed", error=str(exc))
+                    pr_ref = None
             # Single-issue mode: bypass the recurrence threshold (the user has
             # explicitly picked this issue; the threshold is for autonomous mode).
             settings_for_run = settings.model_copy(update={"recurrence_threshold": 1})
@@ -151,6 +161,7 @@ def _start_pipeline_thread(
             pipeline.run(
                 events=events,
                 run_meta={
+                    "run_id": run_id,
                     "repo": repo,
                     "issue_number": issue.number,
                     "issue_title": issue.title,
@@ -158,6 +169,8 @@ def _start_pipeline_thread(
                     "dry_run": dry_run,
                     "mode": "mock" if settings.use_mocks else "live",
                 },
+                pr_ref=pr_ref,
+                pr_diff=pr_diff,
             )
         except Exception as exc:
             log.exception("run.failed", run_id=run_id)
@@ -208,23 +221,10 @@ async def run_pipeline(request: RunRequest) -> StreamingResponse:
     )
 
     async def event_stream() -> AsyncIterator[str]:
-        # Initial event with the run_id so the client can subscribe / link.
-        opener = PipelineEvent(
-            type="pipeline.start",
-            layer="ingestion",
-            step="run.opened",
-            run_id=run_id,
-            payload={
-                "run_id": run_id,
-                "repo": request.repo,
-                "issue_number": issue.number,
-                "issue_title": issue.title,
-                "issue_url": issue.url,
-                "dry_run": request.dry_run,
-            },
-        )
-        yield _event_to_sse(opener)
-
+        # The pipeline's own pipeline.start (emitted via the sink) carries the
+        # run_id in its payload, so the client gets it from the first streamed
+        # event — no separate synthetic opener needed. This keeps the live
+        # stream identical to the persisted/replayed one.
         loop = asyncio.get_event_loop()
         while True:
             item = await loop.run_in_executor(None, q.get)

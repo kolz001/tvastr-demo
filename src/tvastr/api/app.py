@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from tvastr import __version__
-from tvastr.api.routes import health, issues, remediate, run, verify
+from tvastr.api.routes import health, issues, pr, remediate, run, verify
 from tvastr.config import get_settings
 from tvastr.logging import configure_logging
 
@@ -28,8 +28,9 @@ def create_app() -> FastAPI:
         ),
     )
     app.include_router(health.router)
-    app.include_router(remediate.router)
     app.include_router(issues.router)
+    app.include_router(pr.router)
+    app.include_router(remediate.router)
     app.include_router(run.router)
     app.include_router(verify.router)
 

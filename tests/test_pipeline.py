@@ -1,3 +1,4 @@
+from tvastr.analysis.pr_discovery import PrDiff, PrFile, PullRequestRef
 from tvastr.pipeline import build_pipeline
 
 
@@ -19,3 +20,21 @@ def test_pipeline_records_hybrid_routing(settings):
     targets = {d["target"] for o in run.outcomes for d in o.routing}
     # A remediated pattern exercises cloud reasoning steps.
     assert "cloud" in targets
+
+
+def test_pipeline_seeds_agent_state_with_pr(settings, recurring_events, monkeypatch):
+
+    pipeline = build_pipeline(settings)
+    seen = {}
+    orig = pipeline.agent.run
+
+    def _spy(state):
+        seen.update(state)
+        return orig(state)
+
+    monkeypatch.setattr(pipeline.agent, "run", _spy)
+    ref = PullRequestRef(30, "fix", "open", False, "u", 1)
+    diff = PrDiff(files=[PrFile("x.py", "modified", 1, 0, "@@\n+x")])
+    pipeline.run(events=recurring_events, pr_ref=ref, pr_diff=diff)
+    assert seen.get("pr_ref") == ref
+    assert seen.get("pr_diff") == diff

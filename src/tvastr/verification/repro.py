@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Callable
 
 from tvastr.domain import FailurePattern, LogEvent, RootCause
 from tvastr.llm.router import HybridRouter, TaskType
@@ -65,15 +66,33 @@ _SYSTEM = (
     "You are a senior Python engineer. Produce a minimal reproducer for the "
     "failure described below — 5 to 15 lines of Python that, when run on a "
     "clean install of the target project, re-triggers the original exception. "
+    "If actual source code for the suspected files is shown, use ONLY APIs "
+    "(constructors, method names, kwargs) that appear in that source. Do not "
+    "invent constructor parameters. "
     "Respond with ONLY the Python source — no prose, no markdown fences."
 )
 
 
+def _truncate(text: str, max_lines: int = 200) -> str:
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[:max_lines]) + f"\n# … ({len(lines) - max_lines} more lines elided)"
+
+
 def _build_prompt(
-    pattern: FailurePattern, root_cause: RootCause, sample_events: list[LogEvent]
+    pattern: FailurePattern,
+    root_cause: RootCause,
+    sample_events: list[LogEvent],
+    code_context: str = "",
 ) -> str:
     sample = sample_events[0] if sample_events else None
     trace = sample.stack_trace if sample and sample.stack_trace else "(no traceback available)"
+    code_section = (
+        f"Actual source of the suspected files (use only these APIs):\n{code_context}\n\n"
+        if code_context.strip()
+        else ""
+    )
     return (
         f"Failure title: {pattern.title}\n"
         f"Exception type: {pattern.exception_type or '(unknown)'}\n"
@@ -81,6 +100,7 @@ def _build_prompt(
         f"Root cause analysis: {root_cause.summary}\n"
         f"Suspected files: {', '.join(root_cause.suspected_files) or '(unknown)'}\n\n"
         f"Traceback excerpt:\n{trace[:2000]}\n\n"
+        f"{code_section}"
         "Write the reproducer."
     )
 
@@ -98,8 +118,17 @@ def synthesize_reproducer(
     sample_events: list[LogEvent],
     issue_body: str | None,
     router: HybridRouter,
+    code_context: str | Callable[[], str] = "",
 ) -> Reproducer:
-    """Best-effort: body → Claude. Returns the lower-cost option that works."""
+    """Best-effort: body → Claude. Returns the lower-cost option that works.
+
+    ``code_context`` is the actual source of the suspected files (formatted by
+    :func:`tvastr.agent.tools.code_retrieval.format_code_for_prompt`). When
+    provided, the prompt instructs Claude to use only APIs visible in that
+    source — the cheapest way to reduce hallucinated constructor params. A
+    callable is resolved lazily, only on the Claude path — fetching source is
+    wasted work when the issue body already contains a runnable block.
+    """
     if (extracted := extract_from_body(issue_body or "")) is not None:
         log.info("verify.repro.extracted", lines=extracted.count("\n") + 1)
         return Reproducer(
@@ -108,7 +137,10 @@ def synthesize_reproducer(
             expected_exception=pattern.exception_type,
         )
 
-    prompt = _build_prompt(pattern, root_cause, sample_events)
+    resolved_context = code_context() if callable(code_context) else code_context
+    prompt = _build_prompt(
+        pattern, root_cause, sample_events, code_context=_truncate(resolved_context)
+    )
     response, _ = router.run(
         TaskType.FIX_GENERATION,
         prompt,

@@ -77,7 +77,12 @@ class RemediationPipeline:
         )
 
     def run(
-        self, events: list[LogEvent] | None = None, *, run_meta: dict | None = None
+        self,
+        events: list[LogEvent] | None = None,
+        *,
+        run_meta: dict | None = None,
+        pr_ref: object | None = None,
+        pr_diff: object | None = None,
     ) -> PipelineRun:
         self._emit("pipeline.start", "pipeline", **(run_meta or {}))
         if events is None:
@@ -132,7 +137,14 @@ class RemediationPipeline:
                 pattern=pattern.fingerprint,
                 title=pattern.title,
             )
-            final = self.agent.run({"pattern": pattern, "sample_events": sample_events})
+            final = self.agent.run(
+                {
+                    "pattern": pattern,
+                    "sample_events": sample_events,
+                    "pr_ref": pr_ref,
+                    "pr_diff": pr_diff,
+                }
+            )
             self.threshold.mark_handled(pattern)
 
             pr_result = final.get("pr_result")
@@ -140,11 +152,7 @@ class RemediationPipeline:
             routing = final.get("routing", [])
             outcome_label = final.get("outcome", "skipped")
             # In dry-run, the PR URL is a sentinel — don't pollute the audit log with it.
-            audit_pr_url = (
-                pr_result.url
-                if pr_result and not pr_result.dry_run
-                else None
-            )
+            audit_pr_url = pr_result.url if pr_result and not pr_result.dry_run else None
             record = AuditRecord(
                 pattern_id=pattern.id,
                 pattern_title=pattern.title,

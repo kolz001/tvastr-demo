@@ -75,3 +75,11 @@ def sensitive_event() -> LogEvent:
             "ConnectionError: failed for user jane.doe@example.com token sk-ant-REDACTEDABC123"
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def clear_pr_discovery_cache() -> None:
+    """Clear the pr_discovery cache before each test for test isolation."""
+    from tvastr.analysis import pr_discovery
+
+    pr_discovery._cache.clear()

@@ -79,12 +79,32 @@ class GitHubClient:
 
     def search_code(self, query: str, *, limit: int = 5) -> list[str]:
         from github import Github  # lazy import
+        from github.GithubException import GithubException
 
         gh = Github(self.token)
-        results = gh.search_code(f"{query} repo:{self.repo_name}")
         paths: list[str] = []
-        for item in results[:limit]:
-            paths.append(item.path)
+        try:
+            results = gh.search_code(f"{query} repo:{self.repo_name}")
+            # Iterate directly rather than slicing: PaginatedList's index-based
+            # slice (results[:limit]) can overrun the materialised page when the
+            # search API's reported count is optimistic, raising IndexError. Its
+            # __iter__ only yields actually-fetched elements, so it is safe.
+            for item in results:
+                if len(paths) >= limit:
+                    break
+                paths.append(item.path)
+        except (GithubException, IndexError) as exc:
+            # A search failure (rate limit, 422 on a free-text query) or the
+            # pagination quirk above must not crash the run — degrade to "no
+            # suspected files" so the agent escalates to a human via the
+            # confidence gate instead.
+            log.warning(
+                "github.search_code.failed",
+                repo=self.repo_name,
+                query=query,
+                error=str(exc),
+            )
+            return []
         log.info("github.search_code", repo=self.repo_name, query=query, hits=len(paths))
         return paths
 

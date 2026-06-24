@@ -7,8 +7,9 @@ Given a fix proposal, an issue, and an agent context, runs:
     3. baseline run           → reproducer pre-patch
     4. apply_changes          → patch the sandbox
     5. rerun                  → reproducer post-patch
-    6. optional regression    → scoped tests post-patch
-    7. judge                  → Verdict + evidence
+    6. triage rerun outcome   → STILL_BROKEN / REPRO_BROKEN / ENVIRONMENTAL_ERROR
+    7. optional regression    → scoped tests, only once the reproducer is green
+    8. judge                  → Verdict + evidence
 
 Emits ``verify.*`` events through the same ``EventSink`` the rest of the
 pipeline uses, so a verification can be streamed live and persisted alongside
@@ -21,6 +22,7 @@ import time
 from pathlib import Path
 
 from tvastr.agent.context import AgentContext
+from tvastr.agent.tools.code_retrieval import format_code_for_prompt, retrieve_code_files
 from tvastr.domain import FailurePattern, FixProposal, LogEvent, RootCause
 from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.logging import get_logger
@@ -95,10 +97,30 @@ class Verifier:
             {"sandbox": self.sandbox.name, "pattern": pattern.fingerprint},
         )
 
-        # 1. Reproducer
+        # 1. Reproducer. Source for the suspected files is supplied lazily —
+        # synthesize_reproducer only resolves it on the Claude path, so issues
+        # whose body already carries a runnable block skip the retrieval. When
+        # Claude does synthesize, seeing the real APIs (constructor params,
+        # method names) stops it hallucinating parameters that don't exist.
+        def _code_context() -> str:
+            try:
+                if root_cause.suspected_files:
+                    files = retrieve_code_files(
+                        self.ctx, root_cause.suspected_files, max_files=2
+                    )
+                    return format_code_for_prompt(files)
+            except Exception as exc:
+                log.warning("verify.code_context.failed", error=str(exc))
+            return ""
+
         try:
             repro: Reproducer = synthesize_reproducer(
-                pattern, root_cause, sample_events, issue_body, self.ctx.router
+                pattern,
+                root_cause,
+                sample_events,
+                issue_body,
+                self.ctx.router,
+                code_context=_code_context,
             )
         except Exception as exc:
             return self._fail(
@@ -172,7 +194,43 @@ class Verifier:
                     {"baseline_exit_code": baseline.exit_code, "rerun_exit_code": rerun.exit_code},
                 )
 
-            # 6. Optional regression check (scoped tests)
+            # 6. Triage the rerun outcome honestly — BEFORE spending a scoped
+            # test run on a rerun that gave no meaningful fix signal:
+            #  - exit 0                       → reproducer is happy, fix works
+            #  - timed out                    → environmental
+            #  - non-zero exit, no original   → repro itself is broken (Claude
+            #    referenced an API that doesn't exist, etc.) — don't pretend
+            #    we have a meaningful signal here. Surface as REPRO_BROKEN so
+            #    the UI re-arms the verify button instead of looking green-ish.
+            if rerun.timed_out:
+                return self._finish(
+                    handle,
+                    Verdict.ENVIRONMENTAL_ERROR,
+                    "none",
+                    started,
+                    {"stage": "rerun", "reason": "timeout"},
+                )
+            if rerun.exit_code != 0:
+                return self._finish(
+                    handle,
+                    Verdict.REPRO_BROKEN,
+                    # The reproducer is exactly what's untrustworthy here, so the
+                    # oracle of record is "none" — matching the timeout branch.
+                    "none",
+                    started,
+                    {
+                        "rerun_exit_code": rerun.exit_code,
+                        "rerun_stderr_tail": _tail(rerun.stderr),
+                        "hint": (
+                            "reproducer raised a different exception than the "
+                            "issue's original — Claude likely referenced an "
+                            "API that doesn't exist; retry to resynthesise."
+                        ),
+                    },
+                )
+
+            # 7. Optional regression check (scoped tests) — only worth running
+            # once the reproducer itself is green.
             if self.project_root is not None:
                 scoped = discover_scoped_tests(fix.changes, self.project_root)
                 if scoped:
@@ -191,17 +249,10 @@ class Verifier:
                             {"scope": scoped, **counts},
                         )
 
-            # The reproducer was happy → the strongest signal we have.
-            verdict = (
-                Verdict.VERIFIED_VIA_REPRODUCER
-                if rerun.succeeded
-                else Verdict.UNVERIFIED_SMOKE_IMPORT_ONLY
-            )
-            oracle = "reproducer" if verdict == Verdict.VERIFIED_VIA_REPRODUCER else "smoke_import"
             return self._finish(
                 handle,
-                verdict,
-                oracle,
+                Verdict.VERIFIED_VIA_REPRODUCER,
+                "reproducer",
                 started,
                 {"rerun_exit_code": rerun.exit_code},
             )
