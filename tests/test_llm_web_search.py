@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import types
-
 from tvastr.llm.base import LLMResponse
 from tvastr.llm.claude import ClaudeClient
 from tvastr.llm.router import HybridRouter, TaskType
@@ -16,7 +14,9 @@ def test_llmresponse_sources_defaults_empty():
 
 def test_doc_grounding_is_a_cloud_task():
     # Not in the local set, so it routes to cloud (and gets redacted).
+    from tvastr.llm.router import _LOCAL_TASKS
     assert TaskType.DOC_GROUNDING.value == "doc_grounding"
+    assert TaskType.DOC_GROUNDING not in _LOCAL_TASKS
 
 
 def test_claude_client_web_search_adds_tool_and_extracts_citations(monkeypatch):

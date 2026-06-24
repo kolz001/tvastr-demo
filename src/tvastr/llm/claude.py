@@ -44,10 +44,10 @@ class ClaudeClient:
         for block in message.content:
             if getattr(block, "type", None) == "text":
                 text_parts.append(block.text)
-            for cit in getattr(block, "citations", None) or []:
-                url = getattr(cit, "url", None)
-                if url and url not in sources:
-                    sources.append(url)
+                for cit in getattr(block, "citations", None) or []:
+                    url = getattr(cit, "url", None)
+                    if url and url not in sources:
+                        sources.append(url)
         return LLMResponse(
             text="".join(text_parts), model=self.model, target=self.target, sources=sources
         )
