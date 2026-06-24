@@ -327,7 +327,9 @@ function renderIssues(data) {
   // Lazy-load PR chip per card. Live mode only — in mock mode the endpoint
   // returns {pr:null} for every issue so no chips appear (expected).
   if (data.mode === "live") {
-    let autoBudget = 5;
+    // PR discovery (chips) is always best-effort; auto-analysis (a cloud call
+    // per PR) only runs when explicitly enabled via TVASTR_AUTO_ANALYZE_PRS.
+    let autoBudget = data.auto_analyze_prs ? 5 : 0;
     document.querySelectorAll(".issue").forEach(el => {
       const num = parseInt(el.dataset.num, 10);
       const slot = el.querySelector(".pr-slot");

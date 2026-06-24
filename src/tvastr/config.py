@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # any model failure, redaction falls back to the regex floor (fail-open).
     pii_local_model: bool = False
 
+    # --- Triage UI ---
+    # When true, the triage UI auto-analyzes the top 5 discovered PRs on load
+    # (one cloud LLM call each). Off by default so loading the issue list never
+    # silently spends cloud calls; users can still analyze any PR on demand via
+    # the per-card "Analyze PR" button.
+    auto_analyze_prs: bool = False
+
     # --- Local LLM (Ollama) ---
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.1"

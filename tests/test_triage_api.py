@@ -26,6 +26,12 @@ def test_issues_endpoint_returns_mock_issues_by_default() -> None:
         assert key in first
 
 
+def test_issues_endpoint_auto_analyze_prs_defaults_false() -> None:
+    # The UI must not auto-spend cloud calls on load unless explicitly enabled.
+    resp = client.get("/api/issues")
+    assert resp.json()["auto_analyze_prs"] is False
+
+
 def test_issues_sorted_by_thumbs_up_descending() -> None:
     resp = client.get("/api/issues?sort=reactions-%2B1")
     data = resp.json()
