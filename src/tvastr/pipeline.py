@@ -232,6 +232,9 @@ def build_pipeline(
         notifier=build_notifier(settings),
         event_sink=sink,
         run_id=run_id,
+        doc_grounding=settings.doc_grounding
+        and not settings.use_mocks
+        and bool(settings.anthropic_api_key),
     )
     return RemediationPipeline(
         detector=FailureDetector(),

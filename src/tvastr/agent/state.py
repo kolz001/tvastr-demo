@@ -42,3 +42,4 @@ class AgentState(TypedDict, total=False):
     pr_ref: PullRequestRef | None
     pr_diff: PrDiff | None
     fix_comparison: FixComparison | None
+    doc_sources: list[str]  # citation URLs from documentation grounding
