@@ -87,3 +87,35 @@ def clear_pr_discovery_cache() -> None:
     from tvastr.analysis import pr_discovery
 
     pr_discovery._cache.clear()
+
+
+@pytest.fixture
+def scripted_reasoning():
+    """Factory for a router that returns scripted ROOT_CAUSE responses (to drive
+    the iterative-retrieval loop) and delegates every other task to the real mock
+    router. Usage: router = scripted_reasoning(settings, [text_pass0, text_pass1])."""
+    from tvastr.domain import RoutingDecision, Sensitivity
+    from tvastr.llm.base import LLMResponse
+    from tvastr.llm.router import TaskType, build_router
+
+    def _make(settings, root_cause_texts):
+        real = build_router(settings)
+        texts = list(root_cause_texts)
+
+        class _Router:
+            def run(self, task, prompt, **kwargs):
+                if task == TaskType.ROOT_CAUSE and texts:
+                    text = texts.pop(0)
+                    decision = RoutingDecision(
+                        task=task.value, target="cloud", model="mock",
+                        sensitivity=Sensitivity.INTERNAL, reason="scripted",
+                    )
+                    return (
+                        LLMResponse(text=text, model="mock", target="cloud", mocked=True),
+                        decision,
+                    )
+                return real.run(task, prompt, **kwargs)
+
+        return _Router()
+
+    return _make
