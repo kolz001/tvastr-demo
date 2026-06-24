@@ -242,7 +242,5 @@ def generate_fix(
             "Add a regression test reproducing the failure; assert it no longer occurs."
         )
 
-    fix = FixProposal(
-        pattern_id=pattern.id, summary=summary, changes=changes, test_plan=test_plan
-    )
+    fix = FixProposal(pattern_id=pattern.id, summary=summary, changes=changes, test_plan=test_plan)
     return fix, decision
