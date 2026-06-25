@@ -116,3 +116,4 @@ def test_bootstrap_resolves_and_copies(tmp_path):
     assert "find_spec" in src
     assert "shutil.copyfile" in src
     assert ".origin" in src
+    assert "except Exception" in src

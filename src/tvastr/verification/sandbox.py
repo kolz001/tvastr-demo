@@ -36,11 +36,14 @@ import importlib.util, json, pathlib, shutil
 mani = json.loads(pathlib.Path("/work/.tvastr_patch/manifest.json").read_text())
 for module, staged in mani:
     spec = importlib.util.find_spec(module)
-    if spec and spec.origin:
+    if not (spec and spec.origin):
+        print(f"[tvastr] skip unresolved module: {module}")
+        continue
+    try:
         shutil.copyfile(f"/work/.tvastr_patch/{staged}", spec.origin)
         print(f"[tvastr] patched {module} -> {spec.origin}")
-    else:
-        print(f"[tvastr] skip unresolved module: {module}")
+    except Exception as e:
+        print(f"[tvastr] skip uncopyable {module}: {e}")
 '''
 
 
