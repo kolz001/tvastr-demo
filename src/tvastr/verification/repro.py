@@ -15,7 +15,12 @@ from collections.abc import Callable
 from tvastr.domain import FailurePattern, LogEvent, RootCause
 from tvastr.llm.router import HybridRouter, TaskType
 from tvastr.logging import get_logger
-from tvastr.verification.models import Reproducer, ReproducerSource
+from tvastr.verification.models import (
+    BEHAVIOR_OK_MARKER,
+    Reproducer,
+    ReproducerKind,
+    ReproducerSource,
+)
 
 log = get_logger(__name__)
 
@@ -63,13 +68,23 @@ def extract_from_body(body: str) -> str | None:
 
 
 _SYSTEM = (
-    "You are a senior Python engineer. Produce a minimal reproducer for the "
-    "failure described below — 5 to 15 lines of Python that, when run on a "
-    "clean install of the target project, re-triggers the original exception. "
-    "If actual source code for the suspected files is shown, use ONLY APIs "
-    "(constructors, method names, kwargs) that appear in that source. Do not "
-    "invent constructor parameters. "
-    "Respond with ONLY the Python source — no prose, no markdown fences."
+    "You are a senior Python engineer. Produce a MINIMAL reproducer (5-20 lines) "
+    "for the failure below, runnable on a clean install of the target project.\n\n"
+    "PREFER a BEHAVIORAL reproducer: set up the scenario, exercise the buggy "
+    "operation, and ASSERT the expected CORRECT result (e.g. data round-trips, "
+    "the returned value equals what was stored). End the script with exactly:\n"
+    f"    print(\"{BEHAVIOR_OK_MARKER}\")\n"
+    "so the marker prints ONLY if every assertion passed. A fix that merely "
+    "suppresses the error without restoring behavior must fail your assertion.\n\n"
+    "If you CANNOT determine the expected correct behavior from the issue and "
+    "code, FALL BACK to a crash reproducer that simply re-triggers the original "
+    "exception (no assertion, no marker).\n\n"
+    "The FIRST line of your response MUST be one of:\n"
+    "    # tvastr-kind: behavioral\n"
+    "    # tvastr-kind: crash\n"
+    "If actual source of the suspected files is shown, use ONLY APIs that appear "
+    "in it; do not invent constructor parameters. Respond with ONLY Python source "
+    "— no prose, no markdown fences."
 )
 
 
@@ -101,6 +116,8 @@ def _build_prompt(
         f"Suspected files: {', '.join(root_cause.suspected_files) or '(unknown)'}\n\n"
         f"Traceback excerpt:\n{trace[:2000]}\n\n"
         f"{code_section}"
+        f"Start your response with # tvastr-kind: behavioral or # tvastr-kind: crash.\n"
+        f"If behavioral, end with print(\"{BEHAVIOR_OK_MARKER}\").\n"
         "Write the reproducer."
     )
 
@@ -110,6 +127,14 @@ def _strip_fences(text: str) -> str:
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:python|py)?\s*|\s*```$", "", stripped, flags=re.DOTALL).strip()
     return stripped
+
+
+def _parse_kind(code: str) -> ReproducerKind:
+    """Read the leading `# tvastr-kind:` tag; default CRASH when absent/unknown."""
+    first = code.lstrip().splitlines()[0] if code.strip() else ""
+    if "tvastr-kind:" in first and "behavioral" in first:
+        return ReproducerKind.BEHAVIORAL
+    return ReproducerKind.CRASH
 
 
 def synthesize_reproducer(
@@ -148,9 +173,16 @@ def synthesize_reproducer(
         system=_SYSTEM,
     )
     code = _strip_fences(response.text)
-    log.info("verify.repro.synthesized", lines=code.count("\n") + 1, model=response.model)
+    kind = _parse_kind(code)
+    log.info(
+        "verify.repro.synthesized",
+        lines=code.count("\n") + 1,
+        model=response.model,
+        kind=kind.value,
+    )
     return Reproducer(
         source=ReproducerSource.CLAUDE,
         code=code,
         expected_exception=pattern.exception_type,
+        kind=kind,
     )
