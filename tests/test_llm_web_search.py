@@ -106,7 +106,10 @@ def test_claude_client_web_search_falls_back_when_force_rejected(monkeypatch):
         def create(self, **kwargs):
             calls.append(kwargs)
             if "tool_choice" in kwargs:
-                raise RuntimeError("tool_choice not supported for server tool")
+                import anthropic
+                # Construct a BadRequestError without a real HTTP response.
+                err = anthropic.BadRequestError.__new__(anthropic.BadRequestError)
+                raise err
             return _Msg()
 
     class _Anthropic:
@@ -121,6 +124,7 @@ def test_claude_client_web_search_falls_back_when_force_rejected(monkeypatch):
     assert len(calls) == 2                  # forced attempt, then unforced retry
     assert "tool_choice" in calls[0]
     assert "tool_choice" not in calls[1]
+    assert "tools" in calls[1]  # tools kept on the unforced retry
 
 
 def test_router_passes_web_search_to_cloud_client_only():

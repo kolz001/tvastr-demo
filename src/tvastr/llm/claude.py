@@ -40,11 +40,12 @@ class ClaudeClient:
             kwargs["tool_choice"] = {"type": "tool", "name": "web_search"}
         try:
             message = client.messages.create(**kwargs)
-        except Exception:
+        except anthropic.BadRequestError:
+            # Some API configs reject forcing the server-side web_search tool with
+            # a 400; retry once offered (non-forced) so grounding still runs. Other
+            # errors (transient network, auth) propagate unchanged.
             if "tool_choice" not in kwargs:
-                raise  # non-web_search failures propagate unchanged
-            # Some API configs reject forcing the server-side web_search tool;
-            # retry once offered (non-forced) so grounding still runs.
+                raise
             log.warning("llm.cloud.web_search.force_rejected", model=self.model)
             kwargs.pop("tool_choice")
             message = client.messages.create(**kwargs)
