@@ -56,6 +56,7 @@ def test_claude_client_web_search_adds_tool_and_extracts_citations(monkeypatch):
     tools = captured.get("tools")
     assert tools and tools[0]["type"] == "web_search_20250305"
     assert tools[0]["max_uses"] == 3
+    assert captured["tool_choice"] == {"type": "tool", "name": "web_search"}
 
 
 def test_claude_client_without_web_search_passes_no_tools(monkeypatch):
@@ -86,6 +87,40 @@ def test_claude_client_without_web_search_passes_no_tools(monkeypatch):
     assert resp.text == "plain"
     assert resp.sources == []
     assert "tools" not in captured  # no tools key when web_search is off
+    assert "tool_choice" not in captured  # only forced when web_search is on
+
+
+def test_claude_client_web_search_falls_back_when_force_rejected(monkeypatch):
+    calls: list[dict] = []
+
+    class _Block:
+        type = "text"
+        text = "grounded after retry"
+        citations = None
+
+    class _Msg:
+        def __init__(self):
+            self.content = [_Block()]
+
+    class _Messages:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if "tool_choice" in kwargs:
+                raise RuntimeError("tool_choice not supported for server tool")
+            return _Msg()
+
+    class _Anthropic:
+        def __init__(self, api_key):
+            self.messages = _Messages()
+
+    import anthropic
+    monkeypatch.setattr(anthropic, "Anthropic", _Anthropic)
+
+    resp = ClaudeClient(api_key="k", model="m").complete("p", web_search=True)
+    assert resp.text == "grounded after retry"
+    assert len(calls) == 2                  # forced attempt, then unforced retry
+    assert "tool_choice" in calls[0]
+    assert "tool_choice" not in calls[1]
 
 
 def test_router_passes_web_search_to_cloud_client_only():

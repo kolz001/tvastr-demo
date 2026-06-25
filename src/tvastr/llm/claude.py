@@ -37,7 +37,17 @@ class ClaudeClient:
         }
         if web_search:
             kwargs["tools"] = [_WEB_SEARCH_TOOL]
-        message = client.messages.create(**kwargs)
+            kwargs["tool_choice"] = {"type": "tool", "name": "web_search"}
+        try:
+            message = client.messages.create(**kwargs)
+        except Exception:
+            if "tool_choice" not in kwargs:
+                raise  # non-web_search failures propagate unchanged
+            # Some API configs reject forcing the server-side web_search tool;
+            # retry once offered (non-forced) so grounding still runs.
+            log.warning("llm.cloud.web_search.force_rejected", model=self.model)
+            kwargs.pop("tool_choice")
+            message = client.messages.create(**kwargs)
 
         text_parts: list[str] = []
         sources: list[str] = []
