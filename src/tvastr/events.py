@@ -53,6 +53,8 @@ EventType = Literal[
     "verify.result",
     "benchmark.compared",
     "benchmark.skipped",
+    "doc.grounded",
+    "doc.skipped",
     "error",
 ]
 

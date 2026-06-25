@@ -40,6 +40,7 @@ class TaskType(StrEnum):
     PR_DESCRIPTION = "pr_description"
     PR_ANALYSIS = "pr_analysis"
     FIX_COMPARISON = "fix_comparison"
+    DOC_GROUNDING = "doc_grounding"
 
 
 _LOCAL_TASKS = {TaskType.LOG_PARSING, TaskType.SUMMARIZATION}
@@ -75,6 +76,7 @@ class HybridRouter:
         *,
         sensitivity: Sensitivity = Sensitivity.INTERNAL,
         system: str | None = None,
+        web_search: bool = False,
     ) -> tuple[LLMResponse, RoutingDecision]:
         target = self.route_target(task, sensitivity)
         client = self.local if target == "local" else self.cloud
@@ -126,7 +128,8 @@ class HybridRouter:
             )
         )
         started = time.perf_counter()
-        response = client.complete(payload, system=system)
+        extra = {"web_search": web_search} if (target == "cloud" and web_search) else {}
+        response = client.complete(payload, system=system, **extra)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.event_sink.emit(
             PipelineEvent(

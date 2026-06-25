@@ -47,3 +47,4 @@ class AgentContext:
     min_confidence: float = 0.5
     event_sink: EventSink = field(default_factory=NullEventSink)
     run_id: str | None = None
+    doc_grounding: bool = False

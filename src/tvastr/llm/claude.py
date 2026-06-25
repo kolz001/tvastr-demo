@@ -12,6 +12,8 @@ from tvastr.logging import get_logger
 
 log = get_logger(__name__)
 
+_WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+
 
 class ClaudeClient:
     target = "cloud"
@@ -20,19 +22,35 @@ class ClaudeClient:
         self.api_key = api_key
         self.model = model
 
-    def complete(self, prompt: str, *, system: str | None = None) -> LLMResponse:
+    def complete(
+        self, prompt: str, *, system: str | None = None, web_search: bool = False
+    ) -> LLMResponse:
         import anthropic  # lazy import: only needed when not mocking
 
         client = anthropic.Anthropic(api_key=self.api_key)
-        log.info("llm.cloud.complete", model=self.model)
-        message = client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            system=system or "You are a senior software engineer fixing production bugs.",
-            messages=[{"role": "user", "content": prompt}],
+        log.info("llm.cloud.complete", model=self.model, web_search=web_search)
+        kwargs: dict = {
+            "model": self.model,
+            "max_tokens": 2048,
+            "system": system or "You are a senior software engineer fixing production bugs.",
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if web_search:
+            kwargs["tools"] = [_WEB_SEARCH_TOOL]
+        message = client.messages.create(**kwargs)
+
+        text_parts: list[str] = []
+        sources: list[str] = []
+        for block in message.content:
+            if getattr(block, "type", None) == "text":
+                text_parts.append(block.text)
+                for cit in getattr(block, "citations", None) or []:
+                    url = getattr(cit, "url", None)
+                    if url and url not in sources:
+                        sources.append(url)
+        return LLMResponse(
+            text="".join(text_parts), model=self.model, target=self.target, sources=sources
         )
-        text = "".join(block.text for block in message.content if block.type == "text")
-        return LLMResponse(text=text, model=self.model, target=self.target)
 
 
 class MockClaudeClient:
@@ -48,7 +66,9 @@ class MockClaudeClient:
     def __init__(self, model: str = "claude-opus-4-7") -> None:
         self.model = model
 
-    def complete(self, prompt: str, *, system: str | None = None) -> LLMResponse:
+    def complete(
+        self, prompt: str, *, system: str | None = None, web_search: bool = False
+    ) -> LLMResponse:
         log.info("llm.cloud.complete", model=self.model, mocked=True)
         if self._looks_like_fix_prompt(prompt, system):
             text = self._mock_fix_json(prompt)

@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # any model failure, redaction falls back to the regex floor (fail-open).
     pii_local_model: bool = False
 
+    # --- Documentation grounding ---
+    # When true (live mode + Anthropic key), the agent runs a web-search-grounded
+    # diagnosis check before generating a fix. Off by default; no-op in mock mode.
+    doc_grounding: bool = False
+
     # --- Triage UI ---
     # When true, the triage UI auto-analyzes the top 5 discovered PRs on load
     # (one cloud LLM call each). Off by default so loading the issue list never

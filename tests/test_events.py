@@ -120,3 +120,32 @@ def test_benchmark_event_types_exist() -> None:
     args = typing.get_args(EventType)
     assert "benchmark.compared" in args
     assert "benchmark.skipped" in args
+
+
+def test_doc_grounding_event_types_exist():
+    import typing
+
+    from tvastr.events import EventType
+    args = typing.get_args(EventType)
+    assert "doc.grounded" in args
+    assert "doc.skipped" in args
+
+
+def test_doc_grounding_setting_defaults_false():
+    from tvastr.config import Settings
+    assert Settings(use_mocks=True).doc_grounding is False
+
+
+def test_agent_context_doc_grounding_defaults_false():
+    from tvastr.agent.context import AgentContext
+
+    # Construct with the minimum required positional deps via keywords; defaults apply.
+    from tvastr.config import Settings
+    from tvastr.integrations import build_notifier
+    from tvastr.integrations.github import MockGitHubClient
+    from tvastr.llm.router import build_router
+    s = Settings(use_mocks=True)
+    ctx = AgentContext(
+        router=build_router(s), code_host=MockGitHubClient(), notifier=build_notifier(s)
+    )
+    assert ctx.doc_grounding is False

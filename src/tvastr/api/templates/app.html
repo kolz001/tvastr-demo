@@ -526,6 +526,8 @@ function summarize(event) {
     case "verify.result":   return `verdict=${p.verdict} · oracle=${p.oracle} · ${p.elapsed_s}s`;
     case "benchmark.compared": return `verdict=${p.verdict} · same root cause=${p.same_root_cause} · PR #${p.pr_number}`;
     case "benchmark.skipped":  return p.reason || "no upstream PR";
+    case "doc.grounded": return `${p.searched ? "searched docs" : "no search"}${p.changed ? " · diagnosis revised" : ""}${(p.sources||[]).length ? ` · ${p.sources.length} source(s)` : ""}`;
+    case "doc.skipped":  return p.reason || "grounding skipped";
     case "error":           return p.error ? `${p.error}: ${p.message}` : (p.reason || "error");
     default: return JSON.stringify(p).slice(0, 200);
   }
