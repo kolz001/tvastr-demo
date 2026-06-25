@@ -36,7 +36,7 @@ Produce a fix as JSON with this exact schema:
   "summary": "1-3 sentences describing the fix and why it addresses the root cause",
   "changes": [
     {
-      "path": "<one of the file paths shown above>",
+      "path": "<one of the EDITABLE file paths shown above>",
       "search": "<exact verbatim substring from that file, including indentation and newlines>",
       "replace": "<the substring that should appear in its place>",
       "rationale": "<one sentence on why this change>"
@@ -123,8 +123,32 @@ def _apply_change(file_content: str, search: str, replace: str) -> tuple[str | N
     return file_content.replace(search, replace, 1), ""
 
 
+def _is_doc_example(path: str) -> bool:
+    """A documentation/example artifact — read-only context, never an edit target.
+
+    True for Jupyter notebooks and anything under a ``docs/`` or ``examples/``
+    directory. Maintainers fix library source, not example notebooks.
+    """
+    if path.endswith(".ipynb"):
+        return True
+    segments = path.split("/")
+    return "docs" in segments or "examples" in segments
+
+
+def _editable_files(code_files: dict[str, str]) -> dict[str, str]:
+    """The subset of retrieved files that may be EDITED — source, not docs/examples.
+
+    Allow-as-fallback: when no source files were retrieved (everything is a
+    doc/example), returns all files so a genuinely notebook-only bug stays fixable.
+    """
+    editable = {p: c for p, c in code_files.items() if not _is_doc_example(p)}
+    return editable or dict(code_files)
+
+
 def _build_real_changes(
-    parsed: _ParsedFix, code_files: dict[str, str]
+    parsed: _ParsedFix,
+    code_files: dict[str, str],
+    allowed_paths: dict[str, str] | None = None,
 ) -> tuple[list[FileChange], list[str]]:
     """Validate + apply each parsed change; return ``(file_changes, errors)``.
 
@@ -135,10 +159,14 @@ def _build_real_changes(
     rationales: dict[str, list[str]] = {}
     errors: list[str] = []
 
+    allowed = code_files if allowed_paths is None else allowed_paths
     for c in parsed.changes:
         path = c["path"]
         if path not in working:
             errors.append(f"{path}: not in retrieved file set")
+            continue
+        if path not in allowed:
+            errors.append(f"{path}: not editable (documentation/example — read-only)")
             continue
         new_content, err = _apply_change(working[path], c["search"], c["replace"])
         if new_content is None:
@@ -202,14 +230,21 @@ def generate_fix(
     root_cause: RootCause,
     code_files: dict[str, str],
 ) -> tuple[FixProposal, RoutingDecision]:
-    code_blob = format_code_for_prompt(code_files) or "(no source files retrieved)"
+    editable = _editable_files(code_files)
+    context_only = {p: c for p, c in code_files.items() if p not in editable}
+    editable_blob = format_code_for_prompt(editable) or "(no source files retrieved)"
     prompt = (
         f"Failure: {pattern.title}\n"
         f"Representative message: {pattern.representative_message}\n"
         f"Root cause: {root_cause.summary}\n\n"
-        f"Source files:\n{code_blob}\n\n"
-        f"{_PROMPT_SCHEMA_HINT}"
+        f"EDITABLE source files (your fix MUST target one of these):\n{editable_blob}\n\n"
     )
+    if context_only:
+        prompt += (
+            "READ-ONLY context (do NOT edit — examples/docs):\n"
+            f"{format_code_for_prompt(context_only)}\n\n"
+        )
+    prompt += _PROMPT_SCHEMA_HINT
     response, decision = ctx.router.run(
         TaskType.FIX_GENERATION, prompt, sensitivity=pattern.sensitivity, system=_SYSTEM
     )
@@ -220,7 +255,7 @@ def generate_fix(
         summary = response.text.strip()[:500]
         test_plan = "Add a regression test reproducing the failure; assert it no longer occurs."
     else:
-        changes, errors = _build_real_changes(parsed, code_files)
+        changes, errors = _build_real_changes(parsed, code_files, editable)
         if not changes:
             log.warning(
                 "tool.fix_generation.no_valid_changes",
