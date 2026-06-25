@@ -27,7 +27,9 @@ from tvastr.domain import FailurePattern, FixProposal, LogEvent, RootCause
 from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.logging import get_logger
 from tvastr.verification.models import (
+    BEHAVIOR_OK_MARKER,
     Reproducer,
+    ReproducerKind,
     RunResult,
     Verdict,
     VerificationResult,
@@ -152,7 +154,12 @@ class Verifier:
                     "timed_out": baseline.timed_out,
                 },
             )
-            if not saw_original and baseline.succeeded:
+            is_behavioral = repro.kind == ReproducerKind.BEHAVIORAL
+            if is_behavioral:
+                baseline_reproduced = BEHAVIOR_OK_MARKER not in baseline.stdout
+            else:
+                baseline_reproduced = saw_original or not baseline.succeeded
+            if not baseline_reproduced:
                 # Reproducer ran cleanly without ever hitting the bug: we have
                 # no signal to evaluate "is the fix necessary?" — be honest.
                 return self._finish(
@@ -210,24 +217,60 @@ class Verifier:
                     started,
                     {"stage": "rerun", "reason": "timeout"},
                 )
-            if rerun.exit_code != 0:
-                return self._finish(
-                    handle,
-                    Verdict.REPRO_BROKEN,
-                    # The reproducer is exactly what's untrustworthy here, so the
-                    # oracle of record is "none" — matching the timeout branch.
-                    "none",
-                    started,
-                    {
-                        "rerun_exit_code": rerun.exit_code,
-                        "rerun_stderr_tail": _tail(rerun.stderr),
-                        "hint": (
-                            "reproducer raised a different exception than the "
-                            "issue's original — Claude likely referenced an "
-                            "API that doesn't exist; retry to resynthesise."
-                        ),
-                    },
-                )
+            if is_behavioral:
+                if rerun.exit_code == 0 and BEHAVIOR_OK_MARKER in rerun.stdout:
+                    green_verdict = Verdict.VERIFIED_VIA_BEHAVIOR
+                    green_oracle = "behavior"
+                elif "AssertionError" in rerun.stderr:
+                    # Crash suppressed, but the behavioral assertion failed: the
+                    # fix masks the symptom without restoring behavior.
+                    return self._finish(
+                        handle,
+                        Verdict.MASKS_SYMPTOM,
+                        "behavior",
+                        started,
+                        {
+                            "rerun_exit_code": rerun.exit_code,
+                            "rerun_stderr_tail": _tail(rerun.stderr),
+                            "hint": (
+                                "the fix stopped the exception but the behavioral "
+                                "assertion failed — the symptom is masked, not fixed."
+                            ),
+                        },
+                    )
+                else:
+                    return self._finish(
+                        handle,
+                        Verdict.REPRO_BROKEN,
+                        "none",
+                        started,
+                        {
+                            "rerun_exit_code": rerun.exit_code,
+                            "rerun_stderr_tail": _tail(rerun.stderr),
+                            "hint": "behavioral reproducer neither asserted-OK nor failed cleanly.",
+                        },
+                    )
+            else:
+                if rerun.exit_code != 0:
+                    return self._finish(
+                        handle,
+                        Verdict.REPRO_BROKEN,
+                        # The reproducer is exactly what's untrustworthy here, so the
+                        # oracle of record is "none" — matching the timeout branch.
+                        "none",
+                        started,
+                        {
+                            "rerun_exit_code": rerun.exit_code,
+                            "rerun_stderr_tail": _tail(rerun.stderr),
+                            "hint": (
+                                "reproducer raised a different exception than the "
+                                "issue's original — Claude likely referenced an "
+                                "API that doesn't exist; retry to resynthesise."
+                            ),
+                        },
+                    )
+                green_verdict = Verdict.VERIFIED_VIA_REPRODUCER
+                green_oracle = "reproducer"
 
             # 7. Optional regression check (scoped tests) — only worth running
             # once the reproducer itself is green.
@@ -251,8 +294,8 @@ class Verifier:
 
             return self._finish(
                 handle,
-                Verdict.VERIFIED_VIA_REPRODUCER,
-                "reproducer",
+                green_verdict,
+                green_oracle,
                 started,
                 {"rerun_exit_code": rerun.exit_code},
             )
