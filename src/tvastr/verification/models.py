@@ -12,12 +12,24 @@ class Verdict(StrEnum):
 
     VERIFIED_VIA_REPRODUCER = "verified_via_reproducer"
     VERIFIED_VIA_SCOPED_TESTS = "verified_via_scoped_tests"
+    VERIFIED_VIA_BEHAVIOR = "verified_via_behavior"
+    MASKS_SYMPTOM = "masks_symptom"
     UNVERIFIED_SMOKE_IMPORT_ONLY = "unverified_smoke_import_only"
     REPRO_BROKEN = "repro_broken"
     NO_REPRO = "no_repro"
     STILL_BROKEN = "still_broken"
     REGRESSION = "regression"
     ENVIRONMENTAL_ERROR = "environmental_error"
+
+
+BEHAVIOR_OK_MARKER = "TVASTR_BEHAVIOR_OK"
+
+
+class ReproducerKind(StrEnum):
+    """Whether the reproducer asserts correct behavior or just re-triggers the crash."""
+
+    BEHAVIORAL = "behavioral"
+    CRASH = "crash"
 
 
 class ReproducerSource(StrEnum):
@@ -30,6 +42,7 @@ class Reproducer:
     source: ReproducerSource
     code: str
     expected_exception: str | None = None  # exception class we're trying to re-trigger
+    kind: ReproducerKind = ReproducerKind.CRASH
 
 
 @dataclass(frozen=True)
@@ -56,4 +69,5 @@ class VerificationResult:
         return self.verdict in {
             Verdict.VERIFIED_VIA_REPRODUCER,
             Verdict.VERIFIED_VIA_SCOPED_TESTS,
+            Verdict.VERIFIED_VIA_BEHAVIOR,
         }
