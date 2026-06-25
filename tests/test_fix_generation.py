@@ -4,8 +4,11 @@ from tvastr.agent.context import AgentContext
 from tvastr.agent.tools.fix_generation import (
     _apply_change,
     _build_real_changes,
+    _editable_files,
     _extract_json,
+    _is_doc_example,
     _parse_response,
+    _ParsedFix,
     generate_fix,
 )
 from tvastr.config import Settings
@@ -226,3 +229,126 @@ def test_generate_fix_with_mock_claude_produces_applicable_change() -> None:
     assert "tvastr-mock" in fix.changes[0].patched_content
     # The mock's marker should NOT appear in the original file.
     assert "tvastr-mock" not in files["llama_index/llms/openai/foo.py"]
+
+
+# --- fix-target restriction ------------------------------------------------
+
+
+def test_is_doc_example_flags_notebooks_and_docs():
+    assert _is_doc_example("docs/examples/x.ipynb") is True
+    assert _is_doc_example("foo/bar.ipynb") is True          # any notebook
+    assert _is_doc_example("docs/guide.md") is True          # docs segment
+    assert _is_doc_example("examples/demo.py") is True       # examples segment
+    assert _is_doc_example("llama-index-core/llama_index/core/callbacks/token_counting.py") is False
+    assert _is_doc_example("src/examples_helper.py") is False  # substring, not a segment
+
+
+def test_editable_files_returns_source_only_when_present():
+    files = {"docs/examples/n.ipynb": "nb", "mod.py": "src"}
+    assert _editable_files(files) == {"mod.py": "src"}
+
+
+def test_editable_files_falls_back_to_all_when_no_source():
+    files = {"docs/examples/n.ipynb": "nb", "docs/guide.md": "doc"}
+    assert _editable_files(files) == files
+
+
+class _RecordingLLM:
+    model = "claude-opus-4-7"
+    target = "cloud"
+
+    def __init__(self, response_text: str) -> None:
+        self.response_text = response_text
+        self.last_prompt: str | None = None
+
+    def complete(self, prompt: str, *, system: str | None = None) -> LLMResponse:
+        self.last_prompt = prompt
+        return LLMResponse(
+            text=self.response_text, model=self.model, target=self.target, mocked=True
+        )
+
+
+def test_build_real_changes_rejects_non_editable_path():
+    parsed = _ParsedFix(
+        summary="s",
+        changes=[
+            {
+                "path": "docs/examples/n.ipynb",
+                "search": "x",
+                "replace": "y",
+                "rationale": "r",
+            }
+        ],
+        test_plan="t",
+    )
+    code_files = {"docs/examples/n.ipynb": "x\n", "mod.py": "z\n"}
+    allowed = {"mod.py": "z\n"}  # notebook excluded
+    changes, errors = _build_real_changes(parsed, code_files, allowed)
+    assert changes == []
+    assert any("not editable" in e for e in errors)
+
+
+def test_generate_fix_edits_source_not_notebook():
+    # LLM proposes BOTH a notebook edit (must be rejected) and a source edit (applied).
+    response = (
+        '{"summary": "fix", "test_plan": "t", "changes": ['
+        '{"path": "docs/examples/n.ipynb", "search": "old", "replace": "new", "rationale": "r1"},'
+        '{"path": "mod.py", "search": "return x", "replace": "return x or 0", "rationale": "r2"}'
+        "]}"
+    )
+    ctx = _ctx_with_llm(_ScriptedLLM(response))
+    pattern = _pattern()
+    code_files = {"docs/examples/n.ipynb": "old\n", "mod.py": "return x\n"}
+    fix, _ = generate_fix(ctx, pattern, _root_cause(pattern), code_files)
+    paths = [c.path for c in fix.changes]
+    assert "mod.py" in paths
+    assert "docs/examples/n.ipynb" not in paths
+
+
+def test_generate_fix_allows_notebook_when_only_docs_retrieved():
+    # Fallback: nothing but a notebook was retrieved -> the notebook is editable.
+    response = (
+        '{"summary": "fix", "test_plan": "t", "changes": ['
+        '{"path": "docs/examples/n.ipynb", "search": "old", "replace": "new", "rationale": "r"}'
+        "]}"
+    )
+    ctx = _ctx_with_llm(_ScriptedLLM(response))
+    pattern = _pattern()
+    fix, _ = generate_fix(ctx, pattern, _root_cause(pattern), {"docs/examples/n.ipynb": "old\n"})
+    assert [c.path for c in fix.changes] == ["docs/examples/n.ipynb"]
+
+
+def test_generate_fix_prompt_labels_editable_vs_readonly():
+    llm = _RecordingLLM('{"summary": "s", "test_plan": "t", "changes": []}')
+    settings = Settings(use_mocks=True, audit_backend="memory")
+    router = build_router(settings)
+    router.cloud = llm
+    ctx = AgentContext(
+        router=router,
+        code_host=MockGitHubClient(),
+        notifier=build_notifier(settings),
+    )
+    pattern = _pattern()
+    code_files = {"docs/examples/n.ipynb": "nb\n", "mod.py": "src\n"}
+    generate_fix(ctx, pattern, _root_cause(pattern), code_files)
+    assert "EDITABLE source files" in llm.last_prompt
+    assert "READ-ONLY context" in llm.last_prompt
+    # Assert proper ordering: EDITABLE < READ-ONLY < notebook (read-only section)
+    editable_idx = llm.last_prompt.index("EDITABLE source files")
+    readonly_idx = llm.last_prompt.index("READ-ONLY context")
+    notebook_idx = llm.last_prompt.index("docs/examples/n.ipynb")
+    assert editable_idx < readonly_idx < notebook_idx
+
+
+def test_generate_fix_fallback_does_not_target_notebook():
+    # LLM proposes ONLY a notebook edit -> rejected -> fallback must not land on the notebook.
+    response = (
+        '{"summary": "fix", "test_plan": "t", "changes": ['
+        '{"path": "docs/examples/n.ipynb", "search": "old", "replace": "new", "rationale": "r"}'
+        "]}"
+    )
+    ctx = _ctx_with_llm(_ScriptedLLM(response))
+    pattern = _pattern()
+    code_files = {"docs/examples/n.ipynb": "old\n", "mod.py": "return x\n"}
+    fix, _ = generate_fix(ctx, pattern, _root_cause(pattern), code_files)
+    assert "docs/examples/n.ipynb" not in [c.path for c in fix.changes]
