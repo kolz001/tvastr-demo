@@ -16,6 +16,8 @@ otherwise, and lets settings override.
 
 from __future__ import annotations
 
+import json
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +30,18 @@ from tvastr.logging import get_logger
 from tvastr.verification.models import RunResult
 
 log = get_logger(__name__)
+
+_BOOTSTRAP_SRC = '''\
+import importlib.util, json, pathlib, shutil
+mani = json.loads(pathlib.Path("/work/.tvastr_patch/manifest.json").read_text())
+for module, staged in mani:
+    spec = importlib.util.find_spec(module)
+    if spec and spec.origin:
+        shutil.copyfile(f"/work/.tvastr_patch/{staged}", spec.origin)
+        print(f"[tvastr] patched {module} -> {spec.origin}")
+    else:
+        print(f"[tvastr] skip unresolved module: {module}")
+'''
 
 
 def installed_module_path(repo_path: str) -> str | None:
@@ -137,6 +151,7 @@ class _DockerHandle:
     def __init__(self, root: Path, image: str) -> None:
         self.root = root
         self.image = image
+        self._patch_pending = False
 
     def write_file(self, relpath: str, content: str) -> None:
         full = self.root / relpath
@@ -144,15 +159,42 @@ class _DockerHandle:
         full.write_text(content, encoding="utf-8")
 
     def apply_changes(self, changes: list[FileChange]) -> None:
+        manifest: list[list[str]] = []
         for change in changes:
-            self.write_file(change.path, change.patched_content)
+            module = installed_module_path(change.path)
+            if module is None:
+                # Not an importable package file (notebook, top-level script):
+                # write the repo path as before — it won't be imported, but we
+                # don't lose the content.
+                self.write_file(change.path, change.patched_content)
+                log.info("verify.sandbox.patch.no_module", path=change.path)
+                continue
+            staged = f"{module}.py"
+            self.write_file(f".tvastr_patch/{staged}", change.patched_content)
+            manifest.append([module, staged])
+        if manifest:
+            self.write_file(".tvastr_patch/manifest.json", json.dumps(manifest))
+            self.write_file(".tvastr_apply.py", _BOOTSTRAP_SRC)
+            self._patch_pending = True
+            log.info("verify.sandbox.patch.staged", modules=[m for m, _ in manifest])
 
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult:
+        if self._patch_pending:
+            # Apply the staged patches onto the installed modules inside THIS
+            # container, then run the reproducer — one container so the overwrite
+            # persists for the import. site-packages must be writable for the
+            # copy, so --read-only is dropped for this run ONLY; all other
+            # hardening (no network, no caps, --rm, tmpfs) is kept.
+            readonly = []
+            run_cmd = ["sh", "-c", "python /work/.tvastr_apply.py && " + shlex.join(cmd)]
+        else:
+            readonly = ["--read-only"]
+            run_cmd = list(cmd)
         docker_cmd = [
             "docker",
             "run",
             "--rm",
-            "--read-only",
+            *readonly,
             "--network=none",
             "--cap-drop=ALL",
             "--tmpfs=/tmp:rw,size=64m",
@@ -161,9 +203,10 @@ class _DockerHandle:
             "-w",
             "/work",
             self.image,
-            *cmd,
+            *run_cmd,
         ]
-        log.info("verify.sandbox.run", sandbox="docker", cmd=cmd, image=self.image)
+        log.info("verify.sandbox.run", sandbox="docker", cmd=cmd, image=self.image,
+                 patched=self._patch_pending)
         try:
             proc = subprocess.run(
                 docker_cmd, capture_output=True, text=True, timeout=timeout_s, check=False
