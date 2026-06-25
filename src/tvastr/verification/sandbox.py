@@ -30,6 +30,29 @@ from tvastr.verification.models import RunResult
 log = get_logger(__name__)
 
 
+def installed_module_path(repo_path: str) -> str | None:
+    """Dotted module for a repo-relative source path, or ``None`` if not importable.
+
+    Distribution dirs are hyphenated (``llama-index-core``); import packages are
+    underscored (``llama_index``). Drop everything up to and including the LAST
+    non-identifier segment, then dot-join the remaining identifier segments
+    (``.py`` stripped). Notebooks, non-.py files, and bare single-segment paths
+    return ``None``.
+    """
+    parts = [p for p in repo_path.split("/") if p]
+    if len(parts) < 2 or not parts[-1].endswith(".py"):
+        return None
+    norm = [*parts[:-1], parts[-1][:-3]]  # strip .py on the file segment
+    start = 0
+    for i, seg in enumerate(norm):
+        if not seg.isidentifier():
+            start = i + 1
+    mods = norm[start:]
+    if not mods or any(not s.isidentifier() for s in mods):
+        return None
+    return ".".join(mods)
+
+
 @runtime_checkable
 class SandboxHandle(Protocol):
     """A live sandbox the verifier owns for the duration of one verification."""
