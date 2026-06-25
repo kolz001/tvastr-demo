@@ -46,7 +46,7 @@ Produce a fix as JSON with this exact schema:
 }
 
 Constraints:
-- The "search" string MUST appear EXACTLY ONCE in the file shown above. Include
+- The "search" string MUST appear EXACTLY ONCE in the EDITABLE file shown above. Include
   enough surrounding lines (3+) to make it unique.
 - Whitespace and indentation in "search" must match the file byte-for-byte.
 - Keep edits surgical — modify only what's needed to address the root cause.
@@ -251,7 +251,7 @@ def generate_fix(
 
     parsed = _parse_response(response.text)
     if parsed is None:
-        changes = _fallback_changes(pattern, response.text, code_files)
+        changes = _fallback_changes(pattern, response.text, editable)
         summary = response.text.strip()[:500]
         test_plan = "Add a regression test reproducing the failure; assert it no longer occurs."
     else:
@@ -263,7 +263,7 @@ def generate_fix(
                 errors=errors,
                 proposed=len(parsed.changes),
             )
-            changes = _fallback_changes(pattern, response.text, code_files)
+            changes = _fallback_changes(pattern, response.text, editable)
             summary = parsed.summary or response.text.strip()[:500]
         else:
             log.info(

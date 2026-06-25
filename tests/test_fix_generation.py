@@ -333,9 +333,22 @@ def test_generate_fix_prompt_labels_editable_vs_readonly():
     generate_fix(ctx, pattern, _root_cause(pattern), code_files)
     assert "EDITABLE source files" in llm.last_prompt
     assert "READ-ONLY context" in llm.last_prompt
-    # the notebook appears in the read-only section, after the editable header
+    # Assert proper ordering: EDITABLE < READ-ONLY < notebook (read-only section)
     editable_idx = llm.last_prompt.index("EDITABLE source files")
-    notebook_idx = llm.last_prompt.index("docs/examples/n.ipynb")
-    assert editable_idx < notebook_idx
     readonly_idx = llm.last_prompt.index("READ-ONLY context")
-    assert readonly_idx < notebook_idx
+    notebook_idx = llm.last_prompt.index("docs/examples/n.ipynb")
+    assert editable_idx < readonly_idx < notebook_idx
+
+
+def test_generate_fix_fallback_does_not_target_notebook():
+    # LLM proposes ONLY a notebook edit -> rejected -> fallback must not land on the notebook.
+    response = (
+        '{"summary": "fix", "test_plan": "t", "changes": ['
+        '{"path": "docs/examples/n.ipynb", "search": "old", "replace": "new", "rationale": "r"}'
+        "]}"
+    )
+    ctx = _ctx_with_llm(_ScriptedLLM(response))
+    pattern = _pattern()
+    code_files = {"docs/examples/n.ipynb": "old\n", "mod.py": "return x\n"}
+    fix, _ = generate_fix(ctx, pattern, _root_cause(pattern), code_files)
+    assert "docs/examples/n.ipynb" not in [c.path for c in fix.changes]
