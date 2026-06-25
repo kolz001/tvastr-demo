@@ -229,6 +229,8 @@ const VERIFY_TYPES = new Set([
 const VERDICT_BADGE = {
   verified_via_reproducer:   { kind:"green",  label:"verified · reproducer" },
   verified_via_scoped_tests: { kind:"green",  label:"verified · scoped tests" },
+  verified_via_behavior:     { kind:"green",  label:"verified · behavior" },
+  masks_symptom:             { kind:"red",    label:"masks symptom" },
   unverified_smoke_import_only: { kind:"yellow", label:"unverified · smoke import only" },
   repro_broken:           { kind:"yellow", label:"repro broken · retry" },
   no_repro:               { kind:"yellow", label:"no repro" },

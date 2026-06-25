@@ -33,3 +33,4 @@ def test_is_green_includes_behavior_excludes_masks():
     assert _r(Verdict.VERIFIED_VIA_BEHAVIOR).is_green is True
     assert _r(Verdict.MASKS_SYMPTOM).is_green is False
     assert _r(Verdict.VERIFIED_VIA_REPRODUCER).is_green is True  # unchanged
+    assert _r(Verdict.VERIFIED_VIA_SCOPED_TESTS).is_green is True

@@ -25,7 +25,7 @@ from tvastr.integrations.github import MockGitHubClient
 from tvastr.llm.base import LLMResponse
 from tvastr.llm.router import build_router
 from tvastr.verification import Verdict, Verifier
-from tvastr.verification.models import RunResult
+from tvastr.verification.models import BEHAVIOR_OK_MARKER, RunResult
 from tvastr.verification.sandbox import SandboxHandle
 
 # ─── Test doubles ─────────────────────────────────────────────────────────
@@ -277,3 +277,90 @@ def test_uses_issue_body_repro_when_provided() -> None:
     assert sandbox.last_handle is not None
     assert "import foo" in sandbox.last_handle.written["repro.py"]
     assert "THIS_SHOULD_NOT_BE_USED" not in sandbox.last_handle.written["repro.py"]
+
+
+# ─── Behavioral reproducer tests ──────────────────────────────────────────────
+
+_BEHAVIORAL_REPRO = (
+    f"# tvastr-kind: behavioral\nassert get() == put_value\nprint('{BEHAVIOR_OK_MARKER}')\n"
+)
+
+
+def _kerr_pattern() -> FailurePattern:
+    """FailurePattern with exception_type='KeyError' for behavioral tests."""
+    return FailurePattern(
+        fingerprint="abc",
+        title="KeyError in app",
+        representative_message="KeyError: 'sub_dicts'",
+        exception_type="KeyError",
+        count=3,
+        sensitivity=Sensitivity.INTERNAL,
+    )
+
+
+def test_behavioral_verified_when_marker_present_post_patch() -> None:
+    sandbox = _FakeSandbox(
+        [
+            # baseline: bug reproduces (KeyError, no marker)
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            # rerun after real fix: marker printed, exit 0
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
+    result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.VERIFIED_VIA_BEHAVIOR
+    assert result.oracle == "behavior"
+    assert result.is_green
+
+
+def test_behavioral_masks_symptom_when_assertion_fails_post_patch() -> None:
+    # Regression for #21896: masking fix stops the crash but the assertion fails.
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            RunResult(exit_code=1, stdout="", stderr="Traceback...\nAssertionError"),
+        ]
+    )
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
+    result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.MASKS_SYMPTOM
+    assert not result.is_green
+    assert result.oracle == "behavior"
+
+
+def test_behavioral_still_broken_when_original_exception_remains() -> None:
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+        ]
+    )
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
+    result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.STILL_BROKEN
+
+
+def test_behavioral_repro_broken_on_other_exception() -> None:
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            RunResult(exit_code=1, stdout="", stderr="TypeError: unexpected kwarg"),
+        ]
+    )
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
+    result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.REPRO_BROKEN
+
+
+def test_behavioral_no_repro_when_baseline_prints_marker() -> None:
+    sandbox = _FakeSandbox(
+        [
+            # baseline already passes — marker present, no reproduction
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
+    result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert result.verdict == Verdict.NO_REPRO
