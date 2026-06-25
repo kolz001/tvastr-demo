@@ -85,3 +85,18 @@ def test_prompt_mentions_behavioral_marker_and_fallback():
     prompt = _build_prompt(_pattern(), _root_cause(), [])
     assert BEHAVIOR_OK_MARKER in prompt
     assert "tvastr-kind" in prompt
+
+
+def test_parse_kind_rejects_behavioral_substring_in_crash_tag():
+    # "behavioral" appears, but the tag VALUE is crash -> must be CRASH.
+    code = "# tvastr-kind: crash (was behavioral)\nraise KeyError\n"
+    assert _parse_kind(code) == ReproducerKind.CRASH
+
+
+def test_parse_kind_handles_empty_code():
+    assert _parse_kind("") == ReproducerKind.CRASH
+    assert _parse_kind("   \n  \n") == ReproducerKind.CRASH
+
+
+def test_parse_kind_tolerates_extra_spacing():
+    assert _parse_kind("#   tvastr-kind:   behavioral\nx\n") == ReproducerKind.BEHAVIORAL

@@ -30,6 +30,9 @@ _CODE_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Match the tvastr-kind tag and capture its value.
+_KIND_TAG_RE = re.compile(r"#\s*tvastr-kind:\s*(\w+)")
+
 # When extracting, prefer blocks that look like a runnable repro (imports +
 # something that exercises them) rather than a traceback transcript.
 _TRACEBACK_HINT = "Traceback (most recent call last)"
@@ -130,9 +133,10 @@ def _strip_fences(text: str) -> str:
 
 
 def _parse_kind(code: str) -> ReproducerKind:
-    """Read the leading `# tvastr-kind:` tag; default CRASH when absent/unknown."""
+    """Read the leading `# tvastr-kind:` tag's value; default CRASH when absent/unknown."""
     first = code.lstrip().splitlines()[0] if code.strip() else ""
-    if "tvastr-kind:" in first and "behavioral" in first:
+    m = _KIND_TAG_RE.match(first.strip())
+    if m and m.group(1).lower() == "behavioral":
         return ReproducerKind.BEHAVIORAL
     return ReproducerKind.CRASH
 
