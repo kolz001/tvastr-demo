@@ -85,6 +85,16 @@ container** applies the patch first:
 Because baseline runs *before* `apply_changes`, `_patch_pending` is False then →
 baseline is unpatched (correct); only the rerun is wrapped.
 
+**Read-only relaxation (security tradeoff, decided in brainstorming):** the
+container normally runs `--read-only`, so `site-packages` cannot be overwritten.
+For the patched rerun ONLY (`_patch_pending` true), `--read-only` is omitted so
+the bootstrap can copy over the installed module. ALL other hardening is kept —
+`--network=none`, `--cap-drop=ALL`, `--rm`, `--tmpfs=/tmp`. The container is
+ephemeral and destroyed after the run, has no network and no capabilities, so a
+writable-but-isolated ephemeral fs is a modest, contained tradeoff scoped to
+exactly the run that must write the patched module. The baseline run keeps
+`--read-only`.
+
 **Bootstrap script** (`.tvastr_apply.py`):
 ```python
 import importlib.util, json, shutil, pathlib
@@ -143,8 +153,10 @@ rerun → sh -c "python /work/.tvastr_apply.py && python repro.py"
 - **Docker apply:** `apply_changes` stages each importable file under
   `/work/.tvastr_patch/<dotted>.py`, writes `manifest.json` + `.tvastr_apply.py`,
   sets `_patch_pending`; a non-importable file is written to `change.path`.
-- **Docker run wrapping:** baseline (before apply) issues a plain docker cmd;
-  after `apply_changes`, the docker cmd contains `.tvastr_apply.py && python repro.py`.
+- **Docker run wrapping:** baseline (before apply) issues a plain docker cmd
+  containing `--read-only`; after `apply_changes`, the docker cmd contains
+  `.tvastr_apply.py && python repro.py`, OMITS `--read-only`, and still contains
+  `--network=none`, `--cap-drop=ALL`, `--rm`.
 - **Subprocess unchanged:** `apply_changes` writes `change.path`; `run` not wrapped.
 - **Bootstrap content:** generated `.tvastr_apply.py` resolves via `find_spec` and
   copies over `.origin`.
