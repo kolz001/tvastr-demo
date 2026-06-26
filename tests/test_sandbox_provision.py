@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+
+import pytest
 
 from tvastr.verification.models import ProvisionResult
 from tvastr.verification.sandbox import (
@@ -117,6 +121,9 @@ def test_docker_provision_success(monkeypatch):
     assert "--network=none" not in docker_cmd
     assert "--read-only" not in docker_cmd
     assert "--rm" in docker_cmd
+    # prep container must write as the host user so discard() can rmtree it
+    user_idx = docker_cmd.index("--user")
+    assert docker_cmd[user_idx + 1] == f"{os.getuid()}:{os.getgid()}"
     assert "--cap-drop=ALL" in docker_cmd
     assert "pip" in docker_cmd
     assert "install" in docker_cmd
@@ -166,7 +173,7 @@ def test_docker_run_after_provision_prepends_pythonpath(monkeypatch):
     docker_cmd = captured["cmd"]
     # The last element is the sh -c string; find it.
     sh_c_str = " ".join(docker_cmd)
-    assert "export PYTHONPATH=/work/.tvastr_deps:${PYTHONPATH:-}" in sh_c_str
+    assert "export PYTHONPATH=/work/.tvastr_deps" in sh_c_str
     assert "sh" in docker_cmd
     assert "-c" in docker_cmd
     handle.discard()
@@ -192,3 +199,31 @@ def test_docker_run_no_provision_no_sh_wrapper(monkeypatch):
     assert "--network=none" in docker_cmd
     assert "--read-only" in docker_cmd
     handle.discard()
+
+
+# ─── Opt-in docker smoke test (real network, skipped by default) ──────────
+
+
+@pytest.mark.skipif(
+    not (shutil.which("docker") and os.environ.get("TVASTR_VERIFY_DOCKER_SMOKE")),
+    reason="opt-in docker smoke (set TVASTR_VERIFY_DOCKER_SMOKE=1 with the verify image built)",
+)
+def test_docker_provision_namespace_merge_smoke():
+    from tvastr.verification.sandbox import DockerSandbox
+
+    handle = DockerSandbox(image="tvastr-verify:llamaindex").prepare()
+    try:
+        result = handle.provision(["llama-index-vector-stores-postgres"])
+        assert result.ok, f"provision failed: {result}"
+        # The provisioned integration must import ALONGSIDE the image's core —
+        # this is the PEP 420 namespace-merge assumption the whole feature relies on.
+        run = handle.run([
+            "python", "-c",
+            "import llama_index.core; "
+            "import llama_index.vector_stores.postgres; "
+            "print('MERGE_OK')",
+        ], timeout_s=120)
+        assert run.exit_code == 0, run.stderr
+        assert "MERGE_OK" in run.stdout
+    finally:
+        handle.discard()

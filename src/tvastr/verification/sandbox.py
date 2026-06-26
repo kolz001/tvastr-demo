@@ -245,6 +245,7 @@ class _DockerHandle:
             return ProvisionResult(requested=[], installed=[], failed=[], ok=True)
         docker_cmd = [
             "docker", "run", "--rm",
+            "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop=ALL",
             "--tmpfs=/tmp:rw,size=256m",
             "-e", "PIP_NO_CACHE_DIR=1",
@@ -287,7 +288,9 @@ class _DockerHandle:
         if self._deps_provisioned:
             # Prepend (don't clobber any image PYTHONPATH) so the provisioned
             # integration wins and the patch-applier's find_spec can resolve it.
-            inner = "export PYTHONPATH=/work/.tvastr_deps:${PYTHONPATH:-} && " + inner
+            # Use ${PYTHONPATH:+:$PYTHONPATH} to avoid a trailing colon when the
+            # image sets no PYTHONPATH (a trailing empty entry = /work on sys.path).
+            inner = "export PYTHONPATH=/work/.tvastr_deps${PYTHONPATH:+:$PYTHONPATH} && " + inner
             run_cmd = ["sh", "-c", inner]
         elif self._patch_pending:
             run_cmd = ["sh", "-c", inner]
