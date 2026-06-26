@@ -14,6 +14,7 @@ from tvastr.domain import (
     FailurePattern,
     FileChange,
     FixProposal,
+    FixRegister,
     LogEvent,
     RootCause,
     Sensitivity,
@@ -25,7 +26,13 @@ from tvastr.integrations.github import MockGitHubClient
 from tvastr.llm.base import LLMResponse
 from tvastr.llm.router import build_router
 from tvastr.verification import Verdict, Verifier
-from tvastr.verification.models import BEHAVIOR_OK_MARKER, ProvisionResult, RunResult
+from tvastr.verification.models import (
+    BEHAVIOR_OK_MARKER,
+    ProvisionResult,
+    ReproducerKind,
+    ReproducerSource,
+    RunResult,
+)
 from tvastr.verification.sandbox import SandboxHandle
 
 # ─── Test doubles ─────────────────────────────────────────────────────────
@@ -701,3 +708,73 @@ def test_overlay_retains_human_only_files_in_rerun() -> None:
     assert handle.written[_OVERLAY_PR_FILE] == "# agent-fixed-A-only\n", (
         "A must be overwritten by the agent's fix, not the overlay"
     )
+
+
+# ─── Register-aware verifier tests ───────────────────────────────────────────
+
+
+def _fix_reg(register: FixRegister) -> FixProposal:
+    f = _fix()
+    return f.model_copy(update={"register": register})
+
+
+def test_document_register_short_circuits_unverified_doc_only() -> None:
+    sandbox = _FakeSandbox([])  # must never be used
+    verifier = Verifier(_ctx(), sandbox)
+    out = verifier.verify(
+        _pattern(), _root_cause(), _fix_reg(FixRegister.DOCUMENT), [_event()], issue_body=None
+    )
+    assert out.verdict == Verdict.UNVERIFIED_DOC_ONLY
+    assert sandbox.last_handle is None  # never prepared a sandbox
+
+
+def test_warn_register_greens_via_warning(monkeypatch: object) -> None:
+    import tvastr.verification.verifier as vmod
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        vmod,
+        "synthesize_reproducer",
+        lambda *a, **k: vmod.Reproducer(
+            source=ReproducerSource.CLAUDE,
+            code="x",
+            kind=ReproducerKind.BEHAVIORAL,
+        ),
+    )
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="AssertionError"),  # baseline: no warning
+            RunResult(
+                exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""
+            ),  # rerun: warning fires
+        ]
+    )
+    out = Verifier(_ctx(), sandbox).verify(
+        _pattern(), _root_cause(), _fix_reg(FixRegister.WARN), [_event()], issue_body=None
+    )
+    assert out.verdict == Verdict.VERIFIED_VIA_WARNING
+    assert out.oracle == "warning"
+
+
+def test_better_error_register_greens_via_better_error(monkeypatch: object) -> None:
+    import tvastr.verification.verifier as vmod
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        vmod,
+        "synthesize_reproducer",
+        lambda *a, **k: vmod.Reproducer(
+            source=ReproducerSource.CLAUDE,
+            code="x",
+            kind=ReproducerKind.BEHAVIORAL,
+        ),
+    )
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="AssertionError"),
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    out = Verifier(_ctx(), sandbox).verify(
+        _pattern(), _root_cause(), _fix_reg(FixRegister.BETTER_ERROR), [_event()], issue_body=None
+    )
+    assert out.verdict == Verdict.VERIFIED_VIA_BETTER_ERROR
+    assert out.oracle == "better_error"

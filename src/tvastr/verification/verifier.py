@@ -23,7 +23,7 @@ from pathlib import Path
 
 from tvastr.agent.context import AgentContext
 from tvastr.agent.tools.code_retrieval import format_code_for_prompt, retrieve_code_files
-from tvastr.domain import FailurePattern, FileChange, FixProposal, LogEvent, RootCause
+from tvastr.domain import FailurePattern, FileChange, FixProposal, FixRegister, LogEvent, RootCause
 from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.logging import get_logger
 from tvastr.verification.models import (
@@ -53,6 +53,12 @@ def _original_exception_seen(result: RunResult, expected: str | None) -> bool:
         return False
     blob = f"{result.stdout}\n{result.stderr}"
     return f"{expected}:" in blob or f"{expected} " in blob or f"{expected}\n" in blob
+
+
+_REGISTER_GREEN: dict[FixRegister, tuple[Verdict, str]] = {
+    FixRegister.WARN: (Verdict.VERIFIED_VIA_WARNING, "warning"),
+    FixRegister.BETTER_ERROR: (Verdict.VERIFIED_VIA_BETTER_ERROR, "better_error"),
+}
 
 
 class Verifier:
@@ -155,6 +161,16 @@ class Verifier:
             {"sandbox": self.sandbox.name, "pattern": pattern.fingerprint},
         )
 
+        if fix.register == FixRegister.DOCUMENT:
+            # A docs-only fix has no runtime signal — be honest rather than
+            # running a behavioral oracle it can never satisfy.
+            return self._fail(
+                Verdict.UNVERIFIED_DOC_ONLY,
+                "none",
+                started,
+                {"reason": "documentation-only fix; no behavioral oracle applies"},
+            )
+
         # 1. Reproducer. Source for the suspected files is supplied lazily —
         # synthesize_reproducer only resolves it on the Claude path, so issues
         # whose body already carries a runnable block skip the retrieval. When
@@ -179,6 +195,7 @@ class Verifier:
                 issue_body,
                 self.ctx.router,
                 code_context=_code_context,
+                register=fix.register,
             )
         except Exception as exc:
             return self._fail(
@@ -191,7 +208,8 @@ class Verifier:
             "verify.repro_synth",
             "verify",
             {"source": repro.source.value, "code": repro.code,
-             "expected_exception": repro.expected_exception},
+             "expected_exception": repro.expected_exception,
+             "register": fix.register.value},
         )
 
         # 2/3. Sandbox + baseline
@@ -313,8 +331,9 @@ class Verifier:
                 )
             if is_behavioral:
                 if rerun.exit_code == 0 and BEHAVIOR_OK_MARKER in rerun.stdout:
-                    green_verdict = Verdict.VERIFIED_VIA_BEHAVIOR
-                    green_oracle = "behavior"
+                    green_verdict, green_oracle = _REGISTER_GREEN.get(
+                        fix.register, (Verdict.VERIFIED_VIA_BEHAVIOR, "behavior")
+                    )
                 elif "AssertionError" in rerun.stderr:
                     # Crash suppressed, but the behavioral assertion failed: the
                     # fix masks the symptom without restoring behavior.
