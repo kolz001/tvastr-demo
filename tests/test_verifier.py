@@ -488,3 +488,112 @@ def test_verify_emits_provision_event_and_proceeds_on_failure() -> None:
     assert "verify.provision" in types
     # verify still ran the baseline despite provision failure:
     assert "verify.baseline" in types
+
+
+# ─── Source-overlay tests ─────────────────────────────────────────────────────
+
+# A real path whose last non-hyphenated segment chain maps to an importable module.
+_OVERLAY_PR_FILE = (
+    "llama-index-integrations/vector_stores/llama-index-vector-stores-postgres/"
+    "llama_index/vector_stores/postgres/base.py"
+)
+
+
+def test_overlay_on_no_repro_reproduces_then_verifies() -> None:
+    """Behavioral repro: baseline prints BEHAVIOR_OK (no_repro); after the buggy
+    overlay the retry does NOT print it (reproduces); rerun is OK → VERIFIED."""
+    sandbox = _FakeSandbox(
+        [
+            # baseline #1: marker present → no_repro, triggers overlay
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+            # baseline #2 (retry, post-overlay): marker absent → reproduced
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            # rerun after fix: marker present → VERIFIED_VIA_BEHAVIOR
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=True)
+    result = verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE],
+    )
+    types = [e.type for e in sink.events]
+    assert "verify.overlay" in types
+    # apply_changes called twice: buggy overlay, then the agent fix
+    assert sandbox.last_handle is not None
+    assert len(sandbox.last_handle.applied) >= 2
+    assert result.verdict in {Verdict.VERIFIED_VIA_BEHAVIOR, Verdict.VERIFIED_VIA_REPRODUCER}
+
+
+def test_no_overlay_when_baseline_reproduces() -> None:
+    """First baseline already reproduces → overlay path never taken."""
+    sandbox = _FakeSandbox(
+        [
+            # baseline reproduces (no marker)
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            # rerun after fix
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=True)
+    verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE],
+    )
+    assert "verify.overlay" not in [e.type for e in sink.events]
+
+
+def test_no_overlay_without_pr_number() -> None:
+    """no_repro baseline but pr_number=None → stays no_repro, no overlay."""
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=True)
+    out = verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=None,
+        pr_files=None,
+    )
+    assert "verify.overlay" not in [e.type for e in sink.events]
+    assert out.verdict == Verdict.NO_REPRO
+
+
+def test_overlay_flag_off_skips_overlay() -> None:
+    """source_overlay=False → overlay never runs even with pr_number set."""
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=False)
+    out = verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE],
+    )
+    assert "verify.overlay" not in [e.type for e in sink.events]
+    assert out.verdict == Verdict.NO_REPRO

@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     # long tail of llama_index integrations is importable. Needs network for the
     # prep step; baseline/rerun stay network-isolated. Off in tests.
     verify_provision_deps: bool = True
+    # When true, and the released wheel already contains a closed issue's merged
+    # fix (baseline returns no_repro), verify overlays the PRE-FIX version of the
+    # fixing PR's changed files (fetched at the buggy commit) so the baseline
+    # reproduces and the rerun yields a real verdict. Off in tests.
+    verify_source_overlay: bool = True
 
 
 @lru_cache
