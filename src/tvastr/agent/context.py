@@ -27,6 +27,14 @@ class CodeHost(Protocol):
         """Return the contents of a file in the target repo."""
         ...
 
+    def get_file_at_ref(self, path: str, ref: str) -> str | None:
+        """Return a file's contents at a specific commit/ref, or None."""
+        ...
+
+    def buggy_parent_sha(self, pr_number: int) -> str | None:
+        """Return the commit just before a PR's fix merged (bug present), or None."""
+        ...
+
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult:
         """Create a branch + PR from a draft and return the result."""
         ...
