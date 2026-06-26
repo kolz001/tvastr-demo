@@ -315,6 +315,7 @@ class RemediationAgent:
             # without re-running the agent.
             patched_files={c.path: c.patched_content for c in fix.changes},
             rationales={c.path: c.rationale for c in fix.changes},
+            register=fix.register.value,
         )
         return {"fix": fix, "routing": _append_routing(state, decision)}
 
