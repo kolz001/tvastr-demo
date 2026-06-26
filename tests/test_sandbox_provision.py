@@ -128,6 +128,10 @@ def test_docker_provision_success(monkeypatch):
     assert "pip" in docker_cmd
     assert "install" in docker_cmd
     assert "--target" in docker_cmd
+    # No tmpfs cap on the prep run: a RAM-backed /tmp overflows on the dep tree
+    # pip unpacks. The prep container isn't --read-only, so /tmp uses the disk
+    # overlay. (The hardened baseline/rerun run keeps its own tmpfs.)
+    assert not any(str(a).startswith("--tmpfs") for a in docker_cmd)
     handle.discard()
 
 

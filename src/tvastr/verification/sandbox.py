@@ -243,11 +243,14 @@ class _DockerHandle:
         dists = [d for d in dict.fromkeys(dists) if d]
         if not dists:
             return ProvisionResult(requested=[], installed=[], failed=[], ok=True)
+        # No --tmpfs here (unlike the hardened run): this prep run already drops
+        # --read-only, so /tmp lives on the container's writable (disk-backed)
+        # overlay with ample space. A RAM-backed tmpfs overflows on the full dep
+        # tree pip unpacks under HOME=/tmp (numpy/pillow/sqlalchemy/core/...).
         docker_cmd = [
             "docker", "run", "--rm",
             "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop=ALL",
-            "--tmpfs=/tmp:rw,size=256m",
             "-e", "PIP_NO_CACHE_DIR=1",
             "-e", "HOME=/tmp",
             "-v", f"{self.root}:/work:rw",
