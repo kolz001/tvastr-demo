@@ -273,7 +273,13 @@ def synthesize_reproducer(
     )
     code = _strip_fences(response.text)
     kind = _parse_kind(code)
-    if kind == ReproducerKind.BEHAVIORAL:
+    # The critique hardens BEHAVIORAL round-trip oracles; WARN/BETTER_ERROR
+    # assertions are intentionally non-behavioral (a warning/clear error, NOT a
+    # restored result), so the round-trip-biased critique must not rewrite them.
+    if kind == ReproducerKind.BEHAVIORAL and register not in (
+        FixRegister.WARN,
+        FixRegister.BETTER_ERROR,
+    ):
         code = _critique_reproducer(code, pattern, root_cause, resolved_context, router)
         kind = _parse_kind(code)  # re-parse: a rewrite keeps or restates the tag
     log.info(
