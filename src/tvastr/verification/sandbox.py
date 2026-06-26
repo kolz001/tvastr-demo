@@ -17,9 +17,11 @@ otherwise, and lets settings override.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -27,7 +29,7 @@ from typing import Protocol, runtime_checkable
 from tvastr.config import Settings
 from tvastr.domain import FileChange
 from tvastr.logging import get_logger
-from tvastr.verification.models import RunResult
+from tvastr.verification.models import ProvisionResult, RunResult
 
 log = get_logger(__name__)
 
@@ -70,6 +72,26 @@ def installed_module_path(repo_path: str) -> str | None:
     return ".".join(mods)
 
 
+def distribution_for_path(repo_path: str) -> str | None:
+    """Pip distribution name for a repo-relative source path, or ``None``.
+
+    llama_index is a monorepo: each integration is a separately-installable
+    distribution whose dir is hyphenated (``llama-index-vector-stores-s3``) and
+    sits immediately above the ``llama_index`` import root. Return that dir name
+    when it starts with ``llama-index-``; otherwise ``None`` (flat checkout,
+    notebook, or a path with no integration dir).
+    """
+    parts = [p for p in repo_path.split("/") if p]
+    try:
+        idx = parts.index("llama_index")
+    except ValueError:
+        return None
+    if idx == 0:
+        return None
+    candidate = parts[idx - 1]
+    return candidate if candidate.startswith("llama-index-") else None
+
+
 @runtime_checkable
 class SandboxHandle(Protocol):
     """A live sandbox the verifier owns for the duration of one verification."""
@@ -78,6 +100,7 @@ class SandboxHandle(Protocol):
 
     def write_file(self, relpath: str, content: str) -> None: ...
     def apply_changes(self, changes: list[FileChange]) -> None: ...
+    def provision(self, dists: list[str]) -> ProvisionResult: ...
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult: ...
     def discard(self) -> None: ...
 
@@ -95,6 +118,7 @@ class Sandbox(Protocol):
 class _SubprocessHandle:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._deps_dir: Path | None = None
 
     def write_file(self, relpath: str, content: str) -> None:
         full = self.root / relpath
@@ -104,6 +128,36 @@ class _SubprocessHandle:
     def apply_changes(self, changes: list[FileChange]) -> None:
         for change in changes:
             self.write_file(change.path, change.patched_content)
+
+    def _run_env(self) -> dict[str, str] | None:
+        if self._deps_dir is None:
+            return None
+        env = dict(os.environ)
+        prev = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            f"{self._deps_dir}{os.pathsep}{prev}" if prev else str(self._deps_dir)
+        )
+        return env
+
+    def provision(self, dists: list[str]) -> ProvisionResult:
+        dists = [d for d in dict.fromkeys(dists) if d]  # dedup, drop empties
+        if not dists:
+            return ProvisionResult(requested=[], installed=[], failed=[], ok=True)
+        deps_dir = self.root / ".tvastr_deps"
+        cmd = [sys.executable, "-m", "pip", "install", "--target", str(deps_dir), *dists]
+        log.info("verify.sandbox.provision", sandbox="subprocess", dists=dists)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
+        except Exception as exc:  # network down, pip missing, timeout
+            log.warning("verify.sandbox.provision.error", error=str(exc))
+            return ProvisionResult(requested=dists, installed=[], failed=dists, ok=False)
+        if proc.returncode == 0:
+            self._deps_dir = deps_dir
+            return ProvisionResult(requested=dists, installed=dists, failed=[], ok=True)
+        log.warning("verify.sandbox.provision.failed", stderr=proc.stderr[-400:])
+        if deps_dir.exists():
+            self._deps_dir = deps_dir  # expose whatever landed
+        return ProvisionResult(requested=dists, installed=[], failed=dists, ok=False)
 
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult:
         log.info("verify.sandbox.run", sandbox="subprocess", cmd=cmd, cwd=str(self.root))
@@ -115,6 +169,7 @@ class _SubprocessHandle:
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                env=self._run_env(),
             )
             return RunResult(exit_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
         except subprocess.TimeoutExpired as exc:
@@ -155,6 +210,7 @@ class _DockerHandle:
         self.root = root
         self.image = image
         self._patch_pending = False
+        self._deps_provisioned = False
 
     def write_file(self, relpath: str, content: str) -> None:
         full = self.root / relpath
@@ -181,9 +237,43 @@ class _DockerHandle:
             self._patch_pending = True
             log.info("verify.sandbox.patch.staged", modules=[m for m, _ in manifest])
 
+    def provision(self, dists: list[str]) -> ProvisionResult:
+        dists = [d for d in dict.fromkeys(dists) if d]
+        if not dists:
+            return ProvisionResult(requested=[], installed=[], failed=[], ok=True)
+        docker_cmd = [
+            "docker", "run", "--rm",
+            "--cap-drop=ALL",
+            "--tmpfs=/tmp:rw,size=256m",
+            "-e", "PIP_NO_CACHE_DIR=1",
+            "-e", "HOME=/tmp",
+            "-v", f"{self.root}:/work:rw",
+            "-w", "/work",
+            self.image,
+            "pip", "install", "--target", "/work/.tvastr_deps", *dists,
+        ]
+        log.info("verify.sandbox.provision", sandbox="docker", dists=dists, image=self.image)
+        try:
+            proc = subprocess.run(
+                docker_cmd, capture_output=True, text=True, timeout=300, check=False
+            )
+        except Exception as exc:
+            log.warning("verify.sandbox.provision.error", error=str(exc))
+            return ProvisionResult(requested=dists, installed=[], failed=dists, ok=False)
+        if proc.returncode == 0:
+            self._deps_provisioned = True
+            return ProvisionResult(requested=dists, installed=dists, failed=[], ok=True)
+        log.warning("verify.sandbox.provision.failed", stderr=proc.stderr[-400:])
+        if (self.root / ".tvastr_deps").exists():
+            self._deps_provisioned = True
+        return ProvisionResult(requested=dists, installed=[], failed=dists, ok=False)
+
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult:
+        env_flags = (
+            ["-e", "PYTHONPATH=/work/.tvastr_deps"] if self._deps_provisioned else []
+        )
         if self._patch_pending:
-            # Apply the staged patches onto the installed modules inside THIS
+            # Apply staged patches onto the installed modules inside THIS
             # container, then run the reproducer — one container so the overwrite
             # persists for the import. site-packages must be writable for the
             # copy, so --read-only is dropped for this run ONLY; all other
@@ -201,6 +291,7 @@ class _DockerHandle:
             "--network=none",
             "--cap-drop=ALL",
             "--tmpfs=/tmp:rw,size=64m",
+            *env_flags,
             "-v",
             f"{self.root}:/work:rw",
             "-w",
