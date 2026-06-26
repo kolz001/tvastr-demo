@@ -38,3 +38,19 @@ def test_pipeline_seeds_agent_state_with_pr(settings, recurring_events, monkeypa
     pipeline.run(events=recurring_events, pr_ref=ref, pr_diff=diff)
     assert seen.get("pr_ref") == ref
     assert seen.get("pr_diff") == diff
+
+
+def test_pipeline_seeds_issue_body(settings, recurring_events, monkeypatch):
+    from tvastr.pipeline import build_pipeline
+
+    pipeline = build_pipeline(settings)
+    seen = {}
+    orig = pipeline.agent.run
+
+    def _spy(state):
+        seen.update(state)
+        return orig(state)
+
+    monkeypatch.setattr(pipeline.agent, "run", _spy)
+    pipeline.run(events=recurring_events, issue_body="full issue text here")
+    assert seen.get("issue_body") == "full issue text here"

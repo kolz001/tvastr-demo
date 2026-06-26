@@ -52,3 +52,14 @@ def format_code_for_prompt(files: dict[str, str]) -> str:
 def retrieve_code(ctx: AgentContext, paths: list[str], *, max_files: int = 5) -> str:
     """Back-compat wrapper: returns the prompt-formatted blob."""
     return format_code_for_prompt(retrieve_code_files(ctx, paths, max_files=max_files))
+
+
+def list_dir(ctx: AgentContext, path: str) -> list[str]:
+    """List files under ``path`` in the target repo; ``[]`` on any failure."""
+    try:
+        entries = ctx.code_host.list_dir(path)
+    except Exception as exc:
+        log.warning("tool.list_dir.failed", path=path, error=str(exc))
+        return []
+    log.info("tool.list_dir", path=path, count=len(entries))
+    return entries

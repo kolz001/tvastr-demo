@@ -20,6 +20,7 @@ log = get_logger(__name__)
 class _CodeHostLike(Protocol):
     def search_code(self, query: str, *, limit: int = 5) -> list[str]: ...
     def get_file(self, path: str) -> str: ...
+    def list_dir(self, path: str) -> list[str]: ...
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult: ...
 
 
@@ -45,6 +46,11 @@ class MockGitHubClient:
             "def run(self, *args, **kwargs):\n"
             "    ...  # implementation elided in mock mode\n"
         )
+
+    def list_dir(self, path: str) -> list[str]:
+        log.info("github.list_dir", repo=self.repo, path=path, mocked=True)
+        base = path.rstrip("/")
+        return [f"{base}/base.py", f"{base}/utils.py"]
 
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult:
         self.opened_prs.append(draft)
@@ -113,6 +119,15 @@ class GitHubClient:
         contents = repo.get_contents(path, ref=self.base_branch)
         return contents.decoded_content.decode("utf-8")
 
+    def list_dir(self, path: str) -> list[str]:
+        try:
+            contents = self._get_repo().get_contents(path, ref=self.base_branch)
+        except Exception as exc:
+            log.warning("github.list_dir.failed", path=path, error=str(exc))
+            return []
+        items = contents if isinstance(contents, list) else [contents]
+        return [c.path for c in items]
+
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult:
         repo = self._get_repo()
         base = repo.get_branch(self.base_branch)
@@ -168,6 +183,9 @@ class DryRunCodeHost:
 
     def get_file(self, path: str) -> str:
         return self.inner.get_file(path)
+
+    def list_dir(self, path: str) -> list[str]:
+        return self.inner.list_dir(path)
 
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult:
         self.captured_drafts.append(draft)
