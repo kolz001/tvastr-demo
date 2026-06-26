@@ -110,8 +110,8 @@ class Verifier:
 
     def _apply_buggy_overlay(
         self, handle: object, pr_number: int, pr_files: list[str]
-    ) -> list[str]:
-        """Overlay the pre-fix version of the PR's changed files; return paths applied."""
+    ) -> list[FileChange]:
+        """Overlay the pre-fix version of the PR's changed files; return FileChanges applied."""
         sha = self.ctx.code_host.buggy_parent_sha(pr_number)
         if not sha:
             return []
@@ -130,13 +130,13 @@ class Verifier:
                 )
         if not changes:
             return []
+        handle.apply_changes(changes)  # type: ignore[union-attr]
         self._emit(
             "verify.overlay",
             "verify",
             {"sha": sha, "files": [c.path for c in changes], "ok": True},
         )
-        handle.apply_changes(changes)  # type: ignore[union-attr]
-        return [c.path for c in changes]
+        return changes
 
     def verify(
         self,
@@ -229,15 +229,16 @@ class Verifier:
             self._emit_baseline(baseline, repro)
             baseline_reproduced = self._reproduced(baseline, repro)
 
+            overlay_changes: list[FileChange] = []
             if not baseline_reproduced and self.source_overlay and pr_number and pr_files:
                 # Released wheel already carries the fix (no_repro). Reconstruct
                 # the pre-fix state of the PR's changed files and re-baseline.
                 try:
-                    overlaid = self._apply_buggy_overlay(handle, pr_number, pr_files or [])
+                    overlay_changes = self._apply_buggy_overlay(handle, pr_number, pr_files)
                 except Exception as exc:  # overlay must never abort verify
-                    overlaid = []
+                    overlay_changes = []
                     log.warning("verify.overlay.error", error=str(exc))
-                if overlaid:
+                if overlay_changes:
                     baseline = handle.run(["python", "repro.py"], timeout_s=90)
                     self._emit_baseline(baseline, repro, retry=True)
                     baseline_reproduced = self._reproduced(baseline, repro)
@@ -254,8 +255,17 @@ class Verifier:
                 )
             is_behavioral = repro.kind == ReproducerKind.BEHAVIORAL
 
-            # 4. Apply patch
-            handle.apply_changes(fix.changes)
+            # 4. Apply patch. If we overlaid buggy files, retain the buggy state
+            # of any human-PR files the agent's fix does NOT touch, so the rerun
+            # tests the agent's fix ALONE against the reproduced bug (the fix wins
+            # on any overlapping path). Otherwise each fresh container would revert
+            # those files to the already-fixed upstream version → false VERIFIED.
+            fix_paths = {c.path for c in fix.changes}
+            patch_changes = (
+                [oc for oc in overlay_changes if oc.path not in fix_paths]
+                + list(fix.changes)
+            )
+            handle.apply_changes(patch_changes)
             self._emit(
                 "verify.patch_applied",
                 "verify",
