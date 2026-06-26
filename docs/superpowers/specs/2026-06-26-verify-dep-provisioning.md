@@ -54,8 +54,11 @@ import root); the segment immediately before it is the distribution dir iff it
 starts with `llama-index-`.
 - `.../vector_stores/llama-index-vector-stores-s3/llama_index/vector_stores/s3/base.py`
   → `llama-index-vector-stores-s3`
-- `llama-index-core/llama_index/core/...` → `llama-index-core` (already in image;
-  install is a fast no-op)
+- `llama-index-core/llama_index/core/...` → `llama-index-core` (note: `pip
+  install --target` still performs a full network install of core + its dep
+  tree into `.tvastr_deps` and, being prepended on PYTHONPATH, may shadow the
+  image's pinned core with a possibly-different version — acceptable for a
+  verify sandbox, but NOT a no-op)
 - flat checkout `llama_index/core/...` or a notebook/top-level script → `None`
   (skip; nothing to provision)
 
