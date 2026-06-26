@@ -68,8 +68,9 @@ _Reconstructed = tuple[
 def _reconstruct_from_run(run_id: str) -> _Reconstructed | None:
     """Rebuild the verifier's inputs from a persisted event stream.
 
-    Returns ``(pattern, root_cause, fix, sample_events, repo, issue_title)`` or
-    ``None`` if the run doesn't contain a fix to verify (no ``fix.generated``).
+    Returns ``(pattern, root_cause, fix, sample_events, repo, issue_title,
+    pr_number, pr_files)`` or ``None`` if the run doesn't contain a fix to verify
+    (no ``fix.generated``).
     """
     events = list(load_events(run_path(run_id)))
     if not events:
