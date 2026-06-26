@@ -56,10 +56,10 @@ agent's patch is applied, and `verify.result` becomes a real verdict instead of
 ```
 provision released wheel  →  baseline()
   ├─ baseline reproduces (fix not yet released)  → apply agent patch → rerun   [unchanged]
-  └─ no_repro AND verify_source_overlay AND a fixing PR is known:
-        buggy_sha = buggy_parent_sha(repo, pr_number)     # merge_commit parent; fallback base.sha
+  └─ no_repro AND source_overlay AND pr_number known AND pr_files non-empty:
+        buggy_sha = code_host.buggy_parent_sha(pr_number)   # merge_commit parent; fallback base.sha
         overlay_changes = []
-        for f in fixing_PR.changed_files:
+        for f in pr_files:                                  # the human PR's changed files
             if installed_module_path(f) is None:  continue   # skip docs/tests/notebooks
             content = code_host.get_file_at_ref(f, buggy_sha)
             if content is not None:
@@ -79,10 +79,9 @@ each `apply_changes` re-stages the manifest and the next `run()` applies it.
 
 | File | Change |
 |------|--------|
-| `analysis/pr_discovery.py` | `buggy_parent_sha(repo, pr_number, *, token, transport=None) -> str \| None` — GET `/repos/{repo}/pulls/{n}` → `merge_commit_sha`; GET `/repos/{repo}/commits/{sha}` → `parents[0].sha`; fallback to the PR's `base.sha`; `None` on any HTTP/parse failure. Cached like `discover_pr`. |
-| `integrations/github.py` | `get_file_at_ref(self, path: str, ref: str) -> str \| None` on the `_CodeHostLike` Protocol + `GitHubClient` (Contents API with `ref=` param, base64-decoded; `None` on miss/error), `MockGitHubClient` (canned per path), `DryRunCodeHost` (delegate to inner). |
-| `verification/verifier.py` | `source_overlay: bool = True` ctor kwarg (mirrors `provision_deps`); `pr_number: int \| None` arg on `verify()` (mirrors `issue_body`, per-run data); the lazy `no_repro` → overlay → baseline-retry branch; build overlay `FileChange`s (filtered by `installed_module_path`); emit `verify.overlay`; gate on `self.source_overlay`; all wrapped so any failure degrades to the existing `no_repro`. |
-| `api/routes/verify.py` | reconstruct `pr_number` from the persisted `benchmark.compared` event (its `pr_number` payload field); pass `source_overlay=settings.verify_source_overlay` to the `Verifier` ctor and `pr_number=` to `verify()`. |
+| `integrations/github.py` | Two methods on the `_CodeHostLike` Protocol + `GitHubClient` + `MockGitHubClient` + `DryRunCodeHost` (the code host already owns the repo + token and does PR ops, so the verifier needs no token/repo threading): (1) `get_file_at_ref(self, path, ref) -> str \| None` — GitHubClient via `repo.get_contents(path, ref=ref)` decoded; Mock canned; `None` on miss/error. (2) `buggy_parent_sha(self, pr_number) -> str \| None` — GitHubClient via `repo.get_pull(n).merge_commit_sha` → `repo.get_commit(sha).parents[0].sha`; fallback `repo.get_pull(n).base.sha`; Mock canned; `None` on any error. Both follow the existing code-host convention (real PyGithub path live-validated, Mock unit-tested). |
+| `verification/verifier.py` | `source_overlay: bool = True` ctor kwarg (mirrors `provision_deps`); `pr_number: int \| None` and `pr_files: list[str] \| None` args on `verify()` (per-run data, like `issue_body`); the lazy `no_repro` → overlay → baseline-retry branch (extract a `_reproduced(result, repro)` helper, reused for baseline + retry); build overlay `FileChange`s from `pr_files` (filtered by `installed_module_path`) via `code_host.buggy_parent_sha` + `code_host.get_file_at_ref`; emit `verify.overlay`; gate on `self.source_overlay`; all wrapped so any failure degrades to the existing `no_repro`. |
+| `api/routes/verify.py` | reconstruct `pr_number` (the `benchmark.compared` `pr_number` field) and `pr_files` (`files_both` + `files_theirs_only`) from the persisted run; pass `source_overlay=settings.verify_source_overlay` to the `Verifier` ctor and `pr_number=`/`pr_files=` to `verify()`. |
 | `config.py` | `verify_source_overlay: bool = True` (env `TVASTR_VERIFY_SOURCE_OVERLAY`). |
 | `tests/conftest.py` | seal `TVASTR_VERIFY_SOURCE_OVERLAY=false` (no network in tests). |
 | `api/templates/app.html` | add `verify.overlay` to the verify event allowlist + a summary label (mirrors `verify.provision`). |
@@ -123,11 +122,9 @@ carries the final real verdict.
 
 ## Testing (offline)
 
-- `buggy_parent_sha`: mocked httpx transport → PR with `merge_commit_sha` + a
-  commit with `parents` → returns `parents[0].sha`; missing merge commit →
-  falls back to `base.sha`; HTTP error → `None`.
-- `get_file_at_ref`: `MockGitHubClient` returns canned content per `(path, ref)`;
-  GitHubClient `ref=` param wiring asserted via a fake transport.
+- `buggy_parent_sha` / `get_file_at_ref`: unit-tested on `MockGitHubClient`
+  (canned), matching how the other code-host methods are tested; the real
+  PyGithub path is exercised live (as with `get_file`/`open_pull_request`).
 - Verifier lazy overlay (fake host + fake sandbox, scripted `RunResult`s):
   - first baseline `no_repro` → overlay fetched + `apply_changes(buggy)` →
     baseline-retry reproduces → `apply_changes(fix)` → rerun clean → VERIFIED;
