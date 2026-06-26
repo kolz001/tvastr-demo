@@ -6,6 +6,7 @@ compose into a remediation run.
 from tvastr.agent.tools.code_retrieval import (
     extract_stack_files,
     format_code_for_prompt,
+    list_dir,
     retrieve_code,
     retrieve_code_files,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "extract_stack_files",
     "format_code_for_prompt",
     "generate_fix",
+    "list_dir",
     "open_pull_request",
     "retrieve_code",
     "retrieve_code_files",
