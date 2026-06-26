@@ -157,6 +157,8 @@ class _SubprocessHandle:
         log.warning("verify.sandbox.provision.failed", stderr=proc.stderr[-400:])
         if deps_dir.exists():
             self._deps_dir = deps_dir  # expose whatever landed
+        # conservative: a partial multi-package failure can't be attributed,
+        # so report none installed though some may have landed.
         return ProvisionResult(requested=dists, installed=[], failed=dists, ok=False)
 
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult:
@@ -266,22 +268,30 @@ class _DockerHandle:
         log.warning("verify.sandbox.provision.failed", stderr=proc.stderr[-400:])
         if (self.root / ".tvastr_deps").exists():
             self._deps_provisioned = True
+        # conservative: a partial multi-package failure can't be attributed,
+        # so report none installed though some may have landed.
         return ProvisionResult(requested=dists, installed=[], failed=dists, ok=False)
 
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult:
-        env_flags = (
-            ["-e", "PYTHONPATH=/work/.tvastr_deps"] if self._deps_provisioned else []
-        )
         if self._patch_pending:
             # Apply staged patches onto the installed modules inside THIS
             # container, then run the reproducer — one container so the overwrite
             # persists for the import. site-packages must be writable for the
             # copy, so --read-only is dropped for this run ONLY; all other
             # hardening (no network, no caps, --rm, tmpfs) is kept.
-            readonly = []
-            run_cmd = ["sh", "-c", "python /work/.tvastr_apply.py && " + shlex.join(cmd)]
+            readonly: list[str] = []
+            inner = "python /work/.tvastr_apply.py && " + shlex.join(cmd)
         else:
             readonly = ["--read-only"]
+            inner = shlex.join(cmd)
+        if self._deps_provisioned:
+            # Prepend (don't clobber any image PYTHONPATH) so the provisioned
+            # integration wins and the patch-applier's find_spec can resolve it.
+            inner = "export PYTHONPATH=/work/.tvastr_deps:${PYTHONPATH:-} && " + inner
+            run_cmd = ["sh", "-c", inner]
+        elif self._patch_pending:
+            run_cmd = ["sh", "-c", inner]
+        else:
             run_cmd = list(cmd)
         docker_cmd = [
             "docker",
@@ -291,7 +301,6 @@ class _DockerHandle:
             "--network=none",
             "--cap-drop=ALL",
             "--tmpfs=/tmp:rw,size=64m",
-            *env_flags,
             "-v",
             f"{self.root}:/work:rw",
             "-w",
