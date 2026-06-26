@@ -20,6 +20,8 @@ log = get_logger(__name__)
 class _CodeHostLike(Protocol):
     def search_code(self, query: str, *, limit: int = 5) -> list[str]: ...
     def get_file(self, path: str) -> str: ...
+    def get_file_at_ref(self, path: str, ref: str) -> str | None: ...
+    def buggy_parent_sha(self, pr_number: int) -> str | None: ...
     def list_dir(self, path: str) -> list[str]: ...
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult: ...
 
@@ -46,6 +48,18 @@ class MockGitHubClient:
             "def run(self, *args, **kwargs):\n"
             "    ...  # implementation elided in mock mode\n"
         )
+
+    def get_file_at_ref(self, path: str, ref: str) -> str | None:
+        log.info("github.get_file_at_ref", repo=self.repo, path=path, ref=ref, mocked=True)
+        return (
+            f"# (mock) contents of {path} @ {ref} from {self.repo}\n"
+            "def run(self, *args, **kwargs):\n"
+            "    ...  # implementation elided in mock mode\n"
+        )
+
+    def buggy_parent_sha(self, pr_number: int) -> str | None:
+        log.info("github.buggy_parent_sha", repo=self.repo, pr=pr_number, mocked=True)
+        return f"buggyparent{pr_number}"
 
     def list_dir(self, path: str) -> list[str]:
         log.info("github.list_dir", repo=self.repo, path=path, mocked=True)
@@ -119,6 +133,34 @@ class GitHubClient:
         contents = repo.get_contents(path, ref=self.base_branch)
         return contents.decoded_content.decode("utf-8")
 
+    def get_file_at_ref(self, path: str, ref: str) -> str | None:
+        # Whole body inside try: decoded_content can raise (binary files →
+        # UnicodeDecodeError; >1MB files → encoding "none" → None.decode()).
+        # Constraint: never raise.
+        try:
+            contents = self._get_repo().get_contents(path, ref=ref)
+            if isinstance(contents, list):  # a directory, not a file
+                return None
+            return contents.decoded_content.decode("utf-8")
+        except Exception as exc:
+            log.warning("github.get_file_at_ref.failed", path=path, ref=ref, error=str(exc))
+            return None
+
+    def buggy_parent_sha(self, pr_number: int) -> str | None:
+        try:
+            repo = self._get_repo()
+            pr = repo.get_pull(pr_number)
+            merge_sha = pr.merge_commit_sha
+            if merge_sha:
+                commit = repo.get_commit(merge_sha)
+                if commit.parents:
+                    return str(commit.parents[0].sha)
+            base_sha = getattr(getattr(pr, "base", None), "sha", None)
+            return str(base_sha) if base_sha else None
+        except Exception as exc:
+            log.warning("github.buggy_parent_sha.failed", pr=pr_number, error=str(exc))
+            return None
+
     def list_dir(self, path: str) -> list[str]:
         try:
             contents = self._get_repo().get_contents(path, ref=self.base_branch)
@@ -183,6 +225,12 @@ class DryRunCodeHost:
 
     def get_file(self, path: str) -> str:
         return self.inner.get_file(path)
+
+    def get_file_at_ref(self, path: str, ref: str) -> str | None:
+        return self.inner.get_file_at_ref(path, ref)
+
+    def buggy_parent_sha(self, pr_number: int) -> str | None:
+        return self.inner.buggy_parent_sha(pr_number)
 
     def list_dir(self, path: str) -> list[str]:
         return self.inner.list_dir(path)

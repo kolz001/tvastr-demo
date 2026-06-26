@@ -61,15 +61,16 @@ class _QueueEventSink:
 
 
 _Reconstructed = tuple[
-    FailurePattern, RootCause, FixProposal, list[LogEvent], str, str | None
+    FailurePattern, RootCause, FixProposal, list[LogEvent], str, str | None, int | None, list[str]
 ]
 
 
 def _reconstruct_from_run(run_id: str) -> _Reconstructed | None:
     """Rebuild the verifier's inputs from a persisted event stream.
 
-    Returns ``(pattern, root_cause, fix, sample_events, repo, issue_title)`` or
-    ``None`` if the run doesn't contain a fix to verify (no ``fix.generated``).
+    Returns ``(pattern, root_cause, fix, sample_events, repo, issue_title,
+    pr_number, pr_files)`` or ``None`` if the run doesn't contain a fix to verify
+    (no ``fix.generated``).
     """
     events = list(load_events(run_path(run_id)))
     if not events:
@@ -81,6 +82,8 @@ def _reconstruct_from_run(run_id: str) -> _Reconstructed | None:
     root_cause: RootCause | None = None
     fix: FixProposal | None = None
     sample_events: list[LogEvent] = []
+    pr_number: int | None = None
+    pr_files: list[str] = []
 
     for ev in events:
         p = ev.payload or {}
@@ -117,6 +120,14 @@ def _reconstruct_from_run(run_id: str) -> _Reconstructed | None:
                 exception_type=p.get("exception_type"),
                 count=1,
             )
+        if ev.type == "benchmark.compared":
+            raw_pr = p.get("pr_number")
+            if raw_pr is not None:
+                try:
+                    pr_number = int(raw_pr)
+                except (TypeError, ValueError):
+                    pr_number = None
+            pr_files = list(p.get("files_both") or []) + list(p.get("files_theirs_only") or [])
         if ev.type == "fix.generated":
             file_changes = []
             for path, content in (p.get("patched_files") or {}).items():
@@ -148,7 +159,7 @@ def _reconstruct_from_run(run_id: str) -> _Reconstructed | None:
     if pattern is None or fix is None or root_cause is None:
         return None
     issue_title_str = str(issue_title) if issue_title else None
-    return pattern, root_cause, fix, sample_events, repo, issue_title_str
+    return pattern, root_cause, fix, sample_events, repo, issue_title_str, pr_number, pr_files
 
 
 def _run_in_thread(
@@ -159,6 +170,8 @@ def _run_in_thread(
     fix: FixProposal,
     sample_events: list[LogEvent],
     issue_body: str | None,
+    pr_number: int | None,
+    pr_files: list[str],
     sink: EventSink,
     q: queue.Queue[Any],
 ) -> threading.Thread:
@@ -180,11 +193,15 @@ def _run_in_thread(
         event_sink=sink,
         run_id=run_id,
         provision_deps=settings.verify_provision_deps,
+        source_overlay=settings.verify_source_overlay,
     )
 
     def _exec() -> None:
         try:
-            verifier.verify(pattern, root_cause, fix, sample_events, issue_body)
+            verifier.verify(
+                pattern, root_cause, fix, sample_events, issue_body,
+                pr_number=pr_number, pr_files=pr_files,
+            )
         except Exception as exc:
             log.exception("verify.failed", run_id=run_id)
             sink.emit(
@@ -212,7 +229,9 @@ async def verify_run(run_id: str, request: VerifyRequest) -> StreamingResponse:
             404,
             f"Run {run_id} not found or contains no fix to verify (no fix.generated event)",
         )
-    pattern, root_cause, fix, sample_events, _repo, _issue_title = reconstructed
+    (
+        pattern, root_cause, fix, sample_events, _repo, _issue_title, pr_number, pr_files
+    ) = reconstructed
 
     q: queue.Queue[Any] = queue.Queue()
     file_sink = JsonlEventSink(run_path(run_id))
@@ -226,6 +245,8 @@ async def verify_run(run_id: str, request: VerifyRequest) -> StreamingResponse:
         fix=fix,
         sample_events=sample_events,
         issue_body=request.issue_body,
+        pr_number=pr_number,
+        pr_files=pr_files,
         sink=fanout,
         q=q,
     )

@@ -23,7 +23,7 @@ from pathlib import Path
 
 from tvastr.agent.context import AgentContext
 from tvastr.agent.tools.code_retrieval import format_code_for_prompt, retrieve_code_files
-from tvastr.domain import FailurePattern, FixProposal, LogEvent, RootCause
+from tvastr.domain import FailurePattern, FileChange, FixProposal, LogEvent, RootCause
 from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.logging import get_logger
 from tvastr.verification.models import (
@@ -36,7 +36,7 @@ from tvastr.verification.models import (
 )
 from tvastr.verification.regression import discover_scoped_tests, run_scoped_tests
 from tvastr.verification.repro import synthesize_reproducer
-from tvastr.verification.sandbox import Sandbox, distribution_for_path
+from tvastr.verification.sandbox import Sandbox, distribution_for_path, installed_module_path
 
 log = get_logger(__name__)
 
@@ -67,6 +67,7 @@ class Verifier:
         event_sink: EventSink | None = None,
         run_id: str | None = None,
         provision_deps: bool = True,
+        source_overlay: bool = True,
     ) -> None:
         self.ctx = ctx
         self.sandbox = sandbox
@@ -74,6 +75,7 @@ class Verifier:
         self.sink = event_sink or NullEventSink()
         self.run_id = run_id
         self.provision_deps = provision_deps
+        self.source_overlay = source_overlay
 
     def _emit(self, type_: str, step: str, payload: dict | None = None) -> None:
         self.sink.emit(
@@ -86,6 +88,56 @@ class Verifier:
             )
         )
 
+    def _reproduced(self, result: RunResult, repro: Reproducer) -> bool:
+        if repro.kind == ReproducerKind.BEHAVIORAL:
+            return BEHAVIOR_OK_MARKER not in result.stdout
+        return _original_exception_seen(result, repro.expected_exception) or not result.succeeded
+
+    def _emit_baseline(self, result: RunResult, repro: Reproducer, *, retry: bool = False) -> None:
+        self._emit(
+            "verify.baseline",
+            "verify",
+            {
+                "exit_code": result.exit_code,
+                "stderr_tail": _tail(result.stderr),
+                "original_exception_seen": _original_exception_seen(
+                    result, repro.expected_exception
+                ),
+                "timed_out": result.timed_out,
+                "retry": retry,
+            },
+        )
+
+    def _apply_buggy_overlay(
+        self, handle: object, pr_number: int, pr_files: list[str]
+    ) -> list[FileChange]:
+        """Overlay the pre-fix version of the PR's changed files; return FileChanges applied."""
+        sha = self.ctx.code_host.buggy_parent_sha(pr_number)
+        if not sha:
+            return []
+        changes: list[FileChange] = []
+        for path in pr_files:
+            if installed_module_path(path) is None:
+                continue  # skip docs/tests/notebooks the PR also touched
+            content = self.ctx.code_host.get_file_at_ref(path, sha)
+            if content is not None:
+                changes.append(
+                    FileChange(
+                        path=path,
+                        patched_content=content,
+                        rationale="buggy overlay (pre-fix)",
+                    )
+                )
+        if not changes:
+            return []
+        handle.apply_changes(changes)  # type: ignore[union-attr]
+        self._emit(
+            "verify.overlay",
+            "verify",
+            {"sha": sha, "files": [c.path for c in changes], "ok": True},
+        )
+        return changes
+
     def verify(
         self,
         pattern: FailurePattern,
@@ -93,6 +145,8 @@ class Verifier:
         fix: FixProposal,
         sample_events: list[LogEvent],
         issue_body: str | None,
+        pr_number: int | None = None,
+        pr_files: list[str] | None = None,
     ) -> VerificationResult:
         started = time.time()
         self._emit(
@@ -172,22 +226,23 @@ class Verifier:
 
             handle.write_file("repro.py", repro.code)
             baseline: RunResult = handle.run(["python", "repro.py"], timeout_s=90)
-            saw_original = _original_exception_seen(baseline, repro.expected_exception)
-            self._emit(
-                "verify.baseline",
-                "verify",
-                {
-                    "exit_code": baseline.exit_code,
-                    "stderr_tail": _tail(baseline.stderr),
-                    "original_exception_seen": saw_original,
-                    "timed_out": baseline.timed_out,
-                },
-            )
-            is_behavioral = repro.kind == ReproducerKind.BEHAVIORAL
-            if is_behavioral:
-                baseline_reproduced = BEHAVIOR_OK_MARKER not in baseline.stdout
-            else:
-                baseline_reproduced = saw_original or not baseline.succeeded
+            self._emit_baseline(baseline, repro)
+            baseline_reproduced = self._reproduced(baseline, repro)
+
+            overlay_changes: list[FileChange] = []
+            if not baseline_reproduced and self.source_overlay and pr_number and pr_files:
+                # Released wheel already carries the fix (no_repro). Reconstruct
+                # the pre-fix state of the PR's changed files and re-baseline.
+                try:
+                    overlay_changes = self._apply_buggy_overlay(handle, pr_number, pr_files)
+                except Exception as exc:  # overlay must never abort verify
+                    overlay_changes = []
+                    log.warning("verify.overlay.error", error=str(exc))
+                if overlay_changes:
+                    baseline = handle.run(["python", "repro.py"], timeout_s=90)
+                    self._emit_baseline(baseline, repro, retry=True)
+                    baseline_reproduced = self._reproduced(baseline, repro)
+
             if not baseline_reproduced:
                 # Reproducer ran cleanly without ever hitting the bug: we have
                 # no signal to evaluate "is the fix necessary?" — be honest.
@@ -198,9 +253,19 @@ class Verifier:
                     started,
                     {"reason": "baseline run did not reproduce the failure"},
                 )
+            is_behavioral = repro.kind == ReproducerKind.BEHAVIORAL
 
-            # 4. Apply patch
-            handle.apply_changes(fix.changes)
+            # 4. Apply patch. If we overlaid buggy files, retain the buggy state
+            # of any human-PR files the agent's fix does NOT touch, so the rerun
+            # tests the agent's fix ALONE against the reproduced bug (the fix wins
+            # on any overlapping path). Otherwise each fresh container would revert
+            # those files to the already-fixed upstream version → false VERIFIED.
+            fix_paths = {c.path for c in fix.changes}
+            patch_changes = (
+                [oc for oc in overlay_changes if oc.path not in fix_paths]
+                + list(fix.changes)
+            )
+            handle.apply_changes(patch_changes)
             self._emit(
                 "verify.patch_applied",
                 "verify",

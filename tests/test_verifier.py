@@ -488,3 +488,216 @@ def test_verify_emits_provision_event_and_proceeds_on_failure() -> None:
     assert "verify.provision" in types
     # verify still ran the baseline despite provision failure:
     assert "verify.baseline" in types
+
+
+# ─── Source-overlay tests ─────────────────────────────────────────────────────
+
+# A real path whose last non-hyphenated segment chain maps to an importable module.
+_OVERLAY_PR_FILE = (
+    "llama-index-integrations/vector_stores/llama-index-vector-stores-postgres/"
+    "llama_index/vector_stores/postgres/base.py"
+)
+
+
+def test_overlay_on_no_repro_reproduces_then_verifies() -> None:
+    """Behavioral repro: baseline prints BEHAVIOR_OK (no_repro); after the buggy
+    overlay the retry does NOT print it (reproduces); rerun is OK → VERIFIED."""
+    sandbox = _FakeSandbox(
+        [
+            # baseline #1: marker present → no_repro, triggers overlay
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+            # baseline #2 (retry, post-overlay): marker absent → reproduced
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            # rerun after fix: marker present → VERIFIED_VIA_BEHAVIOR
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=True)
+    result = verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE],
+    )
+    types = [e.type for e in sink.events]
+    assert "verify.overlay" in types
+    # the post-overlay baseline re-emits verify.baseline with retry=True
+    retry_baselines = [
+        e for e in sink.events if e.type == "verify.baseline" and e.payload.get("retry")
+    ]
+    assert len(retry_baselines) == 1, "expected exactly one verify.baseline with retry=True"
+    # apply_changes called twice: buggy overlay, then the agent fix
+    assert sandbox.last_handle is not None
+    assert len(sandbox.last_handle.applied) >= 2
+    assert result.verdict in {Verdict.VERIFIED_VIA_BEHAVIOR, Verdict.VERIFIED_VIA_REPRODUCER}
+
+
+def test_no_overlay_when_baseline_reproduces() -> None:
+    """First baseline already reproduces → overlay path never taken."""
+    sandbox = _FakeSandbox(
+        [
+            # baseline reproduces (no marker)
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            # rerun after fix
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=True)
+    verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE],
+    )
+    assert "verify.overlay" not in [e.type for e in sink.events]
+
+
+def test_no_overlay_without_pr_number() -> None:
+    """no_repro baseline but pr_number=None → stays no_repro, no overlay."""
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=True)
+    out = verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=None,
+        pr_files=None,
+    )
+    assert "verify.overlay" not in [e.type for e in sink.events]
+    assert out.verdict == Verdict.NO_REPRO
+
+
+def test_overlay_flag_off_skips_overlay() -> None:
+    """source_overlay=False → overlay never runs even with pr_number set."""
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, event_sink=sink, source_overlay=False)
+    out = verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        _fix(),
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE],
+    )
+    assert "verify.overlay" not in [e.type for e in sink.events]
+    assert out.verdict == Verdict.NO_REPRO
+
+
+_OVERLAY_PR_FILE_B = (
+    "llama-index-integrations/vector_stores/llama-index-vector-stores-s3/"
+    "llama_index/vector_stores/s3/base.py"
+)
+
+
+class _ManifestHandle(_FakeHandle):
+    """_FakeHandle variant that simulates the production Docker sandbox's
+    manifest-replacement semantics: each ``apply_changes`` call REPLACES the
+    previously-manifested entries in ``written``, just as a fresh container
+    starts from the base image and only the current manifest's files are
+    overlaid.  ``write_file`` entries (e.g. repro.py) are NOT cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._manifest_paths: set[str] = set()
+
+    def apply_changes(self, changes: list[FileChange]) -> None:
+        # Evict files from the previous manifest (simulate fresh container)
+        for p in self._manifest_paths:
+            self.written.pop(p, None)
+        self._manifest_paths = {c.path for c in changes}
+        super().apply_changes(changes)
+
+
+class _ManifestSandbox(_FakeSandbox):
+    """_FakeSandbox variant that issues _ManifestHandle instances."""
+
+    def prepare(self) -> SandboxHandle:
+        h = _ManifestHandle()
+        h.responses = list(self._responses)
+        h.provision_ok = self._provision_ok
+        self.last_handle = h
+        return h
+
+
+def test_overlay_retains_human_only_files_in_rerun() -> None:
+    """Buggy overlay for files the agent's fix does NOT touch must survive into the
+    rerun sandbox.  Otherwise each fresh container reverts those files to the
+    already-fixed upstream image — testing 'agent-fix + upstream-fix' and giving
+    a false VERIFIED for an incomplete agent fix.
+
+    pr_files = [A, B]: fix touches only A.  After verify, B must still hold the
+    buggy overlay content (ref marker 'buggyparent' in it), and A must hold the
+    agent's fix content (fix wins on overlapping path).
+
+    Uses _ManifestSandbox/_ManifestHandle, which simulate production Docker
+    manifest-replacement: each apply_changes call REPLACES the prior manifest,
+    matching the behaviour of _DockerHandle.apply_changes (it overwrites
+    manifest.json on every call)."""
+    # Local fix that only touches A (_OVERLAY_PR_FILE), not B
+    fix_a_only = FixProposal(
+        pattern_id="abc",
+        summary="fix only file A",
+        changes=[
+            FileChange(
+                path=_OVERLAY_PR_FILE,
+                patched_content="# agent-fixed-A-only\n",
+                rationale="fix",
+            )
+        ],
+        test_plan="check it",
+    )
+    sandbox = _ManifestSandbox(
+        [
+            # baseline #1: marker present → no_repro, triggers overlay
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+            # baseline #2 (retry, post-overlay): marker absent → reproduced
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 'sub_dicts'"),
+            # rerun after fix: marker present → VERIFIED_VIA_BEHAVIOR
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),
+        ]
+    )
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, source_overlay=True)
+    verifier.verify(
+        _kerr_pattern(),
+        _root_cause(),
+        fix_a_only,
+        [_event()],
+        issue_body=None,
+        pr_number=21447,
+        pr_files=[_OVERLAY_PR_FILE, _OVERLAY_PR_FILE_B],
+    )
+    assert sandbox.last_handle is not None
+    handle = sandbox.last_handle
+    # B must retain the buggy overlay content through the rerun (not revert to upstream)
+    assert _OVERLAY_PR_FILE_B in handle.written, (
+        "B must be in the rerun manifest — without the fix, apply_changes(fix.changes) "
+        "replaces the manifest and B reverts to the upstream-fixed image"
+    )
+    assert "buggyparent" in handle.written[_OVERLAY_PR_FILE_B], (
+        "B's content must carry the pre-fix (buggy) ref marker, not the upstream-fixed version"
+    )
+    # A must hold the agent's fix (fix wins over overlay on overlapping path)
+    assert handle.written[_OVERLAY_PR_FILE] == "# agent-fixed-A-only\n", (
+        "A must be overwritten by the agent's fix, not the overlay"
+    )
