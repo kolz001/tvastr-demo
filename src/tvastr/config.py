@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     verify_docker_image: str = "tvastr-verify:llamaindex"
     # Project root scanned for scoped regression tests. Empty disables that oracle.
     verify_project_root: str = ""
+    # When true, the verify sandbox installs the issue's integration package(s)
+    # on demand (pip install --target) before running the reproducer, so the
+    # long tail of llama_index integrations is importable. Needs network for the
+    # prep step; baseline/rerun stay network-isolated. Off in tests.
+    verify_provision_deps: bool = True
 
 
 @lru_cache

@@ -174,7 +174,12 @@ def _run_in_thread(
     sandbox = build_sandbox(settings)
     project_root = Path(settings.verify_project_root) if settings.verify_project_root else None
     verifier = Verifier(
-        ctx, sandbox, project_root=project_root, event_sink=sink, run_id=run_id
+        ctx,
+        sandbox,
+        project_root=project_root,
+        event_sink=sink,
+        run_id=run_id,
+        provision_deps=settings.verify_provision_deps,
     )
 
     def _exec() -> None:

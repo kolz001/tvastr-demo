@@ -25,7 +25,7 @@ from tvastr.integrations.github import MockGitHubClient
 from tvastr.llm.base import LLMResponse
 from tvastr.llm.router import build_router
 from tvastr.verification import Verdict, Verifier
-from tvastr.verification.models import BEHAVIOR_OK_MARKER, RunResult
+from tvastr.verification.models import BEHAVIOR_OK_MARKER, ProvisionResult, RunResult
 from tvastr.verification.sandbox import SandboxHandle
 
 # ─── Test doubles ─────────────────────────────────────────────────────────
@@ -39,6 +39,8 @@ class _FakeHandle:
         self.run_history: list[list[str]] = []
         self.responses: list[RunResult] = []
         self.discarded = False
+        self.provisioned: list[list[str]] = []
+        self.provision_ok = True
 
     def write_file(self, relpath: str, content: str) -> None:
         self.written[relpath] = content
@@ -47,6 +49,16 @@ class _FakeHandle:
         self.applied.extend(changes)
         for change in changes:
             self.written[change.path] = change.patched_content
+
+    def provision(self, dists: list[str]) -> ProvisionResult:
+        self.provisioned.append(list(dists))
+        ok = self.provision_ok
+        return ProvisionResult(
+            requested=list(dists),
+            installed=list(dists) if ok else [],
+            failed=[] if ok else list(dists),
+            ok=ok,
+        )
 
     def run(self, cmd: list[str], *, timeout_s: int = 60) -> RunResult:
         self.run_history.append(cmd)
@@ -61,13 +73,15 @@ class _FakeHandle:
 class _FakeSandbox:
     name = "fake"
 
-    def __init__(self, responses: list[RunResult]) -> None:
+    def __init__(self, responses: list[RunResult], *, provision_ok: bool = True) -> None:
         self._responses = responses
+        self._provision_ok = provision_ok
         self.last_handle: _FakeHandle | None = None
 
     def prepare(self) -> SandboxHandle:
         h = _FakeHandle()
         h.responses = list(self._responses)
+        h.provision_ok = self._provision_ok
         self.last_handle = h
         return h
 
@@ -364,3 +378,113 @@ def test_behavioral_no_repro_when_baseline_prints_marker() -> None:
     verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
     result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
     assert result.verdict == Verdict.NO_REPRO
+
+
+# ─── Provisioning wiring tests ────────────────────────────────────────────────
+
+
+def _fix_with_changes(changes: list[FileChange]) -> FixProposal:
+    return FixProposal(
+        pattern_id="abc",
+        summary="fix imports",
+        changes=changes,
+        test_plan="check it imports",
+    )
+
+
+def test_verify_provisions_derived_distributions() -> None:
+    # Two files in the same dist + one in another → two deduped, sorted dists.
+    changes = [
+        FileChange(
+            path=(
+                "llama-index-integrations/vector_stores/llama-index-vector-stores-s3/"
+                "llama_index/vector_stores/s3/base.py"
+            ),
+            patched_content="# fixed\n",
+            rationale="r",
+        ),
+        FileChange(
+            path=(
+                "llama-index-integrations/vector_stores/llama-index-vector-stores-s3/"
+                "llama_index/vector_stores/s3/utils.py"
+            ),
+            patched_content="# fixed2\n",
+            rationale="r",
+        ),
+        FileChange(
+            path=(
+                "llama-index-integrations/vector_stores/llama-index-vector-stores-postgres/"
+                "llama_index/vector_stores/postgres/base.py"
+            ),
+            patched_content="# fixed3\n",
+            rationale="r",
+        ),
+    ]
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: No module named 'foo'"),
+            RunResult(exit_code=0, stdout="ok", stderr=""),
+        ]
+    )
+    verifier = Verifier(_ctx(), sandbox, provision_deps=True)
+    verifier.verify(
+        _pattern(), _root_cause(), _fix_with_changes(changes), [_event()], issue_body=None
+    )
+    assert sandbox.last_handle is not None
+    assert sandbox.last_handle.provisioned == [
+        ["llama-index-vector-stores-postgres", "llama-index-vector-stores-s3"]
+    ]
+
+
+def test_verify_does_not_provision_when_flag_off() -> None:
+    changes = [
+        FileChange(
+            path=(
+                "llama-index-integrations/vector_stores/llama-index-vector-stores-s3/"
+                "llama_index/vector_stores/s3/base.py"
+            ),
+            patched_content="# fixed\n",
+            rationale="r",
+        ),
+    ]
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: No module named 'foo'"),
+            RunResult(exit_code=0, stdout="ok", stderr=""),
+        ]
+    )
+    verifier = Verifier(_ctx(), sandbox, provision_deps=False)
+    verifier.verify(
+        _pattern(), _root_cause(), _fix_with_changes(changes), [_event()], issue_body=None
+    )
+    assert sandbox.last_handle is not None
+    assert sandbox.last_handle.provisioned == []
+
+
+def test_verify_emits_provision_event_and_proceeds_on_failure() -> None:
+    changes = [
+        FileChange(
+            path=(
+                "llama-index-integrations/vector_stores/llama-index-vector-stores-s3/"
+                "llama_index/vector_stores/s3/base.py"
+            ),
+            patched_content="# fixed\n",
+            rationale="r",
+        ),
+    ]
+    sink = ListEventSink()
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: No module named 'foo'"),
+            RunResult(exit_code=0, stdout="ok", stderr=""),
+        ],
+        provision_ok=False,
+    )
+    verifier = Verifier(_ctx(), sandbox, event_sink=sink, run_id="p1", provision_deps=True)
+    verifier.verify(
+        _pattern(), _root_cause(), _fix_with_changes(changes), [_event()], issue_body=None
+    )
+    types = [e.type for e in sink.events]
+    assert "verify.provision" in types
+    # verify still ran the baseline despite provision failure:
+    assert "verify.baseline" in types

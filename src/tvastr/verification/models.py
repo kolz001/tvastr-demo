@@ -58,6 +58,16 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class ProvisionResult:
+    """Outcome of installing an issue's integration package(s) into a sandbox."""
+
+    requested: list[str]
+    installed: list[str]
+    failed: list[str]
+    ok: bool
+
+
+@dataclass(frozen=True)
 class VerificationResult:
     verdict: Verdict
     oracle: str  # "reproducer" | "scoped_tests" | "smoke_import" | "none"
