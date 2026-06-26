@@ -41,6 +41,7 @@ class TaskType(StrEnum):
     PR_ANALYSIS = "pr_analysis"
     FIX_COMPARISON = "fix_comparison"
     DOC_GROUNDING = "doc_grounding"
+    REPRO_CRITIQUE = "repro_critique"
 
 
 _LOCAL_TASKS = {TaskType.LOG_PARSING, TaskType.SUMMARIZATION}

@@ -100,3 +100,18 @@ def test_parse_kind_handles_empty_code():
 
 def test_parse_kind_tolerates_extra_spacing():
     assert _parse_kind("#   tvastr-kind:   behavioral\nx\n") == ReproducerKind.BEHAVIORAL
+
+
+def test_repro_critique_is_a_cloud_task():
+    from tvastr.llm.router import _LOCAL_TASKS, TaskType
+    assert TaskType.REPRO_CRITIQUE.value == "repro_critique"
+    assert TaskType.REPRO_CRITIQUE not in _LOCAL_TASKS
+
+
+def test_system_prompt_forbids_asserting_degraded_state():
+    from tvastr.verification.repro import _SYSTEM
+    s = _SYSTEM
+    assert "round-trip" in s
+    assert "FORBIDDEN" in s
+    assert "degraded" in s
+    assert "SUPPRESSES" in s
