@@ -83,6 +83,8 @@ class MockClaudeClient:
         log.info("llm.cloud.complete", model=self.model, mocked=True)
         if self._looks_like_fix_prompt(prompt, system):
             text = self._mock_fix_json(prompt)
+        elif self._looks_like_investigate_prompt(system):
+            text = self._mock_investigate_json(prompt)
         else:
             text = (
                 "[cloud-reasoning] Based on the failure signature, the most likely root "
@@ -96,6 +98,26 @@ class MockClaudeClient:
     def _looks_like_fix_prompt(prompt: str, system: str | None) -> bool:
         haystack = f"{system or ''}\n{prompt}"
         return '"search"' in haystack and '"replace"' in haystack
+
+    @staticmethod
+    def _looks_like_investigate_prompt(system: str | None) -> bool:
+        # The investigator system prompt contains this unique sentinel phrase.
+        return '"done": true' in (system or "")
+
+    @staticmethod
+    def _mock_investigate_json(prompt: str) -> str:
+        """Return a plausible root-cause finish for the investigator loop."""
+        import re
+
+        # Extract a suspected file path from the prompt if any are mentioned.
+        match = re.search(r"# ── (\S+) ──", prompt)
+        suspected = f'["{match.group(1)}"]' if match else "[]"
+        return (
+            '{"root_cause": "[mock] contract mismatch detected in the suspected file; '
+            "the producer's output type does not match the consumer's expected input type. "
+            'Align the types and add a regression test.", '
+            f'"suspected_files": {suspected}, "confidence": 0.9, "done": true}}'
+        )
 
     @staticmethod
     def _mock_fix_json(prompt: str) -> str:

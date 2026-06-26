@@ -24,7 +24,11 @@ def _root_cause():
 
 
 class _GroundingRouter:
-    """Returns a scripted grounded answer (with sources) for DOC_GROUNDING."""
+    """Returns a scripted grounded answer (with sources) for DOC_GROUNDING.
+
+    When called for the investigator (ROOT_CAUSE with _INVESTIGATE_SYSTEM), returns
+    a valid done-JSON so the confidence gate passes and ground_root_cause is reached.
+    """
 
     def __init__(self, text="corrected diagnosis", sources=("https://docs/x",)):
         self.text = text
@@ -33,7 +37,14 @@ class _GroundingRouter:
 
     def run(self, task, prompt, *, sensitivity=Sensitivity.INTERNAL, system=None, web_search=False):
         self.tasks.append((task, web_search))
-        resp = LLMResponse(text=self.text, model="mock", target="cloud", sources=self.sources)
+        # Investigator calls need a finish JSON so confidence gate routes to "act".
+        if system and '"done": true' in system:
+            text = '{"root_cause": "mock root cause", "confidence": 0.9, "done": true}'
+            sources: list[str] = []
+        else:
+            text = self.text
+            sources = self.sources
+        resp = LLMResponse(text=text, model="mock", target="cloud", sources=sources)
         decision = RoutingDecision(
             task=task.value, target="cloud", model="mock",
             sensitivity=sensitivity, reason="scripted",

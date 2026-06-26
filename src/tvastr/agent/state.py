@@ -41,6 +41,6 @@ class AgentState(TypedDict, total=False):
     notes: str
     pr_ref: PullRequestRef | None
     pr_diff: PrDiff | None
-    issue_body: str  # full issue text, for the investigator's starting context
+    issue_body: str | None  # full issue text, for the investigator's starting context
     fix_comparison: FixComparison | None
     doc_sources: list[str]  # citation URLs from documentation grounding

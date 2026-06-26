@@ -2,12 +2,11 @@
 
 Flow::
 
-    START -> investigate -> reason_root_cause -> (confidence gate)
-        high → ground_root_cause → generate_fix → compare_to_pr → draft_pr → open_pr → notify → END
-        low  → notify (skipped) → END
-
-    reason_root_cause may loop through expand_context (bounded to 2 extra
-    rounds) to fetch code its own analysis asked for before the gate fires.
+    START -> investigate (agentic loop: search/read/list -> root_cause)
+        -> (confidence gate)
+        high -> ground_root_cause -> generate_fix -> compare_to_pr
+             -> draft_pr -> open_pr -> notify -> END
+        low  -> notify (skipped) -> END
 
     compare_to_pr benchmarks the agent's fix against the upstream PR (the
     ground-truth oracle) when one was discovered; it emits benchmark.compared
@@ -31,6 +30,7 @@ from tvastr.agent.tools import (
     extract_stack_files,
     format_code_for_prompt,
     generate_fix,
+    list_dir,
     open_pull_request,
     retrieve_code_files,
     search_codebase,
@@ -54,39 +54,41 @@ def _append_routing(state: AgentState, decision: RoutingDecision) -> list[Routin
     return [*state.get("routing", []), decision]
 
 
-_EVIDENCE_CONFIDENCE = {"stack_trace": 0.8, "search": 0.6}
-_MAX_EXPANSIONS = 2  # extra retrieval rounds beyond the first investigate pass
 _MAX_CONTEXT_FILES = 12  # cap on accumulated code_files
+_MAX_INVESTIGATE_ROUNDS = 4
+
+_INVESTIGATE_SYSTEM = (
+    "You are a senior engineer debugging a reported bug by reading the codebase. "
+    "Follow this method strictly:\n"
+    "1. ROOT CAUSE FIRST: do not conclude until you have READ the actual code that "
+    "proves the cause; if you have not, keep investigating or report low confidence.\n"
+    "2. VERIFY THE REPORTER'S HYPOTHESIS: identify the real symptom AND any cause the "
+    "reporter guessed, and treat the guess as a hypothesis to confirm against the code, "
+    "not as fact.\n"
+    "3. CROSS-REFERENCE: compare related/sibling code paths (read vs write vs delete) and "
+    "look for the inconsistency that explains the bug.\n"
+    "4. CITE EVIDENCE: your root_cause must reference specific file:line; set confidence by "
+    "how well-corroborated it is; do not guess.\n\n"
+    "Respond with ONLY JSON. To investigate further:\n"
+    '{"thought": "...", "actions": [{"search": "terms"}, {"read_file": "path"}, '
+    '{"list_dir": "dir"}]}\n'
+    "When you have a proven root cause:\n"
+    '{"root_cause": "2-4 sentences citing file:line", "suspected_files": ["path"], '
+    '"confidence": 0.0-1.0, "done": true}'
+)
 
 
-def _search_query_from_message(message: str) -> str:
-    """Search terms for a pattern with no exception type.
-
-    Synthetic non-crashing events look like ``UnexpectedBehavior: <issue
-    title>`` — the part after the colon is what's worth grepping for.
-    """
-    tail = message.split(":", 1)[-1].strip()
-    return tail[:120]
+def _clamp_confidence(value: object) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _parse_reasoning(text: str) -> tuple[str, bool, dict]:
-    """Split a reasoning response into (summary, need_more_context, next_targets).
-
-    The reasoning LLM is asked for JSON {"root_cause", "need_more_context",
-    "next_targets": {"queries", "paths"}}. If no such object is present (e.g. a
-    prose mock response), fall back to (text, False, empty) — a single pass,
-    exactly the pre-loop behavior.
-    """
-    empty = {"queries": [], "paths": []}
+def _parse_investigation(text: str) -> dict:
+    """The investigator's JSON turn, or {} if unparseable."""
     parsed = extract_json(text)
-    if not parsed or not parsed.get("root_cause"):
-        return text, False, empty
-    summary = str(parsed["root_cause"])
-    need_more = bool(parsed.get("need_more_context", False))
-    targets = parsed.get("next_targets") or {}
-    queries = [str(q) for q in (targets.get("queries") or []) if q]
-    paths = [str(p) for p in (targets.get("paths") or []) if p]
-    return summary, need_more, {"queries": queries, "paths": paths}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class RemediationAgent:
@@ -110,8 +112,6 @@ class RemediationAgent:
     def _build(self):
         g: StateGraph = StateGraph(AgentState)
         g.add_node("investigate", self._investigate)
-        g.add_node("reason_root_cause", self._reason_root_cause)
-        g.add_node("expand_context", self._expand_context)
         g.add_node("ground_root_cause", self._ground_root_cause)
         g.add_node("generate_fix", self._generate_fix)
         g.add_node("compare_to_pr", self._compare_to_pr)
@@ -120,13 +120,11 @@ class RemediationAgent:
         g.add_node("notify", self._notify)
 
         g.add_edge(START, "investigate")
-        g.add_edge("investigate", "reason_root_cause")
         g.add_conditional_edges(
-            "reason_root_cause",
-            self._after_reason,
-            {"expand": "expand_context", "act": "ground_root_cause", "skip": "notify"},
+            "investigate",
+            self._confidence_gate,
+            {"act": "ground_root_cause", "skip": "notify"},
         )
-        g.add_edge("expand_context", "reason_root_cause")
         g.add_edge("ground_root_cause", "generate_fix")
         g.add_edge("generate_fix", "compare_to_pr")
         g.add_edge("compare_to_pr", "draft_pr")
@@ -140,174 +138,99 @@ class RemediationAgent:
     def _investigate(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]
         events = state.get("sample_events", [])
+        issue_body = state.get("issue_body") or pattern.representative_message or pattern.title
         self._emit("agent.node.start", "investigate", pattern=pattern.fingerprint)
 
-        evidence_source = "none"
+        code_files: dict[str, str] = {}
+        seen: set[str] = set()
+        transcript: list[str] = []
+        decisions: list[RoutingDecision] = []
+
+        # Free seed: stack-trace files when a traceback is present.
         suspected = extract_stack_files(events)
         if suspected:
-            evidence_source = "stack_trace"
-            self._emit(
-                "tool.call",
-                "extract_stack_files",
-                source="stack_trace",
-                paths=suspected,
+            self._emit("tool.call", "extract_stack_files", source="stack_trace", paths=suspected)
+            fetched = retrieve_code_files(self.ctx, suspected)
+            code_files.update(fetched)
+            seen.update(suspected)
+
+        root_cause: RootCause | None = None
+        for round_i in range(_MAX_INVESTIGATE_ROUNDS):
+            prompt = (
+                f"Issue: {pattern.title}\n\n{issue_body[:4000]}\n\n"
+                f"Code read so far:\n{format_code_for_prompt(code_files) or '(none)'}\n\n"
+                f"Tool results so far:\n{chr(10).join(transcript) or '(none)'}\n\n"
+                "Investigate further or finish with a proven root_cause."
             )
-        else:
-            # No stack trace: grep for the exception type, or — for
-            # non-crashing reports (synthetic "UnexpectedBehavior: <title>"
-            # events) — for the behavior description after the colon.
-            query = pattern.exception_type or _search_query_from_message(
-                pattern.representative_message
-            )
-            if query:
-                suspected = search_codebase(self.ctx, query)
-                if suspected:
-                    evidence_source = "search"
-                self._emit(
-                    "tool.call",
-                    "search_codebase",
-                    query=query,
-                    paths=suspected,
+            try:
+                response, decision = self.ctx.router.run(
+                    TaskType.ROOT_CAUSE, prompt,
+                    sensitivity=pattern.sensitivity, system=_INVESTIGATE_SYSTEM,
                 )
+            except Exception as exc:
+                log.warning("agent.investigate.llm_failed", error=str(exc))
+                break
+            decisions.append(decision)
+            parsed = _parse_investigation(response.text)
 
-        code_files = retrieve_code_files(self.ctx, suspected)
-        self._emit(
-            "tool.call",
-            "retrieve_code_files",
-            requested=len(suspected),
-            retrieved=len(code_files),
-            paths=list(code_files.keys()),
-        )
-        self._emit(
-            "agent.node.end",
-            "investigate",
-            suspected_files=suspected,
-            files_retrieved=len(code_files),
-        )
-        return {
-            "suspected_files": suspected,
-            "evidence_source": evidence_source,
-            "code_files": code_files,
-            "code_context": format_code_for_prompt(code_files),
-            "retrieved_paths": set(suspected),
-        }
+            if parsed.get("done") and parsed.get("root_cause"):
+                root_cause = RootCause(
+                    pattern_id=pattern.id,
+                    summary=str(parsed["root_cause"]),
+                    suspected_files=[str(p) for p in (parsed.get("suspected_files") or [])]
+                    or list(code_files),
+                    confidence=_clamp_confidence(parsed.get("confidence", 0.5)),
+                    reasoning=response.text,
+                )
+                break
 
-    def _reason_root_cause(self, state: AgentState) -> AgentState:
-        pattern = state["pattern"]
-        suspected = state.get("suspected_files", [])
-        self._emit("agent.node.start", "reason_root_cause", pattern=pattern.fingerprint)
-        prompt = (
-            f"A recurring failure has been detected ({pattern.count} occurrences).\n"
-            f"Title: {pattern.title}\n"
-            f"Message: {pattern.representative_message}\n"
-            f"Suspected files: {', '.join(suspected) or 'unknown'}\n\n"
-            f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
-            "Diagnose the root cause. If the code context is insufficient to pinpoint "
-            "the bug (the real fault may be in a file you have not seen yet), say so and "
-            "propose where to look next.\n\n"
-            'Respond ONLY with JSON: {"root_cause": "2-3 sentence explanation", '
-            '"need_more_context": true|false, "next_targets": '
-            '{"queries": ["code-search terms"], "paths": ["repo/file/paths"]}}. '
-            "Set need_more_context to false and leave next_targets empty when the "
-            "current context is enough to write the fix."
-        )
-        response, decision = self.ctx.router.run(
-            TaskType.ROOT_CAUSE, prompt, sensitivity=pattern.sensitivity
-        )
-        summary, need_more, next_targets = _parse_reasoning(response.text)
-        # Confidence is unchanged: it tracks how the FIRST evidence was found
-        # (stack trace 0.8 / search 0.6 / none 0.3), not the loop.
-        confidence = _EVIDENCE_CONFIDENCE.get(state.get("evidence_source", "none"), 0.3)
-        root_cause = RootCause(
-            pattern_id=pattern.id,
-            summary=summary,
-            suspected_files=suspected,
-            confidence=confidence,
-            reasoning=response.text,
-        )
-        self._emit(
-            "agent.node.end",
-            "reason_root_cause",
-            confidence=confidence,
-            summary=root_cause.summary,
-            need_more_context=need_more,
-        )
+            actions = parsed.get("actions") or []
+            if not actions:
+                break  # unparseable / nothing proposed → stop
+            self._emit("tool.call", "investigate.round", round=round_i + 1,
+                       thought=str(parsed.get("thought", "")))
+            for act in actions:
+                if not isinstance(act, dict):
+                    continue
+                if "search" in act:
+                    q = str(act["search"])
+                    hits = search_codebase(self.ctx, q)
+                    self._emit("tool.call", "search_codebase", query=q, paths=hits)
+                    transcript.append(f"search {q!r} -> {hits}")
+                elif "read_file" in act:
+                    p = str(act["read_file"])
+                    if p in seen or len(code_files) >= _MAX_CONTEXT_FILES:
+                        continue
+                    fetched = retrieve_code_files(self.ctx, [p], max_files=1)
+                    code_files.update(fetched)
+                    seen.add(p)
+                    self._emit("tool.call", "retrieve_code_files", requested=1,
+                               retrieved=len(fetched), paths=list(fetched.keys()))
+                elif "list_dir" in act:
+                    d = str(act["list_dir"])
+                    entries = list_dir(self.ctx, d)
+                    self._emit("tool.call", "list_dir", path=d, entries=entries)
+                    transcript.append(f"list_dir {d!r} -> {entries}")
+
+        if root_cause is None:
+            root_cause = RootCause(
+                pattern_id=pattern.id,
+                summary="insufficient evidence to determine the root cause",
+                suspected_files=list(code_files),
+                confidence=0.0,
+                reasoning="investigator did not converge within the round budget",
+            )
+        self._emit("agent.node.end", "investigate",
+                   confidence=root_cause.confidence, summary=root_cause.summary,
+                   files_read=len(code_files))
+        routing = state.get("routing", [])
         return {
             "root_cause": root_cause,
-            "need_more_context": need_more,
-            "next_targets": next_targets,
-            "routing": _append_routing(state, decision),
+            "suspected_files": root_cause.suspected_files,
+            "code_files": code_files,
+            "code_context": format_code_for_prompt(code_files),
+            "routing": [*routing, *decisions],
         }
-
-    def _expand_context(self, state: AgentState) -> AgentState:
-        pattern = state["pattern"]
-        iteration = state.get("retrieval_iterations", 0) + 1
-        targets = state.get("next_targets") or {"queries": [], "paths": []}
-        seen = set(state.get("retrieved_paths", set()))
-        code_files = dict(state.get("code_files", {}))
-        self._emit(
-            "agent.node.start", "expand_context",
-            pattern=pattern.fingerprint, iteration=iteration,
-        )
-        try:
-            # New paths come from fresh searches + the LLM's explicit path picks.
-            new_paths: list[str] = []
-            for query in targets["queries"]:
-                if query in seen:
-                    continue
-                seen.add(query)
-                hits = search_codebase(self.ctx, query)
-                self._emit("tool.call", "search_codebase", query=query, paths=hits)
-                for hit in hits:
-                    if hit not in seen and hit not in code_files and hit not in new_paths:
-                        new_paths.append(hit)
-            for path in targets["paths"]:
-                if path not in seen and path not in code_files and path not in new_paths:
-                    new_paths.append(path)
-
-            budget = max(0, _MAX_CONTEXT_FILES - len(code_files))
-            to_fetch = new_paths[:budget]
-            fetched = retrieve_code_files(self.ctx, to_fetch, max_files=budget) if to_fetch else {}
-            missing = [p for p in to_fetch if p not in fetched]
-            self._emit(
-                "tool.call", "retrieve_code_files",
-                requested=len(to_fetch), retrieved=len(fetched), paths=list(fetched.keys()),
-            )
-            code_files.update(fetched)
-            seen.update(to_fetch)
-            self._emit(
-                "agent.node.end", "expand_context",
-                files_added=len(fetched), missing_paths=missing, total_files=len(code_files),
-            )
-            return {
-                "code_files": code_files,
-                "code_context": format_code_for_prompt(code_files),
-                "retrieved_paths": seen,
-                "retrieval_iterations": iteration,
-            }
-        except Exception as exc:  # never crash the run — bump the counter so the cap stops us
-            log.warning("agent.expand_context.failed", error=str(exc))
-            self._emit(
-                "agent.node.end", "expand_context",
-                files_added=0, missing_paths=[], error=str(exc),
-            )
-            return {"retrieval_iterations": iteration}
-
-    def _should_expand(self, state: AgentState) -> bool:
-        if not state.get("need_more_context"):
-            return False
-        if state.get("retrieval_iterations", 0) >= _MAX_EXPANSIONS:
-            return False
-        targets = state.get("next_targets") or {"queries": [], "paths": []}
-        seen = state.get("retrieved_paths", set())
-        fresh = [t for t in (targets["queries"] + targets["paths"]) if t not in seen]
-        return bool(fresh)
-
-    def _after_reason(self, state: AgentState) -> str:
-        """Route out of reasoning: loop to expand_context, or run the gate."""
-        if self._should_expand(state):
-            return "expand"
-        return self._confidence_gate(state)
 
     def _confidence_gate(self, state: AgentState) -> str:
         root_cause = state.get("root_cause")
