@@ -36,7 +36,7 @@ from tvastr.verification.models import (
 )
 from tvastr.verification.regression import discover_scoped_tests, run_scoped_tests
 from tvastr.verification.repro import synthesize_reproducer
-from tvastr.verification.sandbox import Sandbox
+from tvastr.verification.sandbox import Sandbox, distribution_for_path
 
 log = get_logger(__name__)
 
@@ -66,12 +66,14 @@ class Verifier:
         project_root: Path | None = None,
         event_sink: EventSink | None = None,
         run_id: str | None = None,
+        provision_deps: bool = True,
     ) -> None:
         self.ctx = ctx
         self.sandbox = sandbox
         self.project_root = project_root  # for scoped-test discovery
         self.sink = event_sink or NullEventSink()
         self.run_id = run_id
+        self.provision_deps = provision_deps
 
     def _emit(self, type_: str, step: str, payload: dict | None = None) -> None:
         self.sink.emit(
@@ -141,6 +143,33 @@ class Verifier:
         # 2/3. Sandbox + baseline
         handle = self.sandbox.prepare()
         try:
+            # 2a. Provision the issue's integration package(s) so the reproducer
+            # can locate real source and the patch-applier can resolve the
+            # module. Never fatal: a miss degrades to the existing no-repro path.
+            if self.provision_deps:
+                try:
+                    dists = sorted(
+                        {
+                            d
+                            for c in fix.changes
+                            if (d := distribution_for_path(c.path)) is not None
+                        }
+                    )
+                    if dists:
+                        pr = handle.provision(dists)
+                        self._emit(
+                            "verify.provision",
+                            "verify",
+                            {
+                                "requested": pr.requested,
+                                "installed": pr.installed,
+                                "failed": pr.failed,
+                                "ok": pr.ok,
+                            },
+                        )
+                except Exception as exc:  # provisioning must never abort verify
+                    log.warning("verify.provision.error", error=str(exc))
+
             handle.write_file("repro.py", repro.code)
             baseline: RunResult = handle.run(["python", "repro.py"], timeout_s=90)
             saw_original = _original_exception_seen(baseline, repro.expected_exception)

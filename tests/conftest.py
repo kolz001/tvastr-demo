@@ -20,6 +20,9 @@ os.environ["TVASTR_DOC_GROUNDING"] = "false"
 # Pin dry_run=false so tests start from the autonomous-mode baseline. Tests
 # that need dry-run behaviour pass ``Settings(..., dry_run=True)`` explicitly.
 os.environ["TVASTR_DRY_RUN"] = "false"
+# Seal the verify-provisioning flag — a developer's .env may enable it, which
+# would make the verify sandbox pip-install over the network during tests.
+os.environ["TVASTR_VERIFY_PROVISION_DEPS"] = "false"
 # Clear any token-shaped values from ``.env`` so live-path code refuses to fire.
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["GITHUB_TOKEN"] = ""
