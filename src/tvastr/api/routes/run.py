@@ -171,6 +171,7 @@ def _start_pipeline_thread(
                 },
                 pr_ref=pr_ref,
                 pr_diff=pr_diff,
+                issue_body=issue.body or "",
             )
         except Exception as exc:
             log.exception("run.failed", run_id=run_id)

@@ -83,6 +83,7 @@ class RemediationPipeline:
         run_meta: dict | None = None,
         pr_ref: object | None = None,
         pr_diff: object | None = None,
+        issue_body: str | None = None,
     ) -> PipelineRun:
         self._emit("pipeline.start", "pipeline", **(run_meta or {}))
         if events is None:
@@ -143,6 +144,7 @@ class RemediationPipeline:
                     "sample_events": sample_events,
                     "pr_ref": pr_ref,
                     "pr_diff": pr_diff,
+                    "issue_body": issue_body,
                 }
             )
             self.threshold.mark_handled(pattern)
