@@ -73,12 +73,20 @@ def extract_from_body(body: str) -> str | None:
 _SYSTEM = (
     "You are a senior Python engineer. Produce a MINIMAL reproducer (5-20 lines) "
     "for the failure below, runnable on a clean install of the target project.\n\n"
-    "PREFER a BEHAVIORAL reproducer: set up the scenario, exercise the buggy "
-    "operation, and ASSERT the expected CORRECT result (e.g. data round-trips, "
-    "the returned value equals what was stored). End the script with exactly:\n"
+    "PREFER a BEHAVIORAL reproducer: set up REAL, valid input, exercise the FULL "
+    "operation end-to-end, and ASSERT the user-visible output reflects that input "
+    "(e.g. data round-trips: what you get back equals what you put in) or a stated "
+    "expected value. End the script with exactly:\n"
     f"    print(\"{BEHAVIOR_OK_MARKER}\")\n"
-    "so the marker prints ONLY if every assertion passed. A fix that merely "
-    "suppresses the error without restoring behavior must fail your assertion.\n\n"
+    "so the marker prints ONLY if every assertion passed.\n\n"
+    "CRITICAL - make the oracle strong:\n"
+    "- Do NOT mock or hand-construct the already-broken/degraded intermediate "
+    "state and then assert that degraded output. Drive the real operation with "
+    "valid input instead.\n"
+    "- Asserting an empty/None/degenerate result is FORBIDDEN unless empty is "
+    "genuinely the correct outcome for valid input.\n"
+    "- A fix that merely SUPPRESSES the error (returns empty/default without "
+    "restoring behavior) MUST FAIL your assertion.\n\n"
     "If you CANNOT determine the expected correct behavior from the issue and "
     "code, FALL BACK to a crash reproducer that simply re-triggers the original "
     "exception (no assertion, no marker).\n\n"
@@ -87,7 +95,7 @@ _SYSTEM = (
     "    # tvastr-kind: crash\n"
     "If actual source of the suspected files is shown, use ONLY APIs that appear "
     "in it; do not invent constructor parameters. Respond with ONLY Python source "
-    "— no prose, no markdown fences."
+    "- no prose, no markdown fences."
 )
 
 
@@ -141,6 +149,68 @@ def _parse_kind(code: str) -> ReproducerKind:
     return ReproducerKind.CRASH
 
 
+_CRITIQUE_SYSTEM = (
+    "You audit a Python reproducer used to verify a bug fix. The reproducer must "
+    "FAIL on a fix that merely SUPPRESSES the error and PASS only when the intended "
+    "behavior is restored. If a fix that just suppresses the exception (returns "
+    "empty/default/None without restoring the real result) would STILL pass its "
+    "assertions, the oracle is TOO WEAK: rewrite it to set up REAL valid input, "
+    "exercise the full operation end-to-end, and assert the output matches that "
+    "input (round-trip) or a documented expected value. Do NOT mock/hand-construct "
+    "the already-broken state and assert it. Keep the first line "
+    "`# tvastr-kind: behavioral` and end with the exact marker print. If the "
+    "reproducer is already strong, return it UNCHANGED. Respond with ONLY Python "
+    "source - no prose, no markdown fences."
+)
+
+
+def _critique_reproducer(
+    code: str,
+    pattern: FailurePattern,
+    root_cause: RootCause,
+    code_context: str,
+    router: HybridRouter,
+) -> str:
+    """One adversarial pass that strengthens a weak behavioral reproducer.
+
+    Returns the (possibly rewritten) code. On any failure, or a malformed
+    rewrite, returns ``code`` unchanged — the critique strengthens, never blocks.
+    """
+    code_section = (
+        f"Source of suspected files:\n{_truncate(code_context)}\n\n"
+        if code_context.strip()
+        else ""
+    )
+    prompt = (
+        f"Failure: {pattern.title}\n"
+        f"Root cause: {root_cause.summary}\n\n"
+        f"{code_section}"
+        f"Reproducer under audit:\n{code}\n\n"
+        "Audit it. If a suppress-only fix would still pass its assertions, rewrite "
+        "it to assert the intended behavior; otherwise return it unchanged."
+    )
+    try:
+        response, _ = router.run(
+            TaskType.REPRO_CRITIQUE,
+            prompt,
+            sensitivity=pattern.sensitivity,
+            system=_CRITIQUE_SYSTEM,
+        )
+    except Exception as exc:
+        log.warning("verify.repro.critique_failed", error=str(exc))
+        return code
+    revised = _strip_fences(response.text)
+    if not revised.strip():
+        return code
+    # A behavioral rewrite that dropped the success marker is malformed — keep the
+    # original. An explicit downgrade to `# tvastr-kind: crash` is allowed.
+    if _parse_kind(revised) == ReproducerKind.BEHAVIORAL and BEHAVIOR_OK_MARKER not in revised:
+        log.info("verify.repro.critique_discarded", reason="behavioral rewrite lost the marker")
+        return code
+    log.info("verify.repro.critiqued", changed=(revised != code))
+    return revised
+
+
 def synthesize_reproducer(
     pattern: FailurePattern,
     root_cause: RootCause,
@@ -178,6 +248,9 @@ def synthesize_reproducer(
     )
     code = _strip_fences(response.text)
     kind = _parse_kind(code)
+    if kind == ReproducerKind.BEHAVIORAL:
+        code = _critique_reproducer(code, pattern, root_cause, resolved_context, router)
+        kind = _parse_kind(code)  # re-parse: a rewrite keeps or restates the tag
     log.info(
         "verify.repro.synthesized",
         lines=code.count("\n") + 1,
