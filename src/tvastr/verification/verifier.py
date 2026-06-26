@@ -229,7 +229,7 @@ class Verifier:
             self._emit_baseline(baseline, repro)
             baseline_reproduced = self._reproduced(baseline, repro)
 
-            if not baseline_reproduced and self.source_overlay and pr_number:
+            if not baseline_reproduced and self.source_overlay and pr_number and pr_files:
                 # Released wheel already carries the fix (no_repro). Reconstruct
                 # the pre-fix state of the PR's changed files and re-baseline.
                 try:

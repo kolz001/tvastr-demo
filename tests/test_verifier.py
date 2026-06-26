@@ -525,6 +525,11 @@ def test_overlay_on_no_repro_reproduces_then_verifies() -> None:
     )
     types = [e.type for e in sink.events]
     assert "verify.overlay" in types
+    # the post-overlay baseline re-emits verify.baseline with retry=True
+    retry_baselines = [
+        e for e in sink.events if e.type == "verify.baseline" and e.payload.get("retry")
+    ]
+    assert len(retry_baselines) == 1, "expected exactly one verify.baseline with retry=True"
     # apply_changes called twice: buggy overlay, then the agent fix
     assert sandbox.last_handle is not None
     assert len(sandbox.last_handle.applied) >= 2
