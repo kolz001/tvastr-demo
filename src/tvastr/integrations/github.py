@@ -147,16 +147,18 @@ class GitHubClient:
             return None
 
     def buggy_parent_sha(self, pr_number: int) -> str | None:
+        # Merged-to-main only: the buggy base is the merge commit's first parent
+        # (mainline immediately before the fix). An unmerged PR has no merge
+        # commit and no valid buggy base — base.sha would be the CURRENT main tip
+        # (already fixed), so we return None rather than fall back to it.
         try:
             repo = self._get_repo()
             pr = repo.get_pull(pr_number)
             merge_sha = pr.merge_commit_sha
-            if merge_sha:
-                commit = repo.get_commit(merge_sha)
-                if commit.parents:
-                    return str(commit.parents[0].sha)
-            base_sha = getattr(getattr(pr, "base", None), "sha", None)
-            return str(base_sha) if base_sha else None
+            if not merge_sha:
+                return None
+            commit = repo.get_commit(merge_sha)
+            return str(commit.parents[0].sha) if commit.parents else None
         except Exception as exc:
             log.warning("github.buggy_parent_sha.failed", pr=pr_number, error=str(exc))
             return None
