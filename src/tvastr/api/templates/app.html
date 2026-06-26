@@ -223,7 +223,7 @@ let currentRunId = null;
 let runHasFix = false;
 const STAGES = ["ingest","cluster","threshold","investigate","ground_root_cause","confidence_gate","generate_fix","compare_to_pr","draft_pr","open_pr","notify","audit"];
 const VERIFY_TYPES = new Set([
-  "verify.start","verify.provision","verify.repro_synth","verify.baseline",
+  "verify.start","verify.provision","verify.repro_synth","verify.baseline","verify.overlay",
   "verify.patch_applied","verify.rerun","verify.regression","verify.result"
 ]);
 const VERDICT_BADGE = {
@@ -523,6 +523,7 @@ function summarize(event) {
     case "verify.provision": return `provisioned ${(p.installed||[]).length}/${(p.requested||[]).length} dep(s)${p.ok?"":" · FAILED"}${(p.requested||[]).length?` · ${(p.requested||[]).join(", ")}`:""}`;
     case "verify.repro_synth": return `reproducer from ${p.source}${p.expected_exception?` · expecting ${p.expected_exception}`:""}`;
     case "verify.baseline": return `baseline exit=${p.exit_code} · original_exception_seen=${p.original_exception_seen}`;
+    case "verify.overlay": return `buggy overlay @ ${(p.sha||"").slice(0,8)} · ${(p.files||[]).length} file(s)${p.ok?"":" · FAILED"}`;
     case "verify.patch_applied": return `${(p.files||[]).length} file(s) patched`;
     case "verify.rerun":    return `rerun exit=${p.exit_code} · original_exception_seen=${p.original_exception_seen}`;
     case "verify.regression": return `${p.passed||0} passed · ${p.failed||0} failed · ${p.errors||0} errors · ${(p.scope||[]).length} scoped`;
