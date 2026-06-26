@@ -134,14 +134,17 @@ class GitHubClient:
         return contents.decoded_content.decode("utf-8")
 
     def get_file_at_ref(self, path: str, ref: str) -> str | None:
+        # Whole body inside try: decoded_content can raise (binary files →
+        # UnicodeDecodeError; >1MB files → encoding "none" → None.decode()).
+        # Constraint: never raise.
         try:
             contents = self._get_repo().get_contents(path, ref=ref)
+            if isinstance(contents, list):  # a directory, not a file
+                return None
+            return contents.decoded_content.decode("utf-8")
         except Exception as exc:
             log.warning("github.get_file_at_ref.failed", path=path, ref=ref, error=str(exc))
             return None
-        if isinstance(contents, list):  # a directory, not a file
-            return None
-        return contents.decoded_content.decode("utf-8")
 
     def buggy_parent_sha(self, pr_number: int) -> str | None:
         try:
