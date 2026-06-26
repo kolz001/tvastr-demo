@@ -778,3 +778,30 @@ def test_better_error_register_greens_via_better_error(monkeypatch: object) -> N
     )
     assert out.verdict == Verdict.VERIFIED_VIA_BETTER_ERROR
     assert out.oracle == "better_error"
+
+
+def test_fail_fast_register_greens_via_behavior(monkeypatch: object) -> None:
+    """FAIL_FAST is not in _REGISTER_GREEN → falls back to the behavioral verdict
+    (guards the zero-regression contract for the non-WARN/BETTER_ERROR registers)."""
+    import tvastr.verification.verifier as vmod
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        vmod,
+        "synthesize_reproducer",
+        lambda *a, **k: vmod.Reproducer(
+            source=ReproducerSource.CLAUDE,
+            code="x",
+            kind=ReproducerKind.BEHAVIORAL,
+        ),
+    )
+    sandbox = _FakeSandbox(
+        [
+            RunResult(exit_code=1, stdout="", stderr=""),  # baseline: marker absent → reproduces
+            RunResult(exit_code=0, stdout=f"{BEHAVIOR_OK_MARKER}\n", stderr=""),  # rerun: fixed
+        ]
+    )
+    out = Verifier(_ctx(), sandbox).verify(
+        _pattern(), _root_cause(), _fix_reg(FixRegister.FAIL_FAST), [_event()], issue_body=None
+    )
+    assert out.verdict == Verdict.VERIFIED_VIA_BEHAVIOR
+    assert out.oracle == "behavior"
