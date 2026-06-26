@@ -162,3 +162,17 @@ def test_investigate_runs_on_act_path_in_graph():
     steps = [e.step for e in sink.events if e.type == "agent.node.start"]
     assert "investigate" in steps
     assert "reason_root_cause" not in steps and "expand_context" not in steps
+
+
+def test_investigate_survives_tool_error():
+    class _BoomSearchHost(_FakeHost):
+        def search_code(self, query, *, limit=5):
+            raise RuntimeError("network down")
+
+    router = _SeqRouter([
+        '{"thought":"x","actions":[{"search":"q"}]}',
+        '{"root_cause":"rc","suspected_files":["a.py"],"confidence":0.8,"done":true}',
+    ])
+    agent = _agent(_BoomSearchHost(), router)
+    out = agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
+    assert out["root_cause"].summary == "rc"  # tool error swallowed; loop continued to finish

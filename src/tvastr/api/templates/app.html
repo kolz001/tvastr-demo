@@ -221,7 +221,7 @@ let selectedIssue = null;
 let activeEventSource = null;
 let currentRunId = null;
 let runHasFix = false;
-const STAGES = ["ingest","cluster","threshold","investigate","reason_root_cause","confidence_gate","generate_fix","compare_to_pr","draft_pr","open_pr","notify","audit"];
+const STAGES = ["ingest","cluster","threshold","investigate","ground_root_cause","confidence_gate","generate_fix","compare_to_pr","draft_pr","open_pr","notify","audit"];
 const VERIFY_TYPES = new Set([
   "verify.start","verify.repro_synth","verify.baseline",
   "verify.patch_applied","verify.rerun","verify.regression","verify.result"

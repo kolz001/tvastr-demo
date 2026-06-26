@@ -192,25 +192,29 @@ class RemediationAgent:
             for act in actions:
                 if not isinstance(act, dict):
                     continue
-                if "search" in act:
-                    q = str(act["search"])
-                    hits = search_codebase(self.ctx, q)
-                    self._emit("tool.call", "search_codebase", query=q, paths=hits)
-                    transcript.append(f"search {q!r} -> {hits}")
-                elif "read_file" in act:
-                    p = str(act["read_file"])
-                    if p in seen or len(code_files) >= _MAX_CONTEXT_FILES:
-                        continue
-                    fetched = retrieve_code_files(self.ctx, [p], max_files=1)
-                    code_files.update(fetched)
-                    seen.add(p)
-                    self._emit("tool.call", "retrieve_code_files", requested=1,
-                               retrieved=len(fetched), paths=list(fetched.keys()))
-                elif "list_dir" in act:
-                    d = str(act["list_dir"])
-                    entries = list_dir(self.ctx, d)
-                    self._emit("tool.call", "list_dir", path=d, entries=entries)
-                    transcript.append(f"list_dir {d!r} -> {entries}")
+                try:
+                    if "search" in act:
+                        q = str(act["search"])
+                        hits = search_codebase(self.ctx, q)
+                        self._emit("tool.call", "search_codebase", query=q, paths=hits)
+                        transcript.append(f"search {q!r} -> {hits}")
+                    elif "read_file" in act:
+                        p = str(act["read_file"])
+                        if p in seen or len(code_files) >= _MAX_CONTEXT_FILES:
+                            continue
+                        fetched = retrieve_code_files(self.ctx, [p], max_files=1)
+                        code_files.update(fetched)
+                        seen.add(p)
+                        self._emit("tool.call", "retrieve_code_files", requested=1,
+                                   retrieved=len(fetched), paths=list(fetched.keys()))
+                    elif "list_dir" in act:
+                        d = str(act["list_dir"])
+                        entries = list_dir(self.ctx, d)
+                        self._emit("tool.call", "list_dir", path=d, entries=entries)
+                        transcript.append(f"list_dir {d!r} -> {entries}")
+                except Exception as exc:  # a tool failure must not abort the run
+                    log.warning("agent.investigate.action_failed", action=act, error=str(exc))
+                    continue
 
         if root_cause is None:
             root_cause = RootCause(
