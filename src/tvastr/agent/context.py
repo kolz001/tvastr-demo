@@ -64,3 +64,4 @@ class AgentContext:
     event_sink: EventSink = field(default_factory=NullEventSink)
     run_id: str | None = None
     doc_grounding: bool = False
+    issue_era_retrieval: bool = False

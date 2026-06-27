@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # diagnosis check before generating a fix. Off by default; no-op in mock mode.
     doc_grounding: bool = False
 
+    # When true, the agent reads repository code as of the issue's creation date
+    # (so moved/deleted paths resolve and still contain the bug) by wrapping the
+    # code host with IssueEraCodeHost. Off in tests.
+    issue_era_retrieval: bool = True
+
     # --- Triage UI ---
     # When true, the triage UI auto-analyzes the top 5 discovered PRs on load
     # (one cloud LLM call each). Off by default so loading the issue list never

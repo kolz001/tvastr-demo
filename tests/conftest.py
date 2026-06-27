@@ -17,6 +17,7 @@ os.environ["TVASTR_PII_LOCAL_MODEL"] = "false"
 # Seal the doc-grounding flag too — a developer's .env may enable it, which would
 # make grounding (a live web-search call) fire and flip default-state tests.
 os.environ["TVASTR_DOC_GROUNDING"] = "false"
+os.environ["TVASTR_ISSUE_ERA_RETRIEVAL"] = "false"
 # Pin dry_run=false so tests start from the autonomous-mode baseline. Tests
 # that need dry-run behaviour pass ``Settings(..., dry_run=True)`` explicitly.
 os.environ["TVASTR_DRY_RUN"] = "false"
