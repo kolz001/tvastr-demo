@@ -26,3 +26,25 @@ def extract_json(text: str) -> dict | None:
         except json.JSONDecodeError:
             idx = text.find("{", idx + 1)
     return None
+
+
+def extract_all_json(text: str) -> list[dict]:
+    """Return every balanced top-level JSON object in ``text``, in order.
+
+    LLMs sometimes emit several objects in one response (e.g. a thought object
+    followed by a separate finish object). ``extract_json`` returns only the
+    first; this collects them all so callers can merge.
+    """
+    decoder = json.JSONDecoder()
+    out: list[dict] = []
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+        idx = text.find("{", idx + end)  # advance past the object just decoded
+    return out

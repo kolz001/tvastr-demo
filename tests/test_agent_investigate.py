@@ -26,6 +26,20 @@ def test_parse_investigation_actions_and_finish():
     assert _parse_investigation("not json") == {}
 
 
+def test_parse_investigation_merges_multiple_objects():
+    # The model sometimes emits a thought-with-empty-actions object THEN a
+    # separate finish object holding the root_cause (real #17105 shape). Both
+    # must survive the parse.
+    text = (
+        '{"thought":"analysis","actions":[]}\n'
+        '{"root_cause":"rc here","suspected_files":["base.py"],"confidence":0.8,"done":true}'
+    )
+    merged = _parse_investigation(text)
+    assert merged["root_cause"] == "rc here"
+    assert merged["thought"] == "analysis"
+    assert merged["confidence"] == 0.8
+
+
 class _FakeHost:
     def __init__(self, search_map=None, files=None, dirs=None):
         self.search_map = search_map or {}
@@ -111,6 +125,34 @@ def test_investigate_converges_with_actions_then_finish():
     assert "weaviate/base.py" in out["code_files"]
     assert "weaviate/utils.py" in out["code_files"]
     assert out["root_cause"].suspected_files == ["weaviate/base.py"]
+
+
+def test_investigate_captures_root_cause_in_second_object():
+    """Regression for #17105: the model emitted a thought-with-empty-actions
+    object followed by a finish object with the root_cause. The agent must
+    capture it, not fall back to confidence 0.0."""
+    host = _FakeHost(files={"base.py": "response.items()"})
+    router = _SeqRouter([
+        '{"thought":"ollama 0.4.x returns pydantic","actions":[]}\n'
+        '{"root_cause":"base.py assumes dict responses; .items() on a pydantic '
+        'GenerateResponse breaks","suspected_files":["base.py"],'
+        '"confidence":0.8,"done":true}'
+    ])
+    agent = _agent(host, router)
+    out = agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
+    assert out["root_cause"].confidence == 0.8
+    assert "assumes dict" in out["root_cause"].summary
+
+
+def test_investigate_converges_on_root_cause_without_done():
+    """A response carrying a root_cause (no explicit done, no actions) means the
+    model converged — accept it rather than treating empty actions as give-up."""
+    host = _FakeHost()
+    router = _SeqRouter(['{"root_cause":"the real cause","confidence":0.7}'])
+    agent = _agent(host, router)
+    out = agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
+    assert out["root_cause"].confidence == 0.7
+    assert out["root_cause"].summary == "the real cause"
 
 
 def test_investigate_hard_cap_returns_low_confidence():
