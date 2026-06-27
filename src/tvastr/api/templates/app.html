@@ -511,6 +511,7 @@ function summarize(event) {
     case "agent.start":     return `${p.title || ""}`;
     case "agent.node.start":return event.step;
     case "agent.node.end":  return event.step;
+    case "retrieval.issue_era": return `issue-era reads @ ${(p.sha||"").slice(0,8)}${p.ok?"":" · unavailable (current main)"}`;
     case "tool.call":       return `${event.step}(${describe(p)})`;
     case "router.decide":   return `${p.task} → ${p.target} · ${p.reason}`;
     case "llm.call":        return `${p.task} · ${p.target} · ${p.model}${p.elapsed_ms!=null?` · ${p.elapsed_ms}ms`:""}${p.mocked?" · mock":""}`;
