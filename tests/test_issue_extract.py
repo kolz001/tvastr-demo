@@ -12,6 +12,15 @@ def test_extracts_integration_path():
     ]
 
 
+def test_extracts_multiword_provider_name():
+    # Both category and provider name are hyphenated in the dist dir.
+    body = 'File "/x/llama_index/llms/azure_openai/base.py", line 7, in chat\n'
+    assert extract_issue_files(body) == [
+        "llama-index-integrations/llms/llama-index-llms-azure-openai/"
+        "llama_index/llms/azure_openai/base.py"
+    ]
+
+
 def test_extracts_core_path():
     body = 'File "/x/llama_index/core/program/mm.py", line 5, in run\n'
     assert extract_issue_files(body) == [

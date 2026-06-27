@@ -25,7 +25,9 @@ def _to_repo_path(traceback_path: str) -> str | None:
     if parts[1] == "core":
         return f"llama-index-core/{rel}"
     cat, name = parts[1], parts[2]
-    dist = f"llama-index-{cat.replace('_', '-')}-{name}"
+    # Both the category AND the provider name are hyphenated in the dist dir
+    # (e.g. llama_index/llms/azure_openai → llama-index-llms-azure-openai).
+    dist = f"llama-index-{cat.replace('_', '-')}-{name.replace('_', '-')}"
     return f"llama-index-integrations/{cat}/{dist}/{rel}"
 
 

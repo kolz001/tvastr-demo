@@ -161,6 +161,8 @@ class GitHubClient:
         try:
             from datetime import datetime
 
+            # A naive timestamp → naive datetime; GitHub treats `until` as UTC,
+            # which matches our issue timestamps. tz-aware inputs are honored too.
             until = datetime.fromisoformat(iso_date)
             commits = self._get_repo().get_commits(until=until)
             return str(commits[0].sha)
