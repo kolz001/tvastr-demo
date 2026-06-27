@@ -12,7 +12,7 @@ import ast
 import re
 from collections.abc import Callable
 
-from tvastr.domain import FailurePattern, LogEvent, RootCause
+from tvastr.domain import FailurePattern, FixRegister, LogEvent, RootCause
 from tvastr.llm.router import HybridRouter, TaskType
 from tvastr.logging import get_logger
 from tvastr.verification.models import (
@@ -36,6 +36,27 @@ _KIND_TAG_RE = re.compile(r"#\s*tvastr-kind:\s*(\w+)")
 # When extracting, prefer blocks that look like a runnable repro (imports +
 # something that exercises them) rather than a traceback transcript.
 _TRACEBACK_HINT = "Traceback (most recent call last)"
+
+_REGISTER_GUIDANCE: dict[FixRegister, str] = {
+    FixRegister.WARN: (
+        "\n\nFIX REGISTER = WARN: the fix does NOT change behavior; it emits a "
+        "warning on the failing input. Write a BEHAVIORAL reproducer that triggers "
+        "the failing input INSIDE:\n"
+        "    import warnings\n"
+        "    with warnings.catch_warnings(record=True) as _w:\n"
+        "        warnings.simplefilter('always')\n"
+        "        <trigger the failing input>\n"
+        "then assert at least one captured warning's message references the failing "
+        "symbol/field, and end with the marker. The bug = NO such warning at baseline."
+    ),
+    FixRegister.BETTER_ERROR: (
+        "\n\nFIX REGISTER = BETTER_ERROR: the fix replaces a cryptic failure with a "
+        "clearer error. Write a BEHAVIORAL reproducer that triggers the failing input "
+        "inside try/except, asserts the raised error's type or message references the "
+        "failing symbol/field (the clearer error), and ends with the marker. Use stdlib "
+        "only — no pytest."
+    ),
+}
 
 
 def _looks_runnable(code: str) -> bool:
@@ -111,6 +132,7 @@ def _build_prompt(
     root_cause: RootCause,
     sample_events: list[LogEvent],
     code_context: str = "",
+    register: FixRegister = FixRegister.REPAIR,
 ) -> str:
     sample = sample_events[0] if sample_events else None
     trace = sample.stack_trace if sample and sample.stack_trace else "(no traceback available)"
@@ -119,7 +141,7 @@ def _build_prompt(
         if code_context.strip()
         else ""
     )
-    return (
+    base = (
         f"Failure title: {pattern.title}\n"
         f"Exception type: {pattern.exception_type or '(unknown)'}\n"
         f"Representative message: {pattern.representative_message}\n"
@@ -131,6 +153,7 @@ def _build_prompt(
         f"If behavioral, end with print(\"{BEHAVIOR_OK_MARKER}\").\n"
         "Write the reproducer."
     )
+    return base + _REGISTER_GUIDANCE.get(register, "")
 
 
 def _strip_fences(text: str) -> str:
@@ -218,6 +241,7 @@ def synthesize_reproducer(
     issue_body: str | None,
     router: HybridRouter,
     code_context: str | Callable[[], str] = "",
+    register: FixRegister = FixRegister.REPAIR,
 ) -> Reproducer:
     """Best-effort: body → Claude. Returns the lower-cost option that works.
 
@@ -238,7 +262,8 @@ def synthesize_reproducer(
 
     resolved_context = code_context() if callable(code_context) else code_context
     prompt = _build_prompt(
-        pattern, root_cause, sample_events, code_context=_truncate(resolved_context)
+        pattern, root_cause, sample_events, code_context=_truncate(resolved_context),
+        register=register,
     )
     response, _ = router.run(
         TaskType.FIX_GENERATION,
@@ -248,7 +273,13 @@ def synthesize_reproducer(
     )
     code = _strip_fences(response.text)
     kind = _parse_kind(code)
-    if kind == ReproducerKind.BEHAVIORAL:
+    # The critique hardens BEHAVIORAL round-trip oracles; WARN/BETTER_ERROR
+    # assertions are intentionally non-behavioral (a warning/clear error, NOT a
+    # restored result), so the round-trip-biased critique must not rewrite them.
+    if kind == ReproducerKind.BEHAVIORAL and register not in (
+        FixRegister.WARN,
+        FixRegister.BETTER_ERROR,
+    ):
         code = _critique_reproducer(code, pattern, root_cause, resolved_context, router)
         kind = _parse_kind(code)  # re-parse: a rewrite keeps or restates the tag
     log.info(

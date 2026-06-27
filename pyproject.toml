@@ -73,3 +73,6 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-q"
+filterwarnings = [
+    'ignore:Field name "register".*shadows an attribute in parent "BaseModel":UserWarning',
+]

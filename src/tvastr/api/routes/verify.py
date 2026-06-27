@@ -21,7 +21,15 @@ from pydantic import BaseModel, Field
 
 from tvastr.agent.context import AgentContext
 from tvastr.config import get_settings
-from tvastr.domain import FailurePattern, FileChange, FixProposal, LogEvent, RootCause, Sensitivity
+from tvastr.domain import (
+    FailurePattern,
+    FileChange,
+    FixProposal,
+    FixRegister,
+    LogEvent,
+    RootCause,
+    Sensitivity,
+)
 from tvastr.events import (
     EventSink,
     FanoutEventSink,
@@ -142,11 +150,16 @@ def _reconstruct_from_run(run_id: str) -> _Reconstructed | None:
             if not file_changes:
                 for path in p.get("files") or []:
                     file_changes.append(FileChange(path=path, patched_content="", rationale=""))
+            try:
+                register = FixRegister(p.get("register", "repair"))
+            except ValueError:
+                register = FixRegister.REPAIR
             fix = FixProposal(
                 pattern_id=pattern.id if pattern else "",
                 summary=str(p.get("summary", "")),
                 changes=file_changes,
                 test_plan=str(p.get("test_plan", "")),
+                register=register,
             )
             if root_cause is None:
                 root_cause = RootCause(

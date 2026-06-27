@@ -43,6 +43,20 @@ class Sensitivity(StrEnum):
     SENSITIVE = "sensitive"
 
 
+class FixRegister(StrEnum):
+    """The *response register* of a fix — how it addresses the failure.
+
+    REPAIR/FAIL_FAST change behavior; WARN/BETTER_ERROR surface it; DOCUMENT only
+    informs humans. Verify judges each register by its own success definition.
+    """
+
+    REPAIR = "repair"
+    FAIL_FAST = "fail_fast"
+    WARN = "warn"
+    BETTER_ERROR = "better_error"
+    DOCUMENT = "document"
+
+
 class LogEvent(BaseModel):
     """A single log record ingested from a source."""
 
@@ -112,6 +126,7 @@ class FixProposal(BaseModel):
     summary: str
     changes: list[FileChange] = Field(default_factory=list)
     test_plan: str = ""
+    register: FixRegister = FixRegister.REPAIR
 
 
 class PullRequestDraft(BaseModel):

@@ -13,8 +13,11 @@ class Verdict(StrEnum):
     VERIFIED_VIA_REPRODUCER = "verified_via_reproducer"
     VERIFIED_VIA_SCOPED_TESTS = "verified_via_scoped_tests"
     VERIFIED_VIA_BEHAVIOR = "verified_via_behavior"
+    VERIFIED_VIA_WARNING = "verified_via_warning"
+    VERIFIED_VIA_BETTER_ERROR = "verified_via_better_error"
     MASKS_SYMPTOM = "masks_symptom"
     UNVERIFIED_SMOKE_IMPORT_ONLY = "unverified_smoke_import_only"
+    UNVERIFIED_DOC_ONLY = "unverified_doc_only"
     REPRO_BROKEN = "repro_broken"
     NO_REPRO = "no_repro"
     STILL_BROKEN = "still_broken"
@@ -80,4 +83,6 @@ class VerificationResult:
             Verdict.VERIFIED_VIA_REPRODUCER,
             Verdict.VERIFIED_VIA_SCOPED_TESTS,
             Verdict.VERIFIED_VIA_BEHAVIOR,
+            Verdict.VERIFIED_VIA_WARNING,
+            Verdict.VERIFIED_VIA_BETTER_ERROR,
         }

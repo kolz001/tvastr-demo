@@ -230,8 +230,11 @@ const VERDICT_BADGE = {
   verified_via_reproducer:   { kind:"green",  label:"verified · reproducer" },
   verified_via_scoped_tests: { kind:"green",  label:"verified · scoped tests" },
   verified_via_behavior:     { kind:"green",  label:"verified · behavior" },
+  verified_via_warning:      { kind:"green",  label:"verified · warning" },
+  verified_via_better_error: { kind:"green",  label:"verified · better error" },
   masks_symptom:             { kind:"red",    label:"masks symptom" },
   unverified_smoke_import_only: { kind:"yellow", label:"unverified · smoke import only" },
+  unverified_doc_only:       { kind:"yellow", label:"unverified · doc only" },
   repro_broken:           { kind:"yellow", label:"repro broken · retry" },
   no_repro:               { kind:"yellow", label:"no repro" },
   still_broken:           { kind:"red",    label:"still broken" },
@@ -679,7 +682,11 @@ async function streamVerify(runId, attempt) {
   // "Green" verdicts (reproducer / scoped tests) keep the button locked — the
   // fix is verified. Everything else re-arms the CTA so the user can retry
   // with a fresh reproducer + fresh sandbox.
-  const green = lastVerdict === "verified_via_reproducer" || lastVerdict === "verified_via_scoped_tests";
+  const green = lastVerdict === "verified_via_reproducer"
+    || lastVerdict === "verified_via_scoped_tests"
+    || lastVerdict === "verified_via_behavior"
+    || lastVerdict === "verified_via_warning"
+    || lastVerdict === "verified_via_better_error";
   if (green) {
     const cta = document.querySelector(`.verify-cta[data-run="${runId}"]`);
     if (cta) {

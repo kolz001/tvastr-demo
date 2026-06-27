@@ -2,6 +2,7 @@
 a persisted benchmark.compared event.
 
 Task 3 of the verify-source-overlay plan.
+Task 5 of the register-aware-verify plan: persist + reconstruct register.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from tvastr.api.routes.verify import _reconstruct_from_run
+from tvastr.domain import FixRegister
 from tvastr.events import JsonlEventSink, PipelineEvent, run_path
 
 
@@ -114,3 +116,49 @@ def test_reconstruct_handles_bad_pr_number(
     *_, pr_number, pr_files = out
     assert pr_number is None
     assert pr_files == ["a/llama_index/x/base.py"]
+
+
+def test_reconstruct_reads_register(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fix.generated payload with register:"warn" → fix.register == FixRegister.WARN."""
+    monkeypatch.setattr("tvastr.events.default_runs_dir", lambda: tmp_path)
+
+    rid = "recon-register"
+    sink = JsonlEventSink(run_path(rid, runs_dir=tmp_path))
+    _emit(sink, "pipeline.start", {"repo": "run-llama/llama_index", "issue_title": "t"})
+    _emit(sink, "agent.start", {"fingerprint": rid, "title": "t"})
+    _emit(
+        sink,
+        "fix.generated",
+        {
+            "patched_files": {"a/llama_index/x/base.py": "# f"},
+            "summary": "s",
+            "register": "warn",
+        },
+    )
+    out = _reconstruct_from_run(rid)
+    assert out is not None
+    _pattern, _root_cause, fix, *_ = out
+    assert fix.register == FixRegister.WARN
+
+
+def test_reconstruct_register_defaults_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fix.generated payload without register → fix.register defaults to FixRegister.REPAIR."""
+    monkeypatch.setattr("tvastr.events.default_runs_dir", lambda: tmp_path)
+
+    rid = "recon-register-default"
+    sink = JsonlEventSink(run_path(rid, runs_dir=tmp_path))
+    _emit(sink, "pipeline.start", {"repo": "r", "issue_title": "t"})
+    _emit(sink, "agent.start", {"fingerprint": rid, "title": "t"})
+    _emit(
+        sink,
+        "fix.generated",
+        {"patched_files": {"a/llama_index/x/base.py": "# f"}, "summary": "s"},
+    )
+    out = _reconstruct_from_run(rid)
+    assert out is not None
+    _, _, fix, *_ = out
+    assert fix.register == FixRegister.REPAIR
