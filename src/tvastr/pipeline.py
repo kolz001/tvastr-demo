@@ -76,6 +76,29 @@ class RemediationPipeline:
             )
         )
 
+    def _issue_era_host(self, base_host: object, sample_events: list) -> object:
+        """Return an IssueEraCodeHost if the flag is on and a sha resolves; else base_host."""
+        if not getattr(self.agent.ctx, "issue_era_retrieval", False) or not sample_events:
+            return base_host
+        try:
+            iso = sample_events[0].timestamp.isoformat()
+            sha = base_host.commit_before(iso)  # type: ignore[attr-defined]
+        except Exception as exc:
+            log.warning("retrieval.issue_era.resolve_failed", error=str(exc))
+            sha = None
+        self._emit(
+            "retrieval.issue_era",
+            "agent",
+            layer="agent",
+            sha=sha,
+            ok=bool(sha),
+        )
+        if not sha:
+            return base_host
+        from tvastr.integrations.issue_era_host import IssueEraCodeHost
+
+        return IssueEraCodeHost(base_host, sha)
+
     def run(
         self,
         events: list[LogEvent] | None = None,
@@ -126,11 +149,14 @@ class RemediationPipeline:
             selected=[p.title for p in selected],
         )
 
+        base_code_host = self.agent.ctx.code_host
         outcomes: list[PatternOutcome] = []
         for pattern in selected:
             sample_events = [
                 events_by_id[eid] for eid in pattern.sample_event_ids if eid in events_by_id
             ]
+            # Issue-era retrieval: serve the agent's reads as of the issue date.
+            self.agent.ctx.code_host = self._issue_era_host(base_code_host, sample_events)
             self._emit(
                 "agent.start",
                 "agent",
@@ -192,6 +218,10 @@ class RemediationPipeline:
                 )
             )
 
+        # Restore the unwrapped host so a second run() on this pipeline re-wraps
+        # from the real base, never IssueEraCodeHost(IssueEraCodeHost(...)).
+        self.agent.ctx.code_host = base_code_host
+
         run = PipelineRun(
             events_ingested=len(events),
             patterns_detected=len(patterns),
@@ -237,6 +267,7 @@ def build_pipeline(
         doc_grounding=settings.doc_grounding
         and not settings.use_mocks
         and bool(settings.anthropic_api_key),
+        issue_era_retrieval=settings.issue_era_retrieval,
     )
     return RemediationPipeline(
         detector=FailureDetector(),

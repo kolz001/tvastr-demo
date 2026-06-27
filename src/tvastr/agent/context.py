@@ -31,6 +31,14 @@ class CodeHost(Protocol):
         """Return a file's contents at a specific commit/ref, or None."""
         ...
 
+    def commit_before(self, iso_date: str) -> str | None:
+        """Return the repo's HEAD commit sha as of a date (ISO 8601), or None."""
+        ...
+
+    def list_dir_at_ref(self, path: str, ref: str) -> list[str]:
+        """List a directory's entries at a specific commit/ref."""
+        ...
+
     def buggy_parent_sha(self, pr_number: int) -> str | None:
         """Return the commit just before a PR's fix merged (bug present), or None."""
         ...
@@ -56,3 +64,4 @@ class AgentContext:
     event_sink: EventSink = field(default_factory=NullEventSink)
     run_id: str | None = None
     doc_grounding: bool = False
+    issue_era_retrieval: bool = False

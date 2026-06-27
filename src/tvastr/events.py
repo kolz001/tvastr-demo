@@ -55,6 +55,7 @@ EventType = Literal[
     "benchmark.skipped",
     "doc.grounded",
     "doc.skipped",
+    "retrieval.issue_era",
     "error",
 ]
 

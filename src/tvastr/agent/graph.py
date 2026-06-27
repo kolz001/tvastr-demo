@@ -25,6 +25,7 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from tvastr.agent.context import AgentContext
+from tvastr.agent.retrieval import extract_issue_files
 from tvastr.agent.state import AgentState
 from tvastr.agent.tools import (
     extract_stack_files,
@@ -146,10 +147,13 @@ class RemediationAgent:
         transcript: list[str] = []
         decisions: list[RoutingDecision] = []
 
-        # Free seed: stack-trace files when a traceback is present.
+        # Free seed: stack-trace files + files named in the issue's own traceback.
         suspected = extract_stack_files(events)
+        for f in extract_issue_files(state.get("issue_body") or ""):
+            if f not in suspected:
+                suspected.append(f)
         if suspected:
-            self._emit("tool.call", "extract_stack_files", source="stack_trace", paths=suspected)
+            self._emit("tool.call", "extract_stack_files", source="free_seed", paths=suspected)
             fetched = retrieve_code_files(self.ctx, suspected)
             code_files.update(fetched)
             seen.update(suspected)
