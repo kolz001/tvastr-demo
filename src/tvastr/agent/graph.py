@@ -37,7 +37,7 @@ from tvastr.agent.tools import (
     search_codebase,
     send_notification,
 )
-from tvastr.analysis._jsonutil import extract_json
+from tvastr.analysis._jsonutil import extract_all_json
 from tvastr.analysis.fix_comparison import compare_fix_to_pr
 from tvastr.domain import PullRequestDraft, RootCause, RoutingDecision
 from tvastr.events import PipelineEvent
@@ -87,9 +87,16 @@ def _clamp_confidence(value: object) -> float:
 
 
 def _parse_investigation(text: str) -> dict:
-    """The investigator's JSON turn, or {} if unparseable."""
-    parsed = extract_json(text)
-    return parsed if isinstance(parsed, dict) else {}
+    """The investigator's JSON turn, or {} if unparseable.
+
+    Merges every JSON object in the response (later keys win): the model
+    sometimes emits a thought-with-empty-actions object followed by a separate
+    finish object carrying the ``root_cause`` — both must survive.
+    """
+    merged: dict = {}
+    for obj in extract_all_json(text):
+        merged.update(obj)
+    return merged
 
 
 class RemediationAgent:
@@ -177,7 +184,10 @@ class RemediationAgent:
             decisions.append(decision)
             parsed = _parse_investigation(response.text)
 
-            if parsed.get("done") and parsed.get("root_cause"):
+            # A response carrying a root_cause means the model converged —
+            # accept it even without an explicit done:true (and even if it also
+            # carried empty actions), rather than discarding the answer.
+            if parsed.get("root_cause"):
                 root_cause = RootCause(
                     pattern_id=pattern.id,
                     summary=str(parsed["root_cause"]),
