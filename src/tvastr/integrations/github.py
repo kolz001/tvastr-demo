@@ -21,6 +21,8 @@ class _CodeHostLike(Protocol):
     def search_code(self, query: str, *, limit: int = 5) -> list[str]: ...
     def get_file(self, path: str) -> str: ...
     def get_file_at_ref(self, path: str, ref: str) -> str | None: ...
+    def commit_before(self, iso_date: str) -> str | None: ...
+    def list_dir_at_ref(self, path: str, ref: str) -> list[str]: ...
     def buggy_parent_sha(self, pr_number: int) -> str | None: ...
     def list_dir(self, path: str) -> list[str]: ...
     def open_pull_request(self, draft: PullRequestDraft) -> PullRequestResult: ...
@@ -56,6 +58,15 @@ class MockGitHubClient:
             "def run(self, *args, **kwargs):\n"
             "    ...  # implementation elided in mock mode\n"
         )
+
+    def commit_before(self, iso_date: str) -> str | None:
+        log.info("github.commit_before", repo=self.repo, date=iso_date, mocked=True)
+        return f"era{iso_date[:10].replace('-', '')}"
+
+    def list_dir_at_ref(self, path: str, ref: str) -> list[str]:
+        log.info("github.list_dir_at_ref", repo=self.repo, path=path, ref=ref, mocked=True)
+        base = path.rstrip("/")
+        return [f"{base}/base.py", f"{base}/utils.py"]
 
     def buggy_parent_sha(self, pr_number: int) -> str | None:
         log.info("github.buggy_parent_sha", repo=self.repo, pr=pr_number, mocked=True)
@@ -146,6 +157,26 @@ class GitHubClient:
             log.warning("github.get_file_at_ref.failed", path=path, ref=ref, error=str(exc))
             return None
 
+    def commit_before(self, iso_date: str) -> str | None:
+        try:
+            from datetime import datetime
+
+            until = datetime.fromisoformat(iso_date)
+            commits = self._get_repo().get_commits(until=until)
+            return str(commits[0].sha)
+        except Exception as exc:
+            log.warning("github.commit_before.failed", date=iso_date, error=str(exc))
+            return None
+
+    def list_dir_at_ref(self, path: str, ref: str) -> list[str]:
+        try:
+            contents = self._get_repo().get_contents(path, ref=ref)
+        except Exception as exc:
+            log.warning("github.list_dir_at_ref.failed", path=path, ref=ref, error=str(exc))
+            return []
+        items = contents if isinstance(contents, list) else [contents]
+        return [c.path for c in items]
+
     def buggy_parent_sha(self, pr_number: int) -> str | None:
         # Merged-to-main only: the buggy base is the merge commit's first parent
         # (mainline immediately before the fix). An unmerged PR has no merge
@@ -230,6 +261,12 @@ class DryRunCodeHost:
 
     def get_file_at_ref(self, path: str, ref: str) -> str | None:
         return self.inner.get_file_at_ref(path, ref)
+
+    def commit_before(self, iso_date: str) -> str | None:
+        return self.inner.commit_before(iso_date)
+
+    def list_dir_at_ref(self, path: str, ref: str) -> list[str]:
+        return self.inner.list_dir_at_ref(path, ref)
 
     def buggy_parent_sha(self, pr_number: int) -> str | None:
         return self.inner.buggy_parent_sha(pr_number)
