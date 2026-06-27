@@ -153,7 +153,7 @@ class RemediationAgent:
             if f not in suspected:
                 suspected.append(f)
         if suspected:
-            self._emit("tool.call", "extract_stack_files", source="stack_trace", paths=suspected)
+            self._emit("tool.call", "extract_stack_files", source="free_seed", paths=suspected)
             fetched = retrieve_code_files(self.ctx, suspected)
             code_files.update(fetched)
             seen.update(suspected)

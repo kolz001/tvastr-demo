@@ -69,3 +69,34 @@ def test_pipeline_no_wrap_when_flag_off(settings, recurring_events):
 
     era_events = [e for e in sink.events if e.type == "retrieval.issue_era"]
     assert not era_events, "expected no retrieval.issue_era event when flag is off"
+
+
+class _SpyHost(MockGitHubClient):
+    """Records get_file_at_ref calls and pins a fixed issue-era sha."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ref_reads: list[tuple[str, str]] = []
+
+    def commit_before(self, iso_date: str) -> str:
+        return "ERASHA1234"
+
+    def get_file_at_ref(self, path: str, ref: str) -> str:
+        self.ref_reads.append((path, ref))
+        return f"# era {path}"
+
+
+def test_issue_era_reads_seeded_traceback_file_at_sha(settings, recurring_events):
+    """End-to-end: a traceback path in the issue body is extracted, the code host
+    is wrapped, and the investigator reads that file AT the issue-era sha — proving
+    both the wrap (reads served at sha) and the graph-seed (issue-body → suspected)."""
+    pipeline, _ = _make_pipeline(settings, issue_era_retrieval=True)
+    spy = _SpyHost()
+    pipeline.agent.ctx.code_host = spy
+    body = 'Traceback:\n  File "/x/llama_index/core/bug.py", line 1, in f\n    raise ValueError\n'
+
+    pipeline.run(events=recurring_events, issue_body=body)
+
+    assert ("llama-index-core/llama_index/core/bug.py", "ERASHA1234") in spy.ref_reads
+    # M-2: the base host is restored after the run (no IssueEra-wrapping-IssueEra).
+    assert pipeline.agent.ctx.code_host is spy

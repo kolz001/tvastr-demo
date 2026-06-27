@@ -90,7 +90,7 @@ class RemediationPipeline:
             "retrieval.issue_era",
             "agent",
             layer="agent",
-            sha=sha or "",
+            sha=sha,
             ok=bool(sha),
         )
         if not sha:
@@ -217,6 +217,10 @@ class RemediationPipeline:
                     routing=[d.model_dump(mode="json") for d in routing],
                 )
             )
+
+        # Restore the unwrapped host so a second run() on this pipeline re-wraps
+        # from the real base, never IssueEraCodeHost(IssueEraCodeHost(...)).
+        self.agent.ctx.code_host = base_code_host
 
         run = PipelineRun(
             events_ingested=len(events),
