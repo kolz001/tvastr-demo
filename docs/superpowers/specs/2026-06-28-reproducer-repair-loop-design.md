@@ -46,71 +46,71 @@ the real error), the baseline reproduces the actual `AttributeError`, the patch'
 `verified_via_reproducer` across runs (no `repro_broken` from fake-vs-fix
 interactions).
 
-## Decisions (locked in brainstorming)
+## Decisions (locked in brainstorming, corrected during planning)
 
 1. **Sandbox-grounded repair loop** (over introspection-assisted one-shot or a
-   prompt-only tweak): provision first, then synth → run → classify → repair in
-   the provisioned sandbox until the reproducer reproduces the issue's symptom.
-   Realizes the recorded dynamic-reproduction frontier, scoped to the reproducer.
-2. **Validation predicate = matches the issue's symptom.** A baseline failure is
-   "the real bug" when its error matches the issue's expected symptom
-   (`pattern.exception_type` / `representative_message`); a non-matching
-   scaffolding error (`ImportError`/`ModuleNotFoundError`/`NameError`/a
-   `TypeError`/`KeyError` in the repro's own construction) triggers repair.
+   prompt-only tweak): provision first, then run the full verify cycle and repair
+   the reproducer from the real error when it proves untrustworthy. Realizes the
+   recorded dynamic-reproduction frontier, scoped to the reproducer.
+2. **Repair trigger = a `REPRO_BROKEN` outcome of the FULL cycle**, not a baseline
+   check. *(Correction:* validating only the baseline misses #17105 — the fake
+   `GenerateResponse` reproduces correctly at baseline, `base.py` raising the real
+   `AttributeError`; it only breaks at **rerun** under the fix's `dict(response)`.
+   The existing `REPRO_BROKEN` verdict is exactly "the reproducer broke in its own
+   scaffolding rather than real code," and it fires at rerun for the fake case and
+   at baseline for import/construction errors. So the loop wraps
+   baseline→patch→rerun→triage and retries on `REPRO_BROKEN`.)*
 3. **Bounded** `_MAX_REPRO_REPAIR = 2`; gated by `verify_repro_repair` (default
-   on); degrade to today's synth+baseline+verdict flow on exhaustion or flag-off.
+   on); on exhaustion return the last `REPRO_BROKEN`; flag-off → today's flow.
 
 ## Architecture
 
+Provisioning is reordered to run **before** synth so the cycle executes against
+the real installed deps. The baseline→patch→rerun→triage is extracted into a
+helper `_run_cycle(handle, repro, fix, ...) -> _CycleOutcome(verdict, oracle,
+evidence)` (the existing logic, returning the outcome instead of finishing). The
+verify method loops it, repairing the reproducer when the outcome is
+`REPRO_BROKEN`:
+
 ```
 prepare → provision (real deps installed)
-draft = synthesize_reproducer(...)          # _SYSTEM strengthened: import REAL deps, never fake SDK types
+repro = synthesize_reproducer(...)          # _SYSTEM strengthened: import REAL deps, never fake SDK types
 for attempt in 0.._MAX_REPRO_REPAIR:        # default 2 repairs
-    result = handle.run(["python", "repro.py"])     # in the provisioned sandbox
-    klass = classify(result, pattern, repro)
-    emit verify.repro_repair {attempt, classification: klass, error_tail}
-    if klass == REPRODUCES_SYMPTOM:  break          # VALIDATED → this is the baseline
-    if klass == RAN_CLEAN:           break          # no symptom → existing NO_REPRO/overlay path
-    # klass == SCAFFOLDING_ERROR:
-    draft = repair_reproducer(draft, result.stderr, expected, pattern, root_cause, router)
-    handle.write_file("repro.py", draft)
-# the loop's last `result` is the baseline; proceed: patch → rerun → verdict (unchanged)
+    handle.write_file("repro.py", repro.code)
+    outcome = self._run_cycle(handle, repro, fix, pr_number, pr_files, started)
+    if outcome.verdict != REPRO_BROKEN or not self.repro_repair or attempt == _MAX_REPRO_REPAIR:
+        return self._finish(handle, outcome.verdict, outcome.oracle, started, outcome.evidence)
+    # REPRO_BROKEN → the reproducer broke in its own scaffolding, not real code.
+    emit verify.repro_repair {attempt, error_tail: outcome.evidence["rerun_stderr_tail"]}
+    repro = repair_reproducer(repro, outcome.evidence, pattern, root_cause, self.ctx.router)
 ```
 
-This loop **subsumes** the current baseline run (its final `result` is the
-baseline). Provisioning is reordered to run **before** synth so the loop executes
-against the real installed deps. `code_context` (source of suspected files) is
-unchanged and still seeds synth.
+`_run_cycle` is exactly today's baseline → (overlay) → patch → rerun → triage →
+scoped-tests path, but returns `_CycleOutcome` rather than calling `_finish`. The
+patch is re-applied each attempt (idempotent: it overwrites the module). The
+overlay path is inside the cycle, unchanged.
 
-## The classifier
-
-`classify(result, pattern, repro) -> {REPRODUCES_SYMPTOM, SCAFFOLDING_ERROR, RAN_CLEAN}`:
-
-- **REPRODUCES_SYMPTOM** — the failure matches the issue's expected symptom:
-  - crash repro: `pattern.exception_type` (or `repro.expected_exception`) appears
-    in stderr, OR a representative-message token matches;
-  - behavioral repro: the run failed via the assertion path (`AssertionError`)
-    rather than a scaffolding error (i.e. `_reproduced(result, repro)` True AND
-    stderr is not a scaffolding error).
-- **SCAFFOLDING_ERROR** — non-zero exit whose stderr is an import/name/construction
-  error (`ImportError`, `ModuleNotFoundError`, `NameError`, `TypeError`/`KeyError`
-  inside the reproducer file) and does NOT match the symptom.
-- **RAN_CLEAN** — exit 0 / no failure (behavioral marker present, or crash repro
-  succeeded) → no symptom to repair; hand to the existing no-repro/overlay path.
-
-This also closes a latent weakness: today a scaffolding crash at baseline (exit
-≠ 0) masquerades as "reproduced"; the classifier now distinguishes it.
+**Why `REPRO_BROKEN` is the right trigger:** it is the existing verdict for "the
+rerun failed in a way the reproducer can't be trusted for" — a non-zero rerun
+that does NOT carry the original exception (crash kind), or a behavioral rerun
+that neither asserted-OK nor failed cleanly. That is precisely the fake-breaks-
+under-the-fix case (#17105 rerun `KeyError: 0` in `/work/repro.py`) and the
+baseline/rerun import-error case. A real `VERIFIED_*`/`STILL_BROKEN`/
+`MASKS_SYMPTOM`/`NO_REPRO`/`REGRESSION` outcome is returned immediately (no
+repair).
 
 ## The repair step
 
-`repair_reproducer(code, error_stderr, expected, pattern, root_cause, router) -> str`
-(a new `repro.py` function): prompt the model with the failing reproducer + the
-real stderr + "This error is scaffolding, NOT the issue's symptom (`<expected>`).
-The issue's integration and its dependencies are installed in this sandbox —
-import and construct the REAL objects (e.g. `from ollama import …`); never define
-fake/stub classes for external library types. Return only the corrected
-reproducer." Reuses the kind tag + marker conventions; degrade (return the
-original) on any error.
+`repair_reproducer(repro, evidence, pattern, root_cause, router) -> Reproducer`
+(a new `repro.py` function): prompt the model with the failing reproducer code +
+the real rerun stderr (from `evidence`) + "This reproducer FAILED in its own code,
+not in the library under test — it is untrustworthy. The issue's integration and
+its dependencies are installed in this sandbox; import and construct the REAL
+objects (e.g. `from ollama import …`) instead of fake/stub classes for external
+library types (fakes won't match real behavior — e.g. a hand-rolled response that
+supports `[]` but not `dict()`). Return only the corrected reproducer." Reuses
+the kind tag + marker conventions and `_strip_fences`/`_parse_kind`; degrade
+(return the original `Reproducer`) on any error.
 
 ## `_SYSTEM` strengthening (the first draft)
 
@@ -125,8 +125,8 @@ tends to be faithful before any repair.
 
 | File | Change |
 |------|--------|
-| `verification/verifier.py` | reorder: `prepare` → provision → synth → `_reproduce_with_repair(handle, repro, pattern, root_cause)` (the loop; returns the validated baseline `RunResult` + final `Reproducer`) → existing patch/rerun/verdict. Emit `verify.repro_repair`. Gate on `self.repro_repair`. Degrade to a single baseline run when off / on exhaustion. |
-| `verification/repro.py` | `repair_reproducer(...)`; a `classify_reproduction(result, pattern, repro) -> str` helper (or inline in the verifier); strengthen `_SYSTEM`. |
+| `verification/verifier.py` | reorder provision before synth; extract `_run_cycle(...) -> _CycleOutcome(verdict, oracle, evidence)` from the existing baseline→overlay→patch→rerun→triage→scoped-tests path (returning the outcome, not `_finish`-ing); wrap it in the repair loop in `verify()`; emit `verify.repro_repair`; gate on `self.repro_repair`; on flag-off / exhaustion, return the (last) outcome. `_CycleOutcome` is a small local dataclass/namedtuple. |
+| `verification/repro.py` | `repair_reproducer(repro, evidence, pattern, root_cause, router) -> Reproducer`; strengthen `_SYSTEM` (import real installed deps; never fake external SDK/response types). |
 | `config.py` | `verify_repro_repair: bool = True` (`TVASTR_VERIFY_REPRO_REPAIR`). |
 | `tests/conftest.py` | seal `TVASTR_VERIFY_REPRO_REPAIR=false`. |
 | `api/templates/app.html` | summary label for `verify.repro_repair` (Minor). |
@@ -162,8 +162,8 @@ tends to be faithful before any repair.
 
 ## Observability
 
-`verify.repro_repair` event per attempt (payload `{attempt, classification,
-error_tail}`), rendered in the dashboard timeline.
+`verify.repro_repair` event per repair (payload `{attempt, error_tail}`),
+emitted before each retry, rendered in the dashboard timeline.
 
 ## Scope boundary (deferred, recorded follow-up)
 
@@ -173,13 +173,16 @@ error_tail}`), rendered in the dashboard timeline.
 
 ## Testing (offline)
 
-- Repair loop over a fake sandbox with scripted `RunResult`s: scaffolding-error
-  first → `repair_reproducer` called → REPRODUCES_SYMPTOM on retry → validated;
-  symptom on first try → no repair; budget exhausted → degrade to verdict triage.
-- `classify_reproduction`: symptom-match (crash + behavioral) vs scaffolding
-  (`ImportError`/`KeyError`-in-repro) vs ran-clean.
-- `repair_reproducer` prompt content (mock router); returns original on error.
-- `verify_repro_repair=false` → no reorder/loop (single baseline), behavior
-  byte-equivalent.
+- Repair loop over a fake sandbox with scripted `RunResult`s: first cycle yields
+  `REPRO_BROKEN` (rerun non-zero, no original exception) → `repair_reproducer`
+  called → second cycle yields `VERIFIED_*` → that verdict is returned.
+- First cycle yields `VERIFIED_*`/`STILL_BROKEN`/`MASKS_SYMPTOM`/`NO_REPRO` →
+  returned immediately, no repair.
+- Budget exhausted (every cycle `REPRO_BROKEN`) → returns `REPRO_BROKEN` after
+  `_MAX_REPRO_REPAIR` repairs; `verify.repro_repair` emitted per repair.
+- `verify_repro_repair=false` → no loop (single cycle), every existing verdict
+  outcome unchanged (the extracted `_run_cycle` preserves them).
+- `repair_reproducer` prompt content (mock router); returns the original
+  `Reproducer` on LLM/parse error.
 - Live metric: #17105 → stable `verified_via_reproducer` across repeated runs
-  (no `repro_broken` from fake-vs-fix).
+  (the fake gets repaired to real objects; no `repro_broken` from fake-vs-fix).
