@@ -314,6 +314,37 @@ class Verifier:
 
         return _CycleOutcome(green_verdict, green_oracle, {"rerun_exit_code": rerun.exit_code})
 
+    def _provision(self, handle: object, fix: FixProposal) -> None:
+        """Provision the issue's integration package(s) into *handle*.
+
+        Never fatal: a provisioning miss degrades to the existing no-repro path.
+        The caller is responsible for having already checked ``self.provision_deps``.
+        """
+        if not self.provision_deps:
+            return
+        try:
+            dists = sorted(
+                {
+                    d
+                    for c in fix.changes
+                    if (d := distribution_for_path(c.path)) is not None
+                }
+            )
+            if dists:
+                pr = handle.provision(dists)  # type: ignore[union-attr]
+                self._emit(
+                    "verify.provision",
+                    "verify",
+                    {
+                        "requested": pr.requested,
+                        "installed": pr.installed,
+                        "failed": pr.failed,
+                        "ok": pr.ok,
+                    },
+                )
+        except Exception as exc:  # provisioning must never abort verify
+            log.warning("verify.provision.error", error=str(exc))
+
     def verify(
         self,
         pattern: FailurePattern,
@@ -357,68 +388,47 @@ class Verifier:
                 log.warning("verify.code_context.failed", error=str(exc))
             return ""
 
-        # 2/3. Sandbox + provision
-        handle = self.sandbox.prepare()
+        # 1. Synthesize the reproducer ONCE, before any sandbox handle is
+        # created.  Synthesis needs no sandbox — moving it outside the loop
+        # means a synth failure is reported cleanly (no handle to discard) and
+        # a repaired reproducer is carried into the next iteration's fresh handle.
         try:
-            # Provision the issue's integration package(s) so the reproducer
-            # can locate real source and the patch-applier can resolve the
-            # module. Never fatal: a miss degrades to the existing no-repro path.
-            if self.provision_deps:
-                try:
-                    dists = sorted(
-                        {
-                            d
-                            for c in fix.changes
-                            if (d := distribution_for_path(c.path)) is not None
-                        }
-                    )
-                    if dists:
-                        pr = handle.provision(dists)
-                        self._emit(
-                            "verify.provision",
-                            "verify",
-                            {
-                                "requested": pr.requested,
-                                "installed": pr.installed,
-                                "failed": pr.failed,
-                                "ok": pr.ok,
-                            },
-                        )
-                except Exception as exc:  # provisioning must never abort verify
-                    log.warning("verify.provision.error", error=str(exc))
-
-            # Synthesize AFTER provisioning so the reproducer (and any repair)
-            # runs against the real installed deps.
-            try:
-                repro: Reproducer = synthesize_reproducer(
-                    pattern,
-                    root_cause,
-                    sample_events,
-                    issue_body,
-                    self.ctx.router,
-                    code_context=_code_context,
-                    register=fix.register,
-                )
-            except Exception as exc:
-                return self._finish(
-                    handle,
-                    Verdict.ENVIRONMENTAL_ERROR,
-                    "none",
-                    started,
-                    {"stage": "repro_synth", "error": str(exc)},
-                )
-            self._emit(
-                "verify.repro_synth",
-                "verify",
-                {
-                    "source": repro.source.value,
-                    "code": repro.code,
-                    "expected_exception": repro.expected_exception,
-                    "register": fix.register.value,
-                },
+            repro: Reproducer = synthesize_reproducer(
+                pattern,
+                root_cause,
+                sample_events,
+                issue_body,
+                self.ctx.router,
+                code_context=_code_context,
+                register=fix.register,
             )
+        except Exception as exc:
+            return self._fail(
+                Verdict.ENVIRONMENTAL_ERROR,
+                "none",
+                started,
+                {"stage": "repro_synth", "error": str(exc)},
+            )
+        self._emit(
+            "verify.repro_synth",
+            "verify",
+            {
+                "source": repro.source.value,
+                "code": repro.code,
+                "expected_exception": repro.expected_exception,
+                "register": fix.register.value,
+            },
+        )
 
-            for attempt in range(_MAX_REPRO_REPAIR + 1):
+        # 2. Repair loop: each attempt gets a FRESH sandbox handle so that
+        # attempt N's applied patch cannot leak into attempt N+1's baseline.
+        # The patch (applied by _run_cycle) stays inside the handle's temp dir
+        # and is fully discarded when handle.discard() runs in the finally block.
+        outcome: _CycleOutcome | None = None
+        for attempt in range(_MAX_REPRO_REPAIR + 1):
+            handle = self.sandbox.prepare()
+            try:
+                self._provision(handle, fix)
                 outcome = self._run_cycle(handle, repro, fix, pr_number, pr_files)
                 if (
                     outcome.verdict != Verdict.REPRO_BROKEN
@@ -428,20 +438,22 @@ class Verifier:
                     return self._finish(
                         handle, outcome.verdict, outcome.oracle, started, outcome.evidence
                     )
-                self._emit(
-                    "verify.repro_repair",
-                    "verify",
-                    {
-                        "attempt": attempt + 1,
-                        "error_tail": outcome.evidence.get("rerun_stderr_tail", ""),
-                    },
-                )
-                repro = repair_reproducer(
-                    repro, outcome.evidence, pattern, root_cause, self.ctx.router
-                )
-            raise AssertionError("unreachable: the repair loop always returns")
-        finally:
-            handle.discard()
+            finally:
+                handle.discard()
+            # REPRO_BROKEN with budget remaining: repair the reproducer and
+            # retry with a completely fresh handle next iteration.
+            self._emit(
+                "verify.repro_repair",
+                "verify",
+                {
+                    "attempt": attempt + 1,
+                    "error_tail": outcome.evidence.get("rerun_stderr_tail", ""),  # type: ignore[union-attr]
+                },
+            )
+            repro = repair_reproducer(
+                repro, outcome.evidence, pattern, root_cause, self.ctx.router  # type: ignore[union-attr]
+            )
+        raise AssertionError("unreachable: the repair loop always returns")
 
     def _finish(
         self,

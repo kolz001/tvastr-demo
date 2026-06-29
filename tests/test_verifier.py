@@ -80,16 +80,34 @@ class _FakeHandle:
 class _FakeSandbox:
     name = "fake"
 
-    def __init__(self, responses: list[RunResult], *, provision_ok: bool = True) -> None:
-        self._responses = responses
+    def __init__(
+        self,
+        responses: list[RunResult] | None = None,
+        *,
+        provision_ok: bool = True,
+        prepares: list[list[RunResult]] | None = None,
+    ) -> None:
+        self._responses = responses or []
         self._provision_ok = provision_ok
+        self._prepares = prepares  # per-attempt response lists; each prepare() pops the next
+        self._prepares_idx = 0
         self.last_handle: _FakeHandle | None = None
+        self.all_handles: list[_FakeHandle] = []  # every handle ever returned by prepare()
 
     def prepare(self) -> SandboxHandle:
         h = _FakeHandle()
-        h.responses = list(self._responses)
+        if self._prepares is not None:
+            # per-attempt mode: each prepare() gets its own response list
+            if self._prepares_idx < len(self._prepares):
+                h.responses = list(self._prepares[self._prepares_idx])
+                self._prepares_idx += 1
+            else:
+                h.responses = []
+        else:
+            h.responses = list(self._responses)
         h.provision_ok = self._provision_ok
         self.last_handle = h
+        self.all_handles.append(h)
         return h
 
 
@@ -644,6 +662,7 @@ class _ManifestSandbox(_FakeSandbox):
         h.responses = list(self._responses)
         h.provision_ok = self._provision_ok
         self.last_handle = h
+        self.all_handles.append(h)
         return h
 
 
@@ -811,13 +830,17 @@ def test_fail_fast_register_greens_via_behavior(monkeypatch: object) -> None:
 
 
 def test_repro_broken_triggers_repair_then_verifies() -> None:
-    # cycle 1: baseline reproduces (exit 1), rerun non-zero w/o original → REPRO_BROKEN
-    # → repair → cycle 2: baseline reproduces, rerun exit 0 → VERIFIED_VIA_REPRODUCER
-    sandbox = _FakeSandbox([
-        RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),  # c1 baseline
-        RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),  # c1 rerun → REPRO_BROKEN
-        RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),  # c2 baseline
-        RunResult(exit_code=0, stdout="ok", stderr=""),                        # c2 rerun → VERIFIED
+    # Attempt 1 (fresh handle): baseline reproduces, rerun w/ different error → REPRO_BROKEN
+    # → repair → Attempt 2 (fresh handle): baseline reproduces, rerun exit 0 → VERIFIED
+    sandbox = _FakeSandbox(prepares=[
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),  # baseline
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),  # rerun → REPRO_BROKEN
+        ],
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),  # baseline
+            RunResult(exit_code=0, stdout="ok", stderr=""),  # rerun → VERIFIED
+        ],
     ])
     sink = ListEventSink()
     verifier = Verifier(_ctx(), sandbox, event_sink=sink, repro_repair=True)
@@ -827,9 +850,12 @@ def test_repro_broken_triggers_repair_then_verifies() -> None:
 
 
 def test_repro_repair_off_returns_repro_broken_once() -> None:
-    sandbox = _FakeSandbox([
-        RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
-        RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),
+    # repro_repair=False → single fresh handle, REPRO_BROKEN returned immediately
+    sandbox = _FakeSandbox(prepares=[
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),
+        ],
     ])
     sink = ListEventSink()
     verifier = Verifier(_ctx(), sandbox, event_sink=sink, repro_repair=False)
@@ -839,12 +865,12 @@ def test_repro_repair_off_returns_repro_broken_once() -> None:
 
 
 def test_repro_repair_budget_exhausted_returns_repro_broken() -> None:
-    # every cycle REPRO_BROKEN → after _MAX_REPRO_REPAIR repairs, return REPRO_BROKEN
+    # 3 fresh handles, each REPRO_BROKEN → budget exhausted after _MAX_REPRO_REPAIR repairs
     _rb = RunResult(exit_code=1, stdout="", stderr="KeyError: 0")
-    sandbox = _FakeSandbox([
-        RunResult(exit_code=1, stdout="", stderr="x"), _rb,
-        RunResult(exit_code=1, stdout="", stderr="x"), _rb,
-        RunResult(exit_code=1, stdout="", stderr="x"), _rb,
+    sandbox = _FakeSandbox(prepares=[
+        [RunResult(exit_code=1, stdout="", stderr="x"), _rb],
+        [RunResult(exit_code=1, stdout="", stderr="x"), _rb],
+        [RunResult(exit_code=1, stdout="", stderr="x"), _rb],
     ])
     sink = ListEventSink()
     verifier = Verifier(_ctx(), sandbox, event_sink=sink, repro_repair=True)
@@ -852,3 +878,33 @@ def test_repro_repair_budget_exhausted_returns_repro_broken() -> None:
     assert out.verdict == Verdict.REPRO_BROKEN
     repairs = [e for e in sink.events if e.type == "verify.repro_repair"]
     assert len(repairs) == 2  # _MAX_REPRO_REPAIR
+
+
+def test_repair_uses_fresh_handle_each_attempt() -> None:
+    """Regression: each repair attempt must prepare a FRESH sandbox handle.
+
+    Without the fix, attempt 2 runs on the same handle as attempt 1, which
+    already has the patch applied.  The bug makes attempt 2's baseline run
+    against the patched (fixed) state → NO_REPRO instead of VERIFIED.
+    """
+    sandbox = _FakeSandbox(prepares=[
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+            RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),
+        ],
+        [
+            RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+            RunResult(exit_code=0, stdout="ok", stderr=""),
+        ],
+    ])
+    verifier = Verifier(_ctx(), sandbox, repro_repair=True)
+    out = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert out.verdict == Verdict.VERIFIED_VIA_REPRODUCER
+    # The critical assertion: sandbox.prepare() must have been called TWICE,
+    # producing two distinct handle objects — one per attempt.
+    assert len(sandbox.all_handles) == 2, (
+        f"expected 2 distinct handles (one per attempt), got {len(sandbox.all_handles)}"
+    )
+    assert sandbox.all_handles[0] is not sandbox.all_handles[1], (
+        "handles must be distinct objects — attempt 2 must not reuse attempt 1's handle"
+    )
