@@ -201,7 +201,7 @@ def test_verdict_repro_broken_when_rerun_raises_different_exception() -> None:
             ),
         ]
     )
-    verifier = Verifier(_ctx(), sandbox)
+    verifier = Verifier(_ctx(), sandbox, repro_repair=False)  # single-cycle REPRO_BROKEN
     result = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
     assert result.verdict == Verdict.REPRO_BROKEN
     assert not result.is_green
@@ -229,7 +229,7 @@ def test_repro_broken_skips_scoped_tests(monkeypatch, tmp_path: Path) -> None:
             RunResult(exit_code=1, stdout="", stderr="TypeError: nope"),
         ]
     )
-    verifier = Verifier(_ctx(), sandbox, project_root=tmp_path)
+    verifier = Verifier(_ctx(), sandbox, project_root=tmp_path, repro_repair=False)
     result = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
     assert result.verdict == Verdict.REPRO_BROKEN
     assert scoped_calls == []
@@ -369,7 +369,7 @@ def test_behavioral_repro_broken_on_other_exception() -> None:
             RunResult(exit_code=1, stdout="", stderr="TypeError: unexpected kwarg"),
         ]
     )
-    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox)
+    verifier = Verifier(_ctx(_BEHAVIORAL_REPRO), sandbox, repro_repair=False)
     result = verifier.verify(_kerr_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
     assert result.verdict == Verdict.REPRO_BROKEN
 

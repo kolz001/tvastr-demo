@@ -24,7 +24,6 @@ from pathlib import Path
 
 from tvastr.agent.context import AgentContext
 from tvastr.agent.tools.code_retrieval import format_code_for_prompt, retrieve_code_files
-from tvastr.config import get_settings
 from tvastr.domain import FailurePattern, FileChange, FixProposal, FixRegister, LogEvent, RootCause
 from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.logging import get_logger
@@ -84,7 +83,7 @@ class Verifier:
         run_id: str | None = None,
         provision_deps: bool = True,
         source_overlay: bool = True,
-        repro_repair: bool | None = None,
+        repro_repair: bool = True,
     ) -> None:
         self.ctx = ctx
         self.sandbox = sandbox
@@ -93,10 +92,7 @@ class Verifier:
         self.run_id = run_id
         self.provision_deps = provision_deps
         self.source_overlay = source_overlay
-        # When None, read from settings (sealed false in tests via conftest env).
-        self.repro_repair = (
-            repro_repair if repro_repair is not None else get_settings().verify_repro_repair
-        )
+        self.repro_repair = repro_repair
 
     def _emit(self, type_: str, step: str, payload: dict | None = None) -> None:
         self.sink.emit(
@@ -443,6 +439,7 @@ class Verifier:
                 repro = repair_reproducer(
                     repro, outcome.evidence, pattern, root_cause, self.ctx.router
                 )
+            raise AssertionError("unreachable: the repair loop always returns")
         finally:
             handle.discard()
 
