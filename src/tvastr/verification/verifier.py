@@ -441,17 +441,17 @@ class Verifier:
             finally:
                 handle.discard()
             # REPRO_BROKEN with budget remaining: repair the reproducer and
-            # retry with a completely fresh handle next iteration.
+            # retry with a completely fresh handle next iteration. Emit the
+            # repaired code so the timeline reflects what actually re-ran (not the
+            # original synth).
+            error_tail = outcome.evidence.get("rerun_stderr_tail", "")  # type: ignore[union-attr]
+            repro = repair_reproducer(
+                repro, outcome.evidence, pattern, root_cause, self.ctx.router  # type: ignore[union-attr]
+            )
             self._emit(
                 "verify.repro_repair",
                 "verify",
-                {
-                    "attempt": attempt + 1,
-                    "error_tail": outcome.evidence.get("rerun_stderr_tail", ""),  # type: ignore[union-attr]
-                },
-            )
-            repro = repair_reproducer(
-                repro, outcome.evidence, pattern, root_cause, self.ctx.router  # type: ignore[union-attr]
+                {"attempt": attempt + 1, "error_tail": error_tail, "code": repro.code},
             )
         raise AssertionError("unreachable: the repair loop always returns")
 

@@ -735,7 +735,7 @@ function renderBody(event) {
     parts.push(`<pre>${html(p.body)}</pre>`);
   }
   // Reproducer source.
-  if (event.type === "verify.repro_synth" && p.code) {
+  if ((event.type === "verify.repro_synth" || event.type === "verify.repro_repair") && p.code) {
     parts.push(`<div class="kv"><span class="k">repro.py</span><span class="v"></span></div><pre>${html(p.code)}</pre>`);
   }
   // Sandbox run output tails.
