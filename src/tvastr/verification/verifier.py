@@ -19,6 +19,7 @@ the agent's run.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from tvastr.agent.context import AgentContext
@@ -35,13 +36,14 @@ from tvastr.verification.models import (
     VerificationResult,
 )
 from tvastr.verification.regression import discover_scoped_tests, run_scoped_tests
-from tvastr.verification.repro import synthesize_reproducer
+from tvastr.verification.repro import repair_reproducer, synthesize_reproducer
 from tvastr.verification.sandbox import Sandbox, distribution_for_path, installed_module_path
 
 log = get_logger(__name__)
 
 
 _TAIL_LINES = 60
+_MAX_REPRO_REPAIR = 2
 
 
 def _tail(text: str, lines: int = _TAIL_LINES) -> str:
@@ -61,6 +63,13 @@ _REGISTER_GREEN: dict[FixRegister, tuple[Verdict, str]] = {
 }
 
 
+@dataclass
+class _CycleOutcome:
+    verdict: Verdict
+    oracle: str
+    evidence: dict
+
+
 class Verifier:
     """Run one verification end-to-end."""
 
@@ -74,6 +83,7 @@ class Verifier:
         run_id: str | None = None,
         provision_deps: bool = True,
         source_overlay: bool = True,
+        repro_repair: bool = True,
     ) -> None:
         self.ctx = ctx
         self.sandbox = sandbox
@@ -82,6 +92,7 @@ class Verifier:
         self.run_id = run_id
         self.provision_deps = provision_deps
         self.source_overlay = source_overlay
+        self.repro_repair = repro_repair
 
     def _emit(self, type_: str, step: str, payload: dict | None = None) -> None:
         self.sink.emit(
@@ -144,6 +155,196 @@ class Verifier:
         )
         return changes
 
+    def _run_cycle(
+        self,
+        handle: object,
+        repro: Reproducer,
+        fix: FixProposal,
+        pr_number: int | None,
+        pr_files: list[str] | None,
+    ) -> _CycleOutcome:
+        handle.write_file("repro.py", repro.code)  # type: ignore[union-attr]
+        baseline: RunResult = handle.run(["python", "repro.py"], timeout_s=90)  # type: ignore[union-attr]
+        self._emit_baseline(baseline, repro)
+        baseline_reproduced = self._reproduced(baseline, repro)
+
+        overlay_changes: list[FileChange] = []
+        if not baseline_reproduced and self.source_overlay and pr_number and pr_files:
+            # Released wheel already carries the fix (no_repro). Reconstruct
+            # the pre-fix state of the PR's changed files and re-baseline.
+            try:
+                overlay_changes = self._apply_buggy_overlay(handle, pr_number, pr_files)
+            except Exception as exc:  # overlay must never abort verify
+                overlay_changes = []
+                log.warning("verify.overlay.error", error=str(exc))
+            if overlay_changes:
+                baseline = handle.run(["python", "repro.py"], timeout_s=90)  # type: ignore[union-attr]
+                self._emit_baseline(baseline, repro, retry=True)
+                baseline_reproduced = self._reproduced(baseline, repro)
+
+        if not baseline_reproduced:
+            # Reproducer ran cleanly without ever hitting the bug: we have
+            # no signal to evaluate "is the fix necessary?" — be honest.
+            return _CycleOutcome(
+                Verdict.NO_REPRO,
+                "none",
+                {"reason": "baseline run did not reproduce the failure"},
+            )
+        is_behavioral = repro.kind == ReproducerKind.BEHAVIORAL
+
+        # 4. Apply patch. If we overlaid buggy files, retain the buggy state
+        # of any human-PR files the agent's fix does NOT touch, so the rerun
+        # tests the agent's fix ALONE against the reproduced bug (the fix wins
+        # on any overlapping path). Otherwise each fresh container would revert
+        # those files to the already-fixed upstream version → false VERIFIED.
+        fix_paths = {c.path for c in fix.changes}
+        patch_changes = (
+            [oc for oc in overlay_changes if oc.path not in fix_paths]
+            + list(fix.changes)
+        )
+        handle.apply_changes(patch_changes)  # type: ignore[union-attr]
+        self._emit(
+            "verify.patch_applied",
+            "verify",
+            {"files": [c.path for c in fix.changes]},
+        )
+
+        # 5. Re-run
+        rerun: RunResult = handle.run(["python", "repro.py"], timeout_s=90)  # type: ignore[union-attr]
+        still_broken = _original_exception_seen(rerun, repro.expected_exception)
+        self._emit(
+            "verify.rerun",
+            "verify",
+            {
+                "exit_code": rerun.exit_code,
+                "stderr_tail": _tail(rerun.stderr),
+                "original_exception_seen": still_broken,
+                "timed_out": rerun.timed_out,
+            },
+        )
+
+        if still_broken:
+            return _CycleOutcome(
+                Verdict.STILL_BROKEN,
+                "reproducer",
+                {"baseline_exit_code": baseline.exit_code, "rerun_exit_code": rerun.exit_code},
+            )
+
+        # 6. Triage the rerun outcome honestly — BEFORE spending a scoped
+        # test run on a rerun that gave no meaningful fix signal:
+        #  - exit 0                       → reproducer is happy, fix works
+        #  - timed out                    → environmental
+        #  - non-zero exit, no original   → repro itself is broken (Claude
+        #    referenced an API that doesn't exist, etc.) — don't pretend
+        #    we have a meaningful signal here. Surface as REPRO_BROKEN so
+        #    the UI re-arms the verify button instead of looking green-ish.
+        if rerun.timed_out:
+            return _CycleOutcome(
+                Verdict.ENVIRONMENTAL_ERROR,
+                "none",
+                {"stage": "rerun", "reason": "timeout"},
+            )
+        if is_behavioral:
+            if rerun.exit_code == 0 and BEHAVIOR_OK_MARKER in rerun.stdout:
+                green_verdict, green_oracle = _REGISTER_GREEN.get(
+                    fix.register, (Verdict.VERIFIED_VIA_BEHAVIOR, "behavior")
+                )
+            elif "AssertionError" in rerun.stderr:
+                # Crash suppressed, but the behavioral assertion failed: the
+                # fix masks the symptom without restoring behavior.
+                return _CycleOutcome(
+                    Verdict.MASKS_SYMPTOM,
+                    "behavior",
+                    {
+                        "rerun_exit_code": rerun.exit_code,
+                        "rerun_stderr_tail": _tail(rerun.stderr),
+                        "hint": (
+                            "the fix stopped the exception but the behavioral "
+                            "assertion failed — the symptom is masked, not fixed."
+                        ),
+                    },
+                )
+            else:
+                return _CycleOutcome(
+                    Verdict.REPRO_BROKEN,
+                    "none",
+                    {
+                        "rerun_exit_code": rerun.exit_code,
+                        "rerun_stderr_tail": _tail(rerun.stderr),
+                        "hint": "behavioral reproducer neither asserted-OK nor failed cleanly.",
+                    },
+                )
+        else:
+            if rerun.exit_code != 0:
+                return _CycleOutcome(
+                    Verdict.REPRO_BROKEN,
+                    # The reproducer is exactly what's untrustworthy here, so the
+                    # oracle of record is "none" — matching the timeout branch.
+                    "none",
+                    {
+                        "rerun_exit_code": rerun.exit_code,
+                        "rerun_stderr_tail": _tail(rerun.stderr),
+                        "hint": (
+                            "reproducer raised a different exception than the "
+                            "issue's original — Claude likely referenced an "
+                            "API that doesn't exist; retry to resynthesise."
+                        ),
+                    },
+                )
+            green_verdict = Verdict.VERIFIED_VIA_REPRODUCER
+            green_oracle = "reproducer"
+
+        # 7. Optional regression check (scoped tests) — only worth running
+        # once the reproducer itself is green.
+        if self.project_root is not None:
+            scoped = discover_scoped_tests(fix.changes, self.project_root)
+            if scoped:
+                test_result, counts = run_scoped_tests(handle, scoped)
+                self._emit(
+                    "verify.regression",
+                    "verify",
+                    {"scope": scoped, **counts, "exit_code": test_result.exit_code},
+                )
+                if counts.get("failed", 0) > 0 or counts.get("errors", 0) > 0:
+                    return _CycleOutcome(
+                        Verdict.REGRESSION,
+                        "scoped_tests",
+                        {"scope": scoped, **counts},
+                    )
+
+        return _CycleOutcome(green_verdict, green_oracle, {"rerun_exit_code": rerun.exit_code})
+
+    def _provision(self, handle: object, fix: FixProposal) -> None:
+        """Provision the issue's integration package(s) into *handle*.
+
+        Never fatal: a provisioning miss degrades to the existing no-repro path.
+        The caller is responsible for having already checked ``self.provision_deps``.
+        """
+        if not self.provision_deps:
+            return
+        try:
+            dists = sorted(
+                {
+                    d
+                    for c in fix.changes
+                    if (d := distribution_for_path(c.path)) is not None
+                }
+            )
+            if dists:
+                pr = handle.provision(dists)  # type: ignore[union-attr]
+                self._emit(
+                    "verify.provision",
+                    "verify",
+                    {
+                        "requested": pr.requested,
+                        "installed": pr.installed,
+                        "failed": pr.failed,
+                        "ok": pr.ok,
+                    },
+                )
+        except Exception as exc:  # provisioning must never abort verify
+            log.warning("verify.provision.error", error=str(exc))
+
     def verify(
         self,
         pattern: FailurePattern,
@@ -171,11 +372,11 @@ class Verifier:
                 {"reason": "documentation-only fix; no behavioral oracle applies"},
             )
 
-        # 1. Reproducer. Source for the suspected files is supplied lazily —
-        # synthesize_reproducer only resolves it on the Claude path, so issues
-        # whose body already carries a runnable block skip the retrieval. When
-        # Claude does synthesize, seeing the real APIs (constructor params,
-        # method names) stops it hallucinating parameters that don't exist.
+        # Source for the suspected files is supplied lazily — synthesize_reproducer
+        # only resolves it on the Claude path, so issues whose body already carries
+        # a runnable block skip the retrieval. When Claude does synthesize, seeing
+        # the real APIs (constructor params, method names) stops it hallucinating
+        # parameters that don't exist.
         def _code_context() -> str:
             try:
                 if root_cause.suspected_files:
@@ -187,6 +388,10 @@ class Verifier:
                 log.warning("verify.code_context.failed", error=str(exc))
             return ""
 
+        # 1. Synthesize the reproducer ONCE, before any sandbox handle is
+        # created.  Synthesis needs no sandbox — moving it outside the loop
+        # means a synth failure is reported cleanly (no handle to discard) and
+        # a repaired reproducer is carried into the next iteration's fresh handle.
         try:
             repro: Reproducer = synthesize_reproducer(
                 pattern,
@@ -207,213 +412,48 @@ class Verifier:
         self._emit(
             "verify.repro_synth",
             "verify",
-            {"source": repro.source.value, "code": repro.code,
-             "expected_exception": repro.expected_exception,
-             "register": fix.register.value},
+            {
+                "source": repro.source.value,
+                "code": repro.code,
+                "expected_exception": repro.expected_exception,
+                "register": fix.register.value,
+            },
         )
 
-        # 2/3. Sandbox + baseline
-        handle = self.sandbox.prepare()
-        try:
-            # 2a. Provision the issue's integration package(s) so the reproducer
-            # can locate real source and the patch-applier can resolve the
-            # module. Never fatal: a miss degrades to the existing no-repro path.
-            if self.provision_deps:
-                try:
-                    dists = sorted(
-                        {
-                            d
-                            for c in fix.changes
-                            if (d := distribution_for_path(c.path)) is not None
-                        }
+        # 2. Repair loop: each attempt gets a FRESH sandbox handle so that
+        # attempt N's applied patch cannot leak into attempt N+1's baseline.
+        # The patch (applied by _run_cycle) stays inside the handle's temp dir
+        # and is fully discarded when handle.discard() runs in the finally block.
+        outcome: _CycleOutcome | None = None
+        for attempt in range(_MAX_REPRO_REPAIR + 1):
+            handle = self.sandbox.prepare()
+            try:
+                self._provision(handle, fix)
+                outcome = self._run_cycle(handle, repro, fix, pr_number, pr_files)
+                if (
+                    outcome.verdict != Verdict.REPRO_BROKEN
+                    or not self.repro_repair
+                    or attempt == _MAX_REPRO_REPAIR
+                ):
+                    return self._finish(
+                        handle, outcome.verdict, outcome.oracle, started, outcome.evidence
                     )
-                    if dists:
-                        pr = handle.provision(dists)
-                        self._emit(
-                            "verify.provision",
-                            "verify",
-                            {
-                                "requested": pr.requested,
-                                "installed": pr.installed,
-                                "failed": pr.failed,
-                                "ok": pr.ok,
-                            },
-                        )
-                except Exception as exc:  # provisioning must never abort verify
-                    log.warning("verify.provision.error", error=str(exc))
-
-            handle.write_file("repro.py", repro.code)
-            baseline: RunResult = handle.run(["python", "repro.py"], timeout_s=90)
-            self._emit_baseline(baseline, repro)
-            baseline_reproduced = self._reproduced(baseline, repro)
-
-            overlay_changes: list[FileChange] = []
-            if not baseline_reproduced and self.source_overlay and pr_number and pr_files:
-                # Released wheel already carries the fix (no_repro). Reconstruct
-                # the pre-fix state of the PR's changed files and re-baseline.
-                try:
-                    overlay_changes = self._apply_buggy_overlay(handle, pr_number, pr_files)
-                except Exception as exc:  # overlay must never abort verify
-                    overlay_changes = []
-                    log.warning("verify.overlay.error", error=str(exc))
-                if overlay_changes:
-                    baseline = handle.run(["python", "repro.py"], timeout_s=90)
-                    self._emit_baseline(baseline, repro, retry=True)
-                    baseline_reproduced = self._reproduced(baseline, repro)
-
-            if not baseline_reproduced:
-                # Reproducer ran cleanly without ever hitting the bug: we have
-                # no signal to evaluate "is the fix necessary?" — be honest.
-                return self._finish(
-                    handle,
-                    Verdict.NO_REPRO,
-                    "none",
-                    started,
-                    {"reason": "baseline run did not reproduce the failure"},
-                )
-            is_behavioral = repro.kind == ReproducerKind.BEHAVIORAL
-
-            # 4. Apply patch. If we overlaid buggy files, retain the buggy state
-            # of any human-PR files the agent's fix does NOT touch, so the rerun
-            # tests the agent's fix ALONE against the reproduced bug (the fix wins
-            # on any overlapping path). Otherwise each fresh container would revert
-            # those files to the already-fixed upstream version → false VERIFIED.
-            fix_paths = {c.path for c in fix.changes}
-            patch_changes = (
-                [oc for oc in overlay_changes if oc.path not in fix_paths]
-                + list(fix.changes)
+            finally:
+                handle.discard()
+            # REPRO_BROKEN with budget remaining: repair the reproducer and
+            # retry with a completely fresh handle next iteration. Emit the
+            # repaired code so the timeline reflects what actually re-ran (not the
+            # original synth).
+            error_tail = outcome.evidence.get("rerun_stderr_tail", "")  # type: ignore[union-attr]
+            repro = repair_reproducer(
+                repro, outcome.evidence, pattern, root_cause, self.ctx.router  # type: ignore[union-attr]
             )
-            handle.apply_changes(patch_changes)
             self._emit(
-                "verify.patch_applied",
+                "verify.repro_repair",
                 "verify",
-                {"files": [c.path for c in fix.changes]},
+                {"attempt": attempt + 1, "error_tail": error_tail, "code": repro.code},
             )
-
-            # 5. Re-run
-            rerun: RunResult = handle.run(["python", "repro.py"], timeout_s=90)
-            still_broken = _original_exception_seen(rerun, repro.expected_exception)
-            self._emit(
-                "verify.rerun",
-                "verify",
-                {
-                    "exit_code": rerun.exit_code,
-                    "stderr_tail": _tail(rerun.stderr),
-                    "original_exception_seen": still_broken,
-                    "timed_out": rerun.timed_out,
-                },
-            )
-
-            if still_broken:
-                return self._finish(
-                    handle,
-                    Verdict.STILL_BROKEN,
-                    "reproducer",
-                    started,
-                    {"baseline_exit_code": baseline.exit_code, "rerun_exit_code": rerun.exit_code},
-                )
-
-            # 6. Triage the rerun outcome honestly — BEFORE spending a scoped
-            # test run on a rerun that gave no meaningful fix signal:
-            #  - exit 0                       → reproducer is happy, fix works
-            #  - timed out                    → environmental
-            #  - non-zero exit, no original   → repro itself is broken (Claude
-            #    referenced an API that doesn't exist, etc.) — don't pretend
-            #    we have a meaningful signal here. Surface as REPRO_BROKEN so
-            #    the UI re-arms the verify button instead of looking green-ish.
-            if rerun.timed_out:
-                return self._finish(
-                    handle,
-                    Verdict.ENVIRONMENTAL_ERROR,
-                    "none",
-                    started,
-                    {"stage": "rerun", "reason": "timeout"},
-                )
-            if is_behavioral:
-                if rerun.exit_code == 0 and BEHAVIOR_OK_MARKER in rerun.stdout:
-                    green_verdict, green_oracle = _REGISTER_GREEN.get(
-                        fix.register, (Verdict.VERIFIED_VIA_BEHAVIOR, "behavior")
-                    )
-                elif "AssertionError" in rerun.stderr:
-                    # Crash suppressed, but the behavioral assertion failed: the
-                    # fix masks the symptom without restoring behavior.
-                    return self._finish(
-                        handle,
-                        Verdict.MASKS_SYMPTOM,
-                        "behavior",
-                        started,
-                        {
-                            "rerun_exit_code": rerun.exit_code,
-                            "rerun_stderr_tail": _tail(rerun.stderr),
-                            "hint": (
-                                "the fix stopped the exception but the behavioral "
-                                "assertion failed — the symptom is masked, not fixed."
-                            ),
-                        },
-                    )
-                else:
-                    return self._finish(
-                        handle,
-                        Verdict.REPRO_BROKEN,
-                        "none",
-                        started,
-                        {
-                            "rerun_exit_code": rerun.exit_code,
-                            "rerun_stderr_tail": _tail(rerun.stderr),
-                            "hint": "behavioral reproducer neither asserted-OK nor failed cleanly.",
-                        },
-                    )
-            else:
-                if rerun.exit_code != 0:
-                    return self._finish(
-                        handle,
-                        Verdict.REPRO_BROKEN,
-                        # The reproducer is exactly what's untrustworthy here, so the
-                        # oracle of record is "none" — matching the timeout branch.
-                        "none",
-                        started,
-                        {
-                            "rerun_exit_code": rerun.exit_code,
-                            "rerun_stderr_tail": _tail(rerun.stderr),
-                            "hint": (
-                                "reproducer raised a different exception than the "
-                                "issue's original — Claude likely referenced an "
-                                "API that doesn't exist; retry to resynthesise."
-                            ),
-                        },
-                    )
-                green_verdict = Verdict.VERIFIED_VIA_REPRODUCER
-                green_oracle = "reproducer"
-
-            # 7. Optional regression check (scoped tests) — only worth running
-            # once the reproducer itself is green.
-            if self.project_root is not None:
-                scoped = discover_scoped_tests(fix.changes, self.project_root)
-                if scoped:
-                    test_result, counts = run_scoped_tests(handle, scoped)
-                    self._emit(
-                        "verify.regression",
-                        "verify",
-                        {"scope": scoped, **counts, "exit_code": test_result.exit_code},
-                    )
-                    if counts.get("failed", 0) > 0 or counts.get("errors", 0) > 0:
-                        return self._finish(
-                            handle,
-                            Verdict.REGRESSION,
-                            "scoped_tests",
-                            started,
-                            {"scope": scoped, **counts},
-                        )
-
-            return self._finish(
-                handle,
-                green_verdict,
-                green_oracle,
-                started,
-                {"rerun_exit_code": rerun.exit_code},
-            )
-        finally:
-            handle.discard()
+        raise AssertionError("unreachable: the repair loop always returns")
 
     def _finish(
         self,

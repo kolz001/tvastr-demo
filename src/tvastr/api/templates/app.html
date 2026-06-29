@@ -530,6 +530,7 @@ function summarize(event) {
     case "verify.overlay": return `buggy overlay @ ${(p.sha||"").slice(0,8)} · ${(p.files||[]).length} file(s)${p.ok?"":" · FAILED"}`;
     case "verify.patch_applied": return `${(p.files||[]).length} file(s) patched`;
     case "verify.rerun":    return `rerun exit=${p.exit_code} · original_exception_seen=${p.original_exception_seen}`;
+    case "verify.repro_repair": return `reproducer repair #${p.attempt} (was REPRO_BROKEN) · ${(p.error_tail||"").slice(0,60)}`;
     case "verify.regression": return `${p.passed||0} passed · ${p.failed||0} failed · ${p.errors||0} errors · ${(p.scope||[]).length} scoped`;
     case "verify.result":   return `verdict=${p.verdict} · oracle=${p.oracle} · ${p.elapsed_s}s`;
     case "benchmark.compared": return `verdict=${p.verdict} · same root cause=${p.same_root_cause} · PR #${p.pr_number}`;
@@ -734,7 +735,7 @@ function renderBody(event) {
     parts.push(`<pre>${html(p.body)}</pre>`);
   }
   // Reproducer source.
-  if (event.type === "verify.repro_synth" && p.code) {
+  if ((event.type === "verify.repro_synth" || event.type === "verify.repro_repair") && p.code) {
     parts.push(`<div class="kv"><span class="k">repro.py</span><span class="v"></span></div><pre>${html(p.code)}</pre>`);
   }
   // Sandbox run output tails.

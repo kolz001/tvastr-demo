@@ -117,6 +117,23 @@ _SYSTEM = (
     "If actual source of the suspected files is shown, use ONLY APIs that appear "
     "in it; do not invent constructor parameters. Respond with ONLY Python source "
     "- no prose, no markdown fences."
+    " The issue's integration and its dependencies are installed in the run "
+    "sandbox: import and construct the REAL classes named in the traceback "
+    "(response/SDK objects) rather than defining fake/stub classes for external "
+    "library types — fakes (e.g. supporting [] but not dict()) won't match real "
+    "behavior and will break under the fix."
+)
+
+_REPAIR_SYSTEM = (
+    "You are fixing a REPRODUCER that failed in its OWN code, not in the library "
+    "under test — so it is untrustworthy. The issue's integration package and its "
+    "dependencies ARE installed in the run sandbox. Import and construct the REAL "
+    "objects named in the traceback (e.g. `from ollama import GenerateResponse`); "
+    "do NOT define fake/stub classes for external library types — fakes don't match "
+    "real behavior (e.g. a hand-rolled response that supports `[]` but not `dict()`). "
+    "Keep the same reproducer KIND. The FIRST line must be '# tvastr-kind: behavioral' "
+    "or '# tvastr-kind: crash'; if behavioral, end with the success marker. Respond "
+    "with ONLY Python source — no prose, no fences."
 )
 
 
@@ -294,3 +311,41 @@ def synthesize_reproducer(
         expected_exception=pattern.exception_type,
         kind=kind,
     )
+
+
+def repair_reproducer(
+    repro: Reproducer,
+    evidence: dict,
+    pattern: FailurePattern,
+    root_cause: RootCause,
+    router: HybridRouter,
+) -> Reproducer:
+    """Re-synthesize a reproducer that failed in its own scaffolding, using the
+    real installed deps. Returns the original ``repro`` on any error."""
+    error = str(evidence.get("rerun_stderr_tail") or evidence.get("hint") or "")
+    expected = repro.expected_exception or pattern.exception_type or "(unknown)"
+    prompt = (
+        f"The issue: {pattern.title}\nExpected symptom: {expected}\n"
+        f"Root cause: {root_cause.summary}\n\n"
+        f"This reproducer FAILED in its own code (not the library under test):\n"
+        f"```\n{repro.code}\n```\n\n"
+        f"The real error from running it:\n{error[:1500]}\n\n"
+        f"Rewrite it to use the REAL installed objects and reproduce the actual symptom."
+    )
+    try:
+        response, _ = router.run(
+            TaskType.FIX_GENERATION, prompt, sensitivity=pattern.sensitivity,
+            system=_REPAIR_SYSTEM,
+        )
+        code = _strip_fences(response.text)
+        if not code.strip():
+            return repro
+        return Reproducer(
+            source=ReproducerSource.CLAUDE,
+            code=code,
+            expected_exception=pattern.exception_type,
+            kind=_parse_kind(code),
+        )
+    except Exception as exc:
+        log.warning("verify.repro.repair_failed", error=str(exc))
+        return repro

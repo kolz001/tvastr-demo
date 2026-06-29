@@ -207,6 +207,7 @@ def _run_in_thread(
         run_id=run_id,
         provision_deps=settings.verify_provision_deps,
         source_overlay=settings.verify_source_overlay,
+        repro_repair=settings.verify_repro_repair,
     )
 
     def _exec() -> None:
