@@ -25,6 +25,7 @@ os.environ["TVASTR_DRY_RUN"] = "false"
 # would make the verify sandbox pip-install over the network during tests.
 os.environ["TVASTR_VERIFY_PROVISION_DEPS"] = "false"
 os.environ["TVASTR_VERIFY_SOURCE_OVERLAY"] = "false"
+os.environ["TVASTR_VERIFY_REPRO_REPAIR"] = "false"
 # Clear any token-shaped values from ``.env`` so live-path code refuses to fire.
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["GITHUB_TOKEN"] = ""

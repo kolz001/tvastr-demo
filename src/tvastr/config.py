@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     # fixing PR's changed files (fetched at the buggy commit) so the baseline
     # reproduces and the rerun yields a real verdict. Off in tests.
     verify_source_overlay: bool = True
+    # When true, a verify cycle that comes back REPRO_BROKEN (the reproducer broke
+    # in its own scaffolding, e.g. a hand-rolled fake of an SDK object) is retried
+    # with a reproducer repaired against the real installed deps. Off in tests.
+    verify_repro_repair: bool = True
 
 
 @lru_cache

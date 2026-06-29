@@ -805,3 +805,50 @@ def test_fail_fast_register_greens_via_behavior(monkeypatch: object) -> None:
     )
     assert out.verdict == Verdict.VERIFIED_VIA_BEHAVIOR
     assert out.oracle == "behavior"
+
+
+# ─── Repair-loop tests ────────────────────────────────────────────────────────
+
+
+def test_repro_broken_triggers_repair_then_verifies() -> None:
+    # cycle 1: baseline reproduces (exit 1), rerun non-zero w/o original → REPRO_BROKEN
+    # → repair → cycle 2: baseline reproduces, rerun exit 0 → VERIFIED_VIA_REPRODUCER
+    sandbox = _FakeSandbox([
+        RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),  # c1 baseline
+        RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),  # c1 rerun → REPRO_BROKEN
+        RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),  # c2 baseline
+        RunResult(exit_code=0, stdout="ok", stderr=""),                        # c2 rerun → VERIFIED
+    ])
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(), sandbox, event_sink=sink, repro_repair=True)
+    out = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert out.verdict == Verdict.VERIFIED_VIA_REPRODUCER
+    assert any(e.type == "verify.repro_repair" for e in sink.events)
+
+
+def test_repro_repair_off_returns_repro_broken_once() -> None:
+    sandbox = _FakeSandbox([
+        RunResult(exit_code=1, stdout="", stderr="ModuleNotFoundError: foo"),
+        RunResult(exit_code=1, stdout="", stderr="KeyError: 0"),
+    ])
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(), sandbox, event_sink=sink, repro_repair=False)
+    out = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert out.verdict == Verdict.REPRO_BROKEN
+    assert not any(e.type == "verify.repro_repair" for e in sink.events)
+
+
+def test_repro_repair_budget_exhausted_returns_repro_broken() -> None:
+    # every cycle REPRO_BROKEN → after _MAX_REPRO_REPAIR repairs, return REPRO_BROKEN
+    _rb = RunResult(exit_code=1, stdout="", stderr="KeyError: 0")
+    sandbox = _FakeSandbox([
+        RunResult(exit_code=1, stdout="", stderr="x"), _rb,
+        RunResult(exit_code=1, stdout="", stderr="x"), _rb,
+        RunResult(exit_code=1, stdout="", stderr="x"), _rb,
+    ])
+    sink = ListEventSink()
+    verifier = Verifier(_ctx(), sandbox, event_sink=sink, repro_repair=True)
+    out = verifier.verify(_pattern(), _root_cause(), _fix(), [_event()], issue_body=None)
+    assert out.verdict == Verdict.REPRO_BROKEN
+    repairs = [e for e in sink.events if e.type == "verify.repro_repair"]
+    assert len(repairs) == 2  # _MAX_REPRO_REPAIR

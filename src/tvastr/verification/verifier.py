@@ -24,6 +24,7 @@ from pathlib import Path
 
 from tvastr.agent.context import AgentContext
 from tvastr.agent.tools.code_retrieval import format_code_for_prompt, retrieve_code_files
+from tvastr.config import get_settings
 from tvastr.domain import FailurePattern, FileChange, FixProposal, FixRegister, LogEvent, RootCause
 from tvastr.events import EventSink, NullEventSink, PipelineEvent
 from tvastr.logging import get_logger
@@ -36,13 +37,14 @@ from tvastr.verification.models import (
     VerificationResult,
 )
 from tvastr.verification.regression import discover_scoped_tests, run_scoped_tests
-from tvastr.verification.repro import synthesize_reproducer
+from tvastr.verification.repro import repair_reproducer, synthesize_reproducer
 from tvastr.verification.sandbox import Sandbox, distribution_for_path, installed_module_path
 
 log = get_logger(__name__)
 
 
 _TAIL_LINES = 60
+_MAX_REPRO_REPAIR = 2
 
 
 def _tail(text: str, lines: int = _TAIL_LINES) -> str:
@@ -82,6 +84,7 @@ class Verifier:
         run_id: str | None = None,
         provision_deps: bool = True,
         source_overlay: bool = True,
+        repro_repair: bool | None = None,
     ) -> None:
         self.ctx = ctx
         self.sandbox = sandbox
@@ -90,6 +93,10 @@ class Verifier:
         self.run_id = run_id
         self.provision_deps = provision_deps
         self.source_overlay = source_overlay
+        # When None, read from settings (sealed false in tests via conftest env).
+        self.repro_repair = (
+            repro_repair if repro_repair is not None else get_settings().verify_repro_repair
+        )
 
     def _emit(self, type_: str, step: str, payload: dict | None = None) -> None:
         self.sink.emit(
@@ -338,11 +345,11 @@ class Verifier:
                 {"reason": "documentation-only fix; no behavioral oracle applies"},
             )
 
-        # 1. Reproducer. Source for the suspected files is supplied lazily —
-        # synthesize_reproducer only resolves it on the Claude path, so issues
-        # whose body already carries a runnable block skip the retrieval. When
-        # Claude does synthesize, seeing the real APIs (constructor params,
-        # method names) stops it hallucinating parameters that don't exist.
+        # Source for the suspected files is supplied lazily — synthesize_reproducer
+        # only resolves it on the Claude path, so issues whose body already carries
+        # a runnable block skip the retrieval. When Claude does synthesize, seeing
+        # the real APIs (constructor params, method names) stops it hallucinating
+        # parameters that don't exist.
         def _code_context() -> str:
             try:
                 if root_cause.suspected_files:
@@ -354,35 +361,10 @@ class Verifier:
                 log.warning("verify.code_context.failed", error=str(exc))
             return ""
 
-        try:
-            repro: Reproducer = synthesize_reproducer(
-                pattern,
-                root_cause,
-                sample_events,
-                issue_body,
-                self.ctx.router,
-                code_context=_code_context,
-                register=fix.register,
-            )
-        except Exception as exc:
-            return self._fail(
-                Verdict.ENVIRONMENTAL_ERROR,
-                "none",
-                started,
-                {"stage": "repro_synth", "error": str(exc)},
-            )
-        self._emit(
-            "verify.repro_synth",
-            "verify",
-            {"source": repro.source.value, "code": repro.code,
-             "expected_exception": repro.expected_exception,
-             "register": fix.register.value},
-        )
-
-        # 2/3. Sandbox + baseline
+        # 2/3. Sandbox + provision
         handle = self.sandbox.prepare()
         try:
-            # 2a. Provision the issue's integration package(s) so the reproducer
+            # Provision the issue's integration package(s) so the reproducer
             # can locate real source and the patch-applier can resolve the
             # module. Never fatal: a miss degrades to the existing no-repro path.
             if self.provision_deps:
@@ -409,10 +391,58 @@ class Verifier:
                 except Exception as exc:  # provisioning must never abort verify
                     log.warning("verify.provision.error", error=str(exc))
 
-            outcome = self._run_cycle(handle, repro, fix, pr_number, pr_files)
-            return self._finish(
-                handle, outcome.verdict, outcome.oracle, started, outcome.evidence
+            # Synthesize AFTER provisioning so the reproducer (and any repair)
+            # runs against the real installed deps.
+            try:
+                repro: Reproducer = synthesize_reproducer(
+                    pattern,
+                    root_cause,
+                    sample_events,
+                    issue_body,
+                    self.ctx.router,
+                    code_context=_code_context,
+                    register=fix.register,
+                )
+            except Exception as exc:
+                return self._finish(
+                    handle,
+                    Verdict.ENVIRONMENTAL_ERROR,
+                    "none",
+                    started,
+                    {"stage": "repro_synth", "error": str(exc)},
+                )
+            self._emit(
+                "verify.repro_synth",
+                "verify",
+                {
+                    "source": repro.source.value,
+                    "code": repro.code,
+                    "expected_exception": repro.expected_exception,
+                    "register": fix.register.value,
+                },
             )
+
+            for attempt in range(_MAX_REPRO_REPAIR + 1):
+                outcome = self._run_cycle(handle, repro, fix, pr_number, pr_files)
+                if (
+                    outcome.verdict != Verdict.REPRO_BROKEN
+                    or not self.repro_repair
+                    or attempt == _MAX_REPRO_REPAIR
+                ):
+                    return self._finish(
+                        handle, outcome.verdict, outcome.oracle, started, outcome.evidence
+                    )
+                self._emit(
+                    "verify.repro_repair",
+                    "verify",
+                    {
+                        "attempt": attempt + 1,
+                        "error_tail": outcome.evidence.get("rerun_stderr_tail", ""),
+                    },
+                )
+                repro = repair_reproducer(
+                    repro, outcome.evidence, pattern, root_cause, self.ctx.router
+                )
         finally:
             handle.discard()
 
