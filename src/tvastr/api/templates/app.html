@@ -148,6 +148,10 @@
   .story .row.err .val{color:var(--error)}
   .story .chip{display:inline-block;font:600 10px var(--mono);padding:1px 6px;border-radius:3px;border:1px solid var(--border);color:var(--text-dim);margin-left:6px}
   .story .gloss{display:block;color:var(--text-dim);margin-top:2px}
+  /* Chapter dividers in the timeline */
+  .chapter{margin:14px 2px 8px;padding:6px 2px 0;font:600 12px var(--sans);color:var(--text);letter-spacing:.01em;border-top:1px solid var(--border)}
+  .chapter .n{color:var(--text-dim);font:600 11px var(--mono);margin-right:6px}
+  .chapter.sub{font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-top:1px dashed var(--border)}
 </style>
 </head>
 <body>
@@ -289,6 +293,7 @@ let verifyAttempts = 0;
 function resetStory() {
   storyEvidence = {};
   verifyAttempts = 0;
+  seenChapters = new Set();
   const old = $("story-card");
   if (old) old.remove();
   const card = document.createElement("div");
@@ -394,6 +399,34 @@ function updateStory(event, cardEl) {
       break;
     }
   }
+}
+
+// ── Chapter dividers ─────────────────────────────────────────────────────────
+// The first event of each chapter inserts a plain-English divider. First-match
+// by chapter order, once each; once a later chapter has started, earlier
+// chapters are sealed (llm./router./tool. events recur during later stages and
+// must not re-trigger "Investigating the cause").
+const CHAPTERS = [
+  { title: "Reading the failure",        prefixes: ["ingest.", "detect.", "threshold."] },
+  { title: "Investigating the cause",    prefixes: ["agent.", "tool.", "retrieval.", "doc.", "router.", "llm."] },
+  { title: "Writing the fix",            prefixes: ["fix.", "pr."] },
+  { title: "Comparing to the human fix", prefixes: ["benchmark."] },
+  { title: "Proving it in a sandbox",    prefixes: ["verify."] },
+];
+let seenChapters = new Set();
+
+function maybeInsertDivider(event) {
+  let idx = -1;
+  for (let i = 0; i < CHAPTERS.length; i++) {
+    if (CHAPTERS[i].prefixes.some(pre => event.type.startsWith(pre))) { idx = i; break; }
+  }
+  if (idx === -1 || seenChapters.has(idx)) return;
+  if ([...seenChapters].some(s => s > idx)) return;  // sealed: a later chapter already started
+  seenChapters.add(idx);
+  const d = document.createElement("div");
+  d.className = "chapter";
+  d.innerHTML = `<span class="n">${idx + 1}.</span>${html(CHAPTERS[idx].title)}`;
+  $("pipeline").appendChild(d);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -720,6 +753,7 @@ function appendEvent(event) {
   const isVerify = VERIFY_TYPES.has(event.type);
   const chip = isVerify ? `<span class="verify-chip">verify</span>` : "";
 
+  maybeInsertDivider(event);
   const card = document.createElement("div");
   card.className = `event layer-${layer}`;
   let extraHead = "";
@@ -788,7 +822,7 @@ function showVerifyCTA(runId, opts) {
 
 function appendVerifyAttemptDivider(n) {
   const d = document.createElement("div");
-  d.style.cssText = "margin:10px 14px 4px;padding:4px 10px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-top:1px dashed var(--border)";
+  d.className = "chapter sub";
   d.textContent = `Verification attempt ${n}`;
   $("pipeline").appendChild(d);
 }
