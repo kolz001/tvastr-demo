@@ -242,6 +242,25 @@ const VERDICT_BADGE = {
   environmental_error:    { kind:"yellow", label:"env error" },
 };
 
+// One honest plain-English sentence per verdict — used in the run story card,
+// the verify.result card body, and as tooltips on verdict badges. Static and
+// deterministic on purpose: it says only what the events prove.
+const VERDICT_GLOSS = {
+  verified_via_reproducer:   "Reproduced the failure on the buggy code, applied the agent's fix, re-ran — the failure is gone.",
+  verified_via_scoped_tests: "The repository's own tests, scoped to the changed files, pass with the fix applied.",
+  verified_via_behavior:     "A behavioral check confirmed the fixed code now returns the expected result.",
+  verified_via_warning:      "The reproducer confirmed the intended warning now fires.",
+  verified_via_better_error: "The reproducer confirmed the clearer error message now raises.",
+  masks_symptom:             "The exception went away but the behavioral check still fails — the symptom is masked, not fixed.",
+  unverified_smoke_import_only: "Only an import smoke test ran — no evidence the fix addresses the issue.",
+  unverified_doc_only:       "Documentation-only fix — there is no runtime behavior to verify.",
+  repro_broken:              "The test script itself broke, so it can't be trusted as evidence either way.",
+  no_repro:                  "Couldn't reproduce the bug in the sandbox, so the fix is unproven — an honest 'no evidence', not a failure.",
+  still_broken:              "The original failure still occurs with the fix applied.",
+  regression:                "The fix resolves the failure but breaks existing repository tests.",
+  environmental_error:       "The sandbox itself failed (timeout, network, Docker) — no verdict on the fix.",
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tab switching
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,6 +733,11 @@ function renderBody(event) {
   const p = event.payload || {};
   const parts = [];
 
+  // Verdict gloss: the plain-English meaning of the verdict, above the raw kvs.
+  if (event.type === "verify.result" && VERDICT_GLOSS[p.verdict]) {
+    parts.push(`<div class="kv"><span class="k">meaning</span><span class="v">${html(VERDICT_GLOSS[p.verdict])}</span></div>`);
+  }
+
   // Routing decisions: render a colored badge.
   if (event.type === "router.decide") {
     parts.push(`<div class="kv"><span class="k">target</span><span class="v"><span class="route ${p.target}">${p.target}</span></span></div>`);
@@ -777,7 +801,7 @@ async function loadRuns() {
       <thead><tr><th>Started</th><th>Repo</th><th>Issue</th><th>Outcome</th><th>Verified?</th><th>Events</th><th>Run ID</th></tr></thead>
       <tbody>${runs.map(r => {
         const v = r.verdict ? (VERDICT_BADGE[r.verdict] || { kind:"yellow", label:r.verdict }) : null;
-        const vCell = v ? `<span class="verdict ${v.kind}">${html(v.label)}</span>` : "—";
+        const vCell = v ? `<span class="verdict ${v.kind}" title="${html(VERDICT_GLOSS[r.verdict] || "")}">${html(v.label)}</span>` : "—";
         return `
         <tr data-run="${r.run_id}">
           <td>${html((r.started_at||"").replace("T"," ").split(".")[0])}</td>
