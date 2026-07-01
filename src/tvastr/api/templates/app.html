@@ -233,7 +233,6 @@ const $ = (id) => document.getElementById(id);
 const html = (s) => s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 let selectedIssue = null;
-let activeEventSource = null;
 let currentRunId = null;
 let runHasFix = false;
 const STAGES = ["ingest","cluster","threshold","investigate","ground_root_cause","confidence_gate","generate_fix","compare_to_pr","draft_pr","open_pr","notify","audit"];
@@ -289,8 +288,12 @@ const STORY_SLOTS = [
 ];
 let storyEvidence = {};   // slot key → the event card element that is its evidence
 let verifyAttempts = 0;
+let runGen = 0;   // bumped on every resetStory() — lets stale stream loops (a verify
+                  // stream from a prior run, or a superseded replay) detect they've
+                  // been superseded and stop touching shared state.
 
 function resetStory() {
+  runGen++;
   storyEvidence = {};
   verifyAttempts = 0;
   seenChapters = new Set();
@@ -346,7 +349,7 @@ function updateStory(event, cardEl) {
       break;
     case "agent.node.start":
       // The confidence gate annotates the diagnosis row (act/skip vs threshold).
-      if (event.step === "confidence_gate" && p.confidence != null) {
+      if (event.step === "confidence_gate" && p.confidence != null && p.threshold != null) {
         const row = $("story-card").querySelector('.row[data-slot="diagnosis"]');
         if (row && !row.classList.contains("pending")) {
           const cmp = p.decision === "act" ? "≥" : "<";
@@ -389,12 +392,21 @@ function updateStory(event, cardEl) {
       break;
     case "error": {
       // Mark the row for the stage in flight: verify errors hit the verify row;
-      // otherwise the earliest still-pending agent-side row.
+      // ingestion/fetch errors hit the issue row (these are almost always
+      // errors before an issue could even be summarized); otherwise the
+      // earliest still-pending agent-side row. If nothing is pending, leave
+      // the card alone — the error is still visible in the timeline.
       const story = $("story-card");
-      const slot = event.step === "verify"
-        ? "verify"
-        : (["diagnosis", "fix", "benchmark"].find(s =>
-            story.querySelector(`.row[data-slot="${s}"]`)?.classList.contains("pending")) || "fix");
+      let slot;
+      if (event.step === "verify") {
+        slot = "verify";
+      } else if (event.layer === "ingestion" || event.step === "fetch") {
+        slot = "issue";
+      } else {
+        slot = ["diagnosis", "fix", "benchmark"].find(s =>
+          story.querySelector(`.row[data-slot="${s}"]`)?.classList.contains("pending"));
+      }
+      if (!slot) break;
       setStoryRow(slot, html(`${p.error || "error"}: ${p.message || p.reason || ""}`), cardEl, "err");
       break;
     }
@@ -603,12 +615,12 @@ async function analyzePr(repo, number, btn, out) {
 // Run pipeline via SSE
 // ─────────────────────────────────────────────────────────────────────────────
 async function runPipeline(req) {
-  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
   currentRunId = null;
   runHasFix = false;
 
   $("pipeline").innerHTML = "";
   resetStory();
+  const gen = runGen;
   $("stage-strip").style.display = "flex";
   $("stage-strip").innerHTML = STAGES.map(s =>
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
@@ -639,8 +651,16 @@ async function runPipeline(req) {
   const decoder = new TextDecoder();
   let buf = "";
   while (true) {
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     const { value, done } = await reader.read();
     if (done) break;
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     buf += decoder.decode(value, { stream: true });
     // SSE: events separated by blank lines (\n\n)
     let idx;
@@ -828,6 +848,7 @@ function appendVerifyAttemptDivider(n) {
 }
 
 async function streamVerify(runId, attempt) {
+  const gen = runGen;
   if (attempt && attempt > 1) appendVerifyAttemptDivider(attempt);
   let resp;
   try {
@@ -851,8 +872,16 @@ async function streamVerify(runId, attempt) {
   let buf = "";
   let lastVerdict = null;
   while (true) {
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     const { value, done } = await reader.read();
     if (done) break;
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     buf += decoder.decode(value, { stream: true });
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -869,6 +898,10 @@ async function streamVerify(runId, attempt) {
       } catch {}
     }
   }
+
+  // A newer run/replay has started since this stream began — don't touch its
+  // story card, CTA, or stage strip with this stale stream's outcome.
+  if (gen !== runGen) return;
 
   // Post-stream: decide whether to re-enable the verify CTA.
   // "Green" verdicts (reproducer / scoped tests) keep the button locked — the
