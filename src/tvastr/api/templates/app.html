@@ -137,6 +137,17 @@
   .pr-verdict.yes{color:#4ade80}.pr-verdict.no{color:#f87171}
   .pr-verdict.partial,.pr-verdict.unknown{color:#fbbf24}
   .pr-slot{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:2px}
+  /* Run story card — pinned sibling ABOVE the scrolling #pipeline */
+  .story{border-bottom:1px solid var(--border);background:var(--surface-2)}
+  .story .story-head{padding:6px 14px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
+  .story .row{display:flex;gap:10px;padding:6px 14px;border-top:1px solid var(--border);font-size:12.5px;line-height:1.45;cursor:pointer}
+  .story .row:hover{background:var(--surface-3)}
+  .story .row .slot{flex:0 0 96px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;padding-top:2px}
+  .story .row .val{flex:1;min-width:0}
+  .story .row.pending .val{color:var(--text-dim)}
+  .story .row.err .val{color:var(--error)}
+  .story .chip{display:inline-block;font:600 10px var(--mono);padding:1px 6px;border-radius:3px;border:1px solid var(--border);color:var(--text-dim);margin-left:6px}
+  .story .gloss{display:block;color:var(--text-dim);margin-top:2px}
 </style>
 </head>
 <body>
@@ -260,6 +271,130 @@ const VERDICT_GLOSS = {
   regression:                "The fix resolves the failure but breaks existing repository tests.",
   environmental_error:       "The sandbox itself failed (timeout, network, Docker) — no verdict on the fix.",
 };
+
+// ── Run story card ───────────────────────────────────────────────────────────
+// Deterministic at-a-glance summary, derived 1:1 from the event stream. Every
+// filled row records its source event card; clicking the row jumps to and
+// expands that card — every claim is one click from its raw evidence.
+const STORY_SLOTS = [
+  { key: "issue",     label: "Issue",         pending: "…" },
+  { key: "diagnosis", label: "Diagnosis",     pending: "…" },
+  { key: "fix",       label: "Fix",           pending: "…" },
+  { key: "verify",    label: "Verified?",     pending: "not yet verified" },
+  { key: "benchmark", label: "vs. human fix", pending: "…" },
+];
+let storyEvidence = {};   // slot key → the event card element that is its evidence
+let verifyAttempts = 0;
+
+function resetStory() {
+  storyEvidence = {};
+  verifyAttempts = 0;
+  const old = $("story-card");
+  if (old) old.remove();
+  const card = document.createElement("div");
+  card.id = "story-card";
+  card.className = "story";
+  card.innerHTML =
+    `<div class="story-head">Run story — click a row to jump to its evidence</div>` +
+    STORY_SLOTS.map(s =>
+      `<div class="row pending" data-slot="${s.key}">` +
+      `<span class="slot">${s.label}</span>` +
+      `<span class="val">${s.pending}</span>` +
+      `</div>`).join("");
+  card.addEventListener("click", (e) => {
+    const row = e.target.closest(".row");
+    if (!row) return;
+    const target = storyEvidence[row.dataset.slot];
+    if (!target) return;
+    target.classList.add("expanded");
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+  $("pipeline").parentElement.insertBefore(card, $("pipeline"));
+}
+
+function setStoryRow(slot, valHtml, evidence, cls) {
+  const story = $("story-card");
+  if (!story) return;
+  const row = story.querySelector(`.row[data-slot="${slot}"]`);
+  if (!row) return;
+  row.classList.remove("pending", "err");
+  if (cls) row.classList.add(cls);
+  row.querySelector(".val").innerHTML = valHtml;
+  if (evidence) storyEvidence[slot] = evidence;
+}
+
+function updateStory(event, cardEl) {
+  if (!$("story-card")) return;
+  const p = event.payload || {};
+  switch (event.type) {
+    case "pipeline.start":
+      setStoryRow("issue",
+        `${html(p.repo || "—")} #${html(String(p.issue_number ?? "?"))} — ${html(p.issue_title || "")}`,
+        cardEl);
+      break;
+    case "agent.node.end":
+      if (event.step === "investigate") {
+        const conf = p.confidence != null
+          ? `<span class="chip">confidence ${Number(p.confidence).toFixed(2)}</span>` : "";
+        setStoryRow("diagnosis", `${html(p.summary || "—")}${conf}`, cardEl);
+      }
+      break;
+    case "agent.node.start":
+      // The confidence gate annotates the diagnosis row (act/skip vs threshold).
+      if (event.step === "confidence_gate" && p.confidence != null) {
+        const row = $("story-card").querySelector('.row[data-slot="diagnosis"]');
+        if (row && !row.classList.contains("pending")) {
+          const cmp = p.decision === "act" ? "≥" : "<";
+          const label = p.decision === "act" ? "acting" : "skipped";
+          row.querySelector(".val").innerHTML +=
+            `<span class="chip">${Number(p.confidence).toFixed(2)} ${cmp} ${Number(p.threshold).toFixed(2)} → ${label}</span>`;
+        }
+      }
+      break;
+    case "fix.generated":
+      setStoryRow("fix",
+        `${(p.files || []).length} file(s) · ${html(p.register || "—")} — ${html(p.summary || "")}`,
+        cardEl);
+      break;
+    case "verify.result": {
+      verifyAttempts++;
+      const meta = VERDICT_BADGE[p.verdict] || { kind: "yellow", label: p.verdict || "?" };
+      const gloss = VERDICT_GLOSS[p.verdict];
+      setStoryRow("verify",
+        `${verifyAttempts > 1 ? `<span class="chip">attempt ${verifyAttempts}</span> ` : ""}` +
+        `<span class="verdict ${meta.kind}">${html(meta.label)}</span>` +
+        (gloss ? `<span class="gloss">${html(gloss)}</span>` : ""),
+        cardEl);
+      break;
+    }
+    case "benchmark.compared": {
+      const kind = { match: "green", partial: "yellow", divergent: "red" }[p.verdict] || "yellow";
+      const both = (p.files_both || []).length;
+      const theirs = (p.files_theirs_only || []).length;
+      setStoryRow("benchmark",
+        `<span class="verdict ${kind}">${html(p.verdict || "?")}</span>` +
+        `<span class="gloss">${p.same_root_cause ? "Same root cause as" : "Different root cause from"} ` +
+        `the human fix (PR #${html(String(p.pr_number ?? "?"))}) · files overlap ${both}/${both + theirs}</span>`,
+        cardEl);
+      break;
+    }
+    case "benchmark.skipped":
+      setStoryRow("benchmark",
+        `<span class="gloss">not compared — ${html(p.reason || "no upstream PR")}</span>`, cardEl);
+      break;
+    case "error": {
+      // Mark the row for the stage in flight: verify errors hit the verify row;
+      // otherwise the earliest still-pending agent-side row.
+      const story = $("story-card");
+      const slot = event.step === "verify"
+        ? "verify"
+        : (["diagnosis", "fix", "benchmark"].find(s =>
+            story.querySelector(`.row[data-slot="${s}"]`)?.classList.contains("pending")) || "fix");
+      setStoryRow(slot, html(`${p.error || "error"}: ${p.message || p.reason || ""}`), cardEl, "err");
+      break;
+    }
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tab switching
@@ -440,6 +575,7 @@ async function runPipeline(req) {
   runHasFix = false;
 
   $("pipeline").innerHTML = "";
+  resetStory();
   $("stage-strip").style.display = "flex";
   $("stage-strip").innerHTML = STAGES.map(s =>
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
@@ -606,6 +742,7 @@ function appendEvent(event) {
   `;
   card.querySelector(".head").addEventListener("click", () => card.classList.toggle("expanded"));
   $("pipeline").appendChild(card);
+  updateStory(event, card);
 
   // Once the agent's PR is captured (dry-run sentinel), offer to verify.
   if (event.type === "pr.dry_run" && currentRunId && runHasFix) {
@@ -824,6 +961,7 @@ async function replayRun(runId) {
   // Jump to triage tab so the user sees the pipeline pane.
   document.querySelector('.tab[data-tab="triage"]').click();
   $("pipeline").innerHTML = "";
+  resetStory();
   $("stage-strip").style.display = "flex";
   $("stage-strip").innerHTML = STAGES.map(s =>
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
