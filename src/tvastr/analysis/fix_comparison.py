@@ -10,17 +10,13 @@ from dataclasses import dataclass
 
 from tvastr.analysis._jsonutil import extract_json
 from tvastr.analysis.pr_discovery import PrDiff, PullRequestRef
+from tvastr.analysis.prompts import FIX_COMPARISON_SYSTEM
 from tvastr.domain import FixProposal, RoutingDecision, Sensitivity
 from tvastr.llm.router import TaskType
 from tvastr.logging import get_logger
 
 log = get_logger(__name__)
 
-_SYSTEM = (
-    "You compare an autonomous agent's proposed fix against a human maintainer's "
-    "pull request for the same bug. Judge whether they target the same root cause "
-    "and are functionally equivalent. Respond ONLY with JSON."
-)
 _SCHEMA_HINT = (
     'Return JSON: {"verdict": "match"|"partial"|"divergent", '
     '"same_root_cause": true|false, '
@@ -77,7 +73,10 @@ def compare_fix_to_pr(
         f"human_only={files_theirs_only}\n\n{_SCHEMA_HINT}"
     )
     response, decision = router.run(
-        TaskType.FIX_COMPARISON, prompt, sensitivity=Sensitivity.INTERNAL, system=_SYSTEM
+        TaskType.FIX_COMPARISON,
+        prompt,
+        sensitivity=Sensitivity.INTERNAL,
+        system=FIX_COMPARISON_SYSTEM,
     )
     parsed = extract_json(response.text)
     if parsed is None:

@@ -25,10 +25,15 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from tvastr.agent.context import AgentContext
+from tvastr.agent.prompts import (
+    DOC_GROUNDING_SYSTEM,
+    INVESTIGATE_SYSTEM,
+    PROBE_SYSTEM,
+    build_grounding_prompt,
+    build_probe_prompt,
+)
 from tvastr.agent.retrieval import extract_issue_files
 from tvastr.agent.sdk_schema import (
-    PROBE_SYSTEM,
-    build_probe_prompt,
     extract_schema_snippets,
     fetch_sdk,
     format_schema_block,
@@ -54,10 +59,6 @@ from tvastr.logging import get_logger
 
 log = get_logger(__name__)
 
-_DOC_GROUNDING_SYSTEM = (
-    "You validate a bug diagnosis against authoritative external documentation."
-)
-
 
 def _append_routing(state: AgentState, decision: RoutingDecision) -> list[RoutingDecision]:
     return [*state.get("routing", []), decision]
@@ -65,26 +66,6 @@ def _append_routing(state: AgentState, decision: RoutingDecision) -> list[Routin
 
 _MAX_CONTEXT_FILES = 12  # cap on accumulated code_files
 _MAX_INVESTIGATE_ROUNDS = 4
-
-_INVESTIGATE_SYSTEM = (
-    "You are a senior engineer debugging a reported bug by reading the codebase. "
-    "Follow this method strictly:\n"
-    "1. ROOT CAUSE FIRST: do not conclude until you have READ the actual code that "
-    "proves the cause; if you have not, keep investigating or report low confidence.\n"
-    "2. VERIFY THE REPORTER'S HYPOTHESIS: identify the real symptom AND any cause the "
-    "reporter guessed, and treat the guess as a hypothesis to confirm against the code, "
-    "not as fact.\n"
-    "3. CROSS-REFERENCE: compare related/sibling code paths (read vs write vs delete) and "
-    "look for the inconsistency that explains the bug.\n"
-    "4. CITE EVIDENCE: your root_cause must reference specific file:line; set confidence by "
-    "how well-corroborated it is; do not guess.\n\n"
-    "Respond with ONLY JSON. To investigate further:\n"
-    '{"thought": "...", "actions": [{"search": "terms"}, {"read_file": "path"}, '
-    '{"list_dir": "dir"}]}\n'
-    "When you have a proven root cause:\n"
-    '{"root_cause": "2-4 sentences citing file:line", "suspected_files": ["path"], '
-    '"confidence": 0.0-1.0, "done": true}'
-)
 
 
 def _clamp_confidence(value: object) -> float:
@@ -184,7 +165,7 @@ class RemediationAgent:
             try:
                 response, decision = self.ctx.router.run(
                     TaskType.ROOT_CAUSE, prompt,
-                    sensitivity=pattern.sensitivity, system=_INVESTIGATE_SYSTEM,
+                    sensitivity=pattern.sensitivity, system=INVESTIGATE_SYSTEM,
                 )
             except Exception as exc:
                 log.warning("agent.investigate.llm_failed", error=str(exc))
@@ -293,7 +274,7 @@ class RemediationAgent:
         try:
             response, decision = self.ctx.router.run(
                 TaskType.ROOT_CAUSE, prompt,
-                sensitivity=pattern.sensitivity, system=_INVESTIGATE_SYSTEM,
+                sensitivity=pattern.sensitivity, system=INVESTIGATE_SYSTEM,
             )
         except Exception as exc:
             log.warning("agent.investigate.final_synthesis_failed", error=str(exc))
@@ -334,38 +315,15 @@ class RemediationAgent:
         schema_block = ""
         if self.ctx.sdk_schema_grounding:
             schema_block = self._sdk_schema_evidence(pattern, root_cause, state)
-        # With SDK definitions in hand, force an explicit field-name diff:
-        # #19293 showed the model can hold the rename evidence in its prompt
-        # and still anchor on its prior story unless told to compare names.
-        crosscheck = (
-            "FIRST, cross-check field names: list each attribute or key the "
-            "suspect code reads from the third-party library's objects, and "
-            "check each one against the SDK type definitions above. If a "
-            "field the code reads is missing there but the definitions carry "
-            "a similarly-named field (a rename, e.g. old vs new API "
-            "versions), that mismatch is the most likely root cause — name "
-            "both fields explicitly in your summary.\n\n"
-            if schema_block
-            else ""
-        )
-        prompt = (
-            f"Failure: {pattern.title}\n"
-            f"Current diagnosis: {root_cause.summary}\n\n"
-            + (f"{schema_block}\n\n" if schema_block else "")
-            + f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
-            + crosscheck
-            + "Validate this diagnosis against authoritative external documentation. "
-            "Use web_search ONLY if the root cause depends on third-party API/library "
-            "behavior (e.g. a renamed field or changed return shape in a dependency). "
-            "Return ONLY the corrected root-cause summary in 2-4 sentences; if the "
-            "original was correct, restate it concisely."
+        prompt = build_grounding_prompt(
+            pattern.title, root_cause.summary, schema_block, state.get("code_context") or ""
         )
         try:
             response, decision = self.ctx.router.run(
                 TaskType.DOC_GROUNDING,
                 prompt,
                 sensitivity=pattern.sensitivity,
-                system=_DOC_GROUNDING_SYSTEM,
+                system=DOC_GROUNDING_SYSTEM,
                 web_search=True,
             )
         except Exception as exc:  # never crash the run

@@ -7,17 +7,13 @@ from dataclasses import dataclass
 
 from tvastr.analysis._jsonutil import extract_json
 from tvastr.analysis.pr_discovery import PrDiff, PullRequestRef
+from tvastr.analysis.prompts import PR_ANALYSIS_SYSTEM
 from tvastr.domain import RoutingDecision, Sensitivity
 from tvastr.llm.router import TaskType
 from tvastr.logging import get_logger
 
 log = get_logger(__name__)
 
-_SYSTEM = (
-    "You are a senior engineer triaging open-source bugs. Given an issue and a "
-    "candidate pull request's diff, assess whether the PR addresses the issue. "
-    "Respond ONLY with JSON matching the requested schema."
-)
 _SCHEMA_HINT = (
     'Return JSON: {"addresses_issue": "yes"|"partial"|"no", '
     '"approach_summary": "<=3 sentences", "key_files": ["path", ...], '
@@ -61,7 +57,7 @@ def analyze_pr(
         f"DIFF:\n{_diff_blob(pr_diff)}\n\n{_SCHEMA_HINT}"
     )
     response, decision = router.run(
-        TaskType.PR_ANALYSIS, prompt, sensitivity=Sensitivity.INTERNAL, system=_SYSTEM
+        TaskType.PR_ANALYSIS, prompt, sensitivity=Sensitivity.INTERNAL, system=PR_ANALYSIS_SYSTEM
     )
     parsed = extract_json(response.text)
     if parsed is None:

@@ -18,6 +18,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from tvastr.agent.prompts import PROBE_SYSTEM as PROBE_SYSTEM
+from tvastr.agent.prompts import build_probe_prompt as build_probe_prompt
 from tvastr.analysis._jsonutil import extract_all_json
 from tvastr.logging import get_logger
 
@@ -27,12 +29,6 @@ _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+!*-]{0,63}$")
 _MAX_KEYWORDS = 4
 _PIP_TIMEOUT_S = 120
-
-PROBE_SYSTEM = (
-    "You decide whether validating a bug diagnosis requires inspecting a "
-    "third-party Python library's type definitions, and if so which pip "
-    "package defines them. Reply with ONLY one JSON object, no prose."
-)
 
 
 @dataclass(frozen=True)
@@ -46,24 +42,6 @@ class SchemaProbe:
 class Snippet:
     path: str
     text: str
-
-
-def build_probe_prompt(
-    title: str, summary: str, suspected_files: list[str], issue_snippet: str
-) -> str:
-    return (
-        f"Failure: {title}\n"
-        f"Current diagnosis: {summary}\n"
-        f"Suspected repository files: {', '.join(suspected_files) or '(none)'}\n\n"
-        f"Issue excerpt:\n{issue_snippet[:1500]}\n\n"
-        "Does validating this diagnosis depend on the exact shape of a "
-        "third-party (pip-installable) library's objects — response types, "
-        "field names, enums? Answer with ONLY this JSON:\n"
-        '{"relevant": <bool>, "package": "<pip distribution defining those '
-        'types, e.g. google-genai>", "version_hint": "<that package\'s version '
-        'if the issue states one, else null>", "keywords": ["2-4 class/field '
-        'names to locate, e.g. usage_metadata"]}'
-    )
 
 
 def parse_probe(text: str) -> SchemaProbe | None:
