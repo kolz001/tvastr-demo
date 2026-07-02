@@ -1,17 +1,23 @@
-"""POST /api/run — pick an issue, stream the pipeline live via SSE.
+"""POST /api/run — pick an issue, start the pipeline as a background job.
+
+The POST responds ``202 {"run_id": ...}`` immediately; it never waits on the
+pipeline. The pipeline runs in a daemon thread that appends events to
+``data/runs/<run_id>.jsonl`` via a ``JsonlEventSink`` — the JSONL file is the
+single source of truth for a run's history.
+
+``GET /api/runs/{run_id}/stream`` attaches to that run: it replays whatever is
+already on disk, then (if the run's thread is still alive) tails the file for
+new lines, polling until a terminal event or thread death. One endpoint
+serves live attach, mid-run re-attach after a client drop, and pure replay of
+a finished run — the client can't tell the difference and doesn't need to.
 
 Also exposes ``GET /api/runs`` (list persisted runs) and
-``GET /api/runs/{run_id}`` (replay the persisted event stream as JSON or SSE).
-
-Each event is published to a fan-out sink: an in-process Queue feeds the SSE
-generator for the live UI, and a JsonlEventSink writes ``data/runs/<run_id>.jsonl``
-so the run is browsable later.
+``GET /api/runs/{run_id}`` (fetch the persisted event stream as JSON or SSE).
 """
 
 from __future__ import annotations
 
 import asyncio
-import queue
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import asdict
@@ -24,10 +30,11 @@ from pydantic import BaseModel, Field
 from tvastr.config import get_settings
 from tvastr.events import (
     EventSink,
-    FanoutEventSink,
     JsonlEventSink,
     PipelineEvent,
+    _parse_event_line,
     default_runs_dir,
+    is_terminal_event,
     list_runs,
     load_events,
     new_run_id,
@@ -47,23 +54,15 @@ log = get_logger(__name__)
 
 router = APIRouter(tags=["run"])
 
-_END_SENTINEL = object()
+# Live pipeline threads by run_id. Entries remove themselves when the thread
+# finishes, so "in the dict and alive" ⇔ the run is still producing events.
+_IN_FLIGHT: dict[str, threading.Thread] = {}
 
 
 class RunRequest(BaseModel):
     repo: str = Field(default="run-llama/llama_index")
     issue_number: int
     dry_run: bool = True  # safe default — never opens a real PR from the UI without opt-in
-
-
-class _QueueEventSink:
-    """Adapts an in-process Queue to the EventSink protocol."""
-
-    def __init__(self, q: queue.Queue[object]) -> None:
-        self.q = q
-
-    def emit(self, event: PipelineEvent) -> None:
-        self.q.put(event)
 
 
 def _fetch_issue(
@@ -110,9 +109,8 @@ def _start_pipeline_thread(
     dry_run: bool,
     sink: EventSink,
     run_id: str,
-    q: queue.Queue[object],
 ) -> threading.Thread:
-    """Run the pipeline in a background thread; emit events onto ``q`` via ``sink``."""
+    """Run the pipeline in a background thread, persisting events via ``sink``."""
     settings = get_settings().model_copy(update={"dry_run": dry_run} if dry_run else {})
 
     def _run() -> None:
@@ -185,9 +183,10 @@ def _start_pipeline_thread(
                 )
             )
         finally:
-            q.put(_END_SENTINEL)
+            _IN_FLIGHT.pop(run_id, None)
 
     t = threading.Thread(target=_run, daemon=True, name=f"tvastr-run-{run_id}")
+    _IN_FLIGHT[run_id] = t
     t.start()
     return t
 
@@ -196,8 +195,13 @@ def _event_to_sse(event: PipelineEvent) -> str:
     return f"event: {event.type}\ndata: {event.to_json()}\n\n"
 
 
-@router.post("/api/run")
-async def run_pipeline(request: RunRequest) -> StreamingResponse:
+@router.post("/api/run", status_code=202)
+async def run_pipeline(request: RunRequest) -> JSONResponse:
+    """Start a pipeline run and return its id immediately.
+
+    The run executes in a background thread writing data/runs/<id>.jsonl;
+    attach to it (live or after the fact) via GET /api/runs/{id}/stream.
+    """
     settings = get_settings()
     issue = _fetch_issue(
         request.repo,
@@ -205,41 +209,60 @@ async def run_pipeline(request: RunRequest) -> StreamingResponse:
         use_mocks=settings.use_mocks,
         token=settings.github_token,
     )
-
     run_id = new_run_id()
-    q: queue.Queue[object] = queue.Queue()
-    file_sink = JsonlEventSink(run_path(run_id))
-    queue_sink = _QueueEventSink(q)
-    fanout = FanoutEventSink(queue_sink, file_sink)
-
     _start_pipeline_thread(
         request.repo,
         issue,
         dry_run=request.dry_run,
-        sink=fanout,
+        sink=JsonlEventSink(run_path(run_id)),
         run_id=run_id,
-        q=q,
     )
+    return JSONResponse({"run_id": run_id}, status_code=202)
+
+
+_TAIL_POLL_S = 0.25
+
+
+@router.get("/api/runs/{run_id}/stream")
+async def stream_run(run_id: str) -> StreamingResponse:
+    """Replay a run's events, then tail while its thread is alive.
+
+    One endpoint for live attach, mid-run re-attach, and replay: reads the
+    persisted JSONL (single source of truth) instead of coupling to the
+    producing request.
+    """
+    path = run_path(run_id)
+    if not path.exists():
+        raise HTTPException(404, f"run {run_id!r} not found")
 
     async def event_stream() -> AsyncIterator[str]:
-        # The pipeline's own pipeline.start (emitted via the sink) carries the
-        # run_id in its payload, so the client gets it from the first streamed
-        # event — no separate synthetic opener needed. This keeps the live
-        # stream identical to the persisted/replayed one.
-        loop = asyncio.get_event_loop()
+        offset = 0
+        saw_terminal = False
         while True:
-            item = await loop.run_in_executor(None, q.get)
-            if item is _END_SENTINEL:
+            text = path.read_text(encoding="utf-8")
+            chunk, offset = text[offset:], len(text)
+            for line in chunk.splitlines():
+                if not line.strip():
+                    continue
+                event = _parse_event_line(line)
+                if event is None:
+                    log.warning("run.stream.bad_line", run_id=run_id)
+                    continue
+                yield _event_to_sse(event)
+                if is_terminal_event(event):
+                    saw_terminal = True
+            thread = _IN_FLIGHT.get(run_id)
+            if saw_terminal or thread is None or not thread.is_alive():
                 break
-            assert isinstance(item, PipelineEvent)
-            yield _event_to_sse(item)
+            await asyncio.sleep(_TAIL_POLL_S)
+        yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering if behind a proxy
+            "X-Accel-Buffering": "no",
             "X-Tvastr-Run-Id": run_id,
         },
     )

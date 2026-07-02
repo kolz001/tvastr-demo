@@ -10,7 +10,9 @@ from fastapi.responses import HTMLResponse
 from tvastr import __version__
 from tvastr.api.routes import health, issues, pr, remediate, run, verify
 from tvastr.config import get_settings
-from tvastr.logging import configure_logging
+from tvastr.logging import configure_logging, get_logger
+
+log = get_logger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -33,6 +35,15 @@ def create_app() -> FastAPI:
     app.include_router(remediate.router)
     app.include_router(run.router)
     app.include_router(verify.router)
+
+    from tvastr.api.routes.run import _IN_FLIGHT
+    from tvastr.events import default_runs_dir, mark_interrupted_runs
+
+    runs_dir = default_runs_dir()
+    if runs_dir.is_dir():
+        marked = mark_interrupted_runs(runs_dir, _IN_FLIGHT)
+        if marked:
+            log.info("app.sweep.marked_interrupted", count=marked)
 
     @app.get("/app", response_class=HTMLResponse, include_in_schema=False)
     def _app_page() -> HTMLResponse:
