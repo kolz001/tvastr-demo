@@ -39,7 +39,7 @@ from tvastr.agent.tools import (
 )
 from tvastr.analysis._jsonutil import extract_all_json
 from tvastr.analysis.fix_comparison import compare_fix_to_pr
-from tvastr.domain import PullRequestDraft, RootCause, RoutingDecision
+from tvastr.domain import FailurePattern, PullRequestDraft, RootCause, RoutingDecision
 from tvastr.events import PipelineEvent
 from tvastr.llm.router import TaskType
 from tvastr.logging import get_logger
@@ -229,6 +229,15 @@ class RemediationAgent:
                 except Exception as exc:  # a tool failure must not abort the run
                     log.warning("agent.investigate.action_failed", action=act, error=str(exc))
                     continue
+        else:
+            # Round budget exhausted without convergence (#19293: the model was
+            # still requesting files one round at a time). Force one final
+            # tool-less synthesis over everything gathered — including files
+            # fetched in the last round, which the model has not seen yet —
+            # instead of discarding the evidence.
+            root_cause = self._final_synthesis(
+                pattern, issue_body, code_files, transcript, decisions
+            )
 
         if root_cause is None:
             root_cause = RootCause(
@@ -249,6 +258,50 @@ class RemediationAgent:
             "code_context": format_code_for_prompt(code_files),
             "routing": [*routing, *decisions],
         }
+
+    def _final_synthesis(
+        self,
+        pattern: FailurePattern,
+        issue_body: str,
+        code_files: dict[str, str],
+        transcript: list[str],
+        decisions: list[RoutingDecision],
+    ) -> RootCause | None:
+        """One forced, tool-less root-cause call after the round budget is spent.
+
+        Returns None (caller falls back to the honest confidence-0.0 result)
+        when the call fails or still produces no root_cause.
+        """
+        prompt = (
+            f"Issue: {pattern.title}\n\n{issue_body[:4000]}\n\n"
+            f"Code read so far:\n{format_code_for_prompt(code_files) or '(none)'}\n\n"
+            f"Tool results so far:\n{chr(10).join(transcript) or '(none)'}\n\n"
+            "Your investigation budget is exhausted — no more tools. Based only "
+            "on the evidence above, give your final JSON now with root_cause, "
+            "suspected_files, and an honest confidence (low if genuinely unproven)."
+        )
+        self._emit("tool.call", "investigate.final_synthesis",
+                   reason="round budget exhausted", files_read=len(code_files))
+        try:
+            response, decision = self.ctx.router.run(
+                TaskType.ROOT_CAUSE, prompt,
+                sensitivity=pattern.sensitivity, system=_INVESTIGATE_SYSTEM,
+            )
+        except Exception as exc:
+            log.warning("agent.investigate.final_synthesis_failed", error=str(exc))
+            return None
+        decisions.append(decision)
+        parsed = _parse_investigation(response.text)
+        if not parsed.get("root_cause"):
+            return None
+        return RootCause(
+            pattern_id=pattern.id,
+            summary=str(parsed["root_cause"]),
+            suspected_files=[str(p) for p in (parsed.get("suspected_files") or [])]
+            or list(code_files),
+            confidence=_clamp_confidence(parsed.get("confidence", 0.5)),
+            reasoning=response.text,
+        )
 
     def _confidence_gate(self, state: AgentState) -> str:
         root_cause = state.get("root_cause")

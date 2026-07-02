@@ -157,12 +157,74 @@ def test_investigate_converges_on_root_cause_without_done():
 
 def test_investigate_hard_cap_returns_low_confidence():
     host = _FakeHost()
-    # always returns actions, never done -> hit the cap -> insufficient evidence
+    # always returns actions, never done -> hit the cap -> one forced final
+    # synthesis; that too yields actions (no root_cause) -> insufficient evidence
     router = _SeqRouter(['{"thought":"x","actions":[{"search":"q"}]}'] * 10)
     agent = _agent(host, router)
     out = agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
     assert out["root_cause"].confidence == 0.0
-    assert router.calls == 4  # _MAX_INVESTIGATE_ROUNDS
+    assert router.calls == 5  # _MAX_INVESTIGATE_ROUNDS + forced final synthesis
+
+
+def test_investigate_budget_exhausted_forces_final_synthesis():
+    """Regression for #19293: the model read one file per round, said it had a
+    strong lead, and the budget ran out one step short — the evidence was
+    discarded for a hardcoded confidence-0.0 fallback. On exhaustion the agent
+    must make ONE final tool-less call over the accumulated evidence and accept
+    its root_cause."""
+    host = _FakeHost(files={"a.py": "x", "b.py": "y", "c.py": "z", "d.py": "TOKEN_SOURCE"})
+    router = _SeqRouter([
+        '{"thought":"reading","actions":[{"read_file":"a.py"}]}',
+        '{"thought":"reading","actions":[{"read_file":"b.py"}]}',
+        '{"thought":"reading","actions":[{"read_file":"c.py"}]}',
+        '{"thought":"strong lead","actions":[{"read_file":"d.py"}]}',
+        '{"root_cause":"token counts dropped in d.py","suspected_files":["d.py"],'
+        '"confidence":0.85}',
+    ])
+    agent = _agent(host, router)
+    out = agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
+    assert router.calls == 5  # 4 rounds + forced synthesis
+    assert out["root_cause"].confidence == 0.85
+    assert out["root_cause"].summary == "token counts dropped in d.py"
+    # round 4's read was fetched and must be visible to the final call
+    assert "d.py" in out["code_files"]
+
+
+def test_investigate_final_synthesis_sees_last_round_evidence():
+    """The forced synthesis prompt must include files fetched in the LAST round
+    (the #19293 shape: base.py was read in round 4 but never shown to the model)."""
+    prompts = []
+
+    class _CapRouter(_SeqRouter):
+        def run(self, task, prompt, *, sensitivity=Sensitivity.INTERNAL, system=None):
+            prompts.append(prompt)
+            return super().run(task, prompt, sensitivity=sensitivity, system=system)
+
+    host = _FakeHost(files={"late.py": "LATE-EVIDENCE"})
+    router = _CapRouter(
+        ['{"thought":"x","actions":[{"search":"q"}]}'] * 3
+        + ['{"thought":"x","actions":[{"read_file":"late.py"}]}',
+           '{"root_cause":"rc","confidence":0.6}']
+    )
+    agent = _agent(host, router)
+    agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
+    assert "LATE-EVIDENCE" in prompts[-1]
+    assert "no more tools" in prompts[-1].lower() or "budget" in prompts[-1].lower()
+
+
+def test_investigate_final_synthesis_failure_keeps_fallback():
+    """If the forced synthesis call itself raises, degrade to the honest
+    confidence-0.0 fallback (never crash)."""
+    class _LastCallBoomRouter(_SeqRouter):
+        def run(self, task, prompt, *, sensitivity=Sensitivity.INTERNAL, system=None):
+            if not self._responses:
+                raise RuntimeError("llm down")
+            return super().run(task, prompt, sensitivity=sensitivity, system=system)
+
+    router = _LastCallBoomRouter(['{"thought":"x","actions":[{"search":"q"}]}'] * 4)
+    agent = _agent(_FakeHost(), router)
+    out = agent._investigate({"pattern": _pattern(), "sample_events": [], "issue_body": "b"})
+    assert out["root_cause"].confidence == 0.0
 
 
 def test_investigate_unparseable_finishes_low_confidence():
