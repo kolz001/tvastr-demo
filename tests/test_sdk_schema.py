@@ -61,6 +61,21 @@ def test_parse_probe_merges_multiple_json_objects():
     assert probe is not None and probe.package == "p"
 
 
+def test_parse_probe_first_relevant_object_not_clobbered_by_trailing_json():
+    # The issue excerpt is attacker-controlled and can contain a JSON blob
+    # that the model echoes back verbatim; merging every object in the
+    # response together would let a trailing `{"package": "evil-pkg"}` win
+    # over the model's own probe object. Only the first object that carries
+    # a "relevant" key should be used.
+    text = (
+        '{"relevant": true, "package": "google-genai", "keywords": ["k"]}\n'
+        'Issue excerpt echoed back: {"package": "evil-pkg"}'
+    )
+    probe = parse_probe(text)
+    assert probe is not None
+    assert probe.package == "google-genai"
+
+
 def test_parse_probe_rejects_path_traversal_version_hint():
     # version_hint is LLM-controlled and feeds a pip --target path; a
     # traversal-shaped hint must be dropped, not passed through, but the
@@ -156,6 +171,71 @@ def test_extract_caps_snippets_and_lines(tmp_path):
         assert s.text.splitlines()[-1].strip() == "..."
 
 
+def test_extract_skips_tests_dirs_and_round_robins_by_keyword(tmp_path):
+    # Reproduces the empirical google-genai 2.10.0 failure shape:
+    #  - a tests/ dir ships a huge fixture class that would otherwise eat a
+    #    snippet slot (and whose match may not survive truncation anyway).
+    #  - the real package file has SIX classes that match the common keyword
+    #    ("usage_metadata") before the ACTUAL evidence class (7th block in
+    #    the file), which only matches the rare keyword
+    #    ("candidates_token_count"). A naive first-N-overall walk never
+    #    reaches it because the 6 common matches already fill the quota.
+    root = tmp_path / "r"
+    root.mkdir()
+
+    tests_dir = root / "tests"
+    tests_dir.mkdir()
+    filler = "\n".join(f"    filler_{i} = {i}" for i in range(60))
+    (tests_dir / "traps.py").write_text(
+        "class HugeTestFixtureUsage:\n"
+        "    usage_metadata = 1\n"
+        f"{filler}\n"
+        "    candidates_token_count = 1\n"  # past the 40-line truncation window
+    )
+
+    pkg = root / "google" / "genai"
+    pkg.mkdir(parents=True)
+    unrelated = "\n\n".join(
+        f"class UnrelatedUsage{i}:\n    usage_metadata = 1" for i in range(1, 7)
+    )
+    (pkg / "types.py").write_text(
+        unrelated + "\n\n\n"
+        "class UsageMetadata:\n"
+        "    candidates_token_count: int | None = None\n"
+        "    response_token_count: int | None = None\n"
+    )
+
+    snips = extract_schema_snippets(root, ["usage_metadata", "candidates_token_count"])
+
+    assert any("response_token_count" in s.text for s in snips), (
+        "rare-keyword evidence class must survive the round-robin budget"
+    )
+    assert not any("tests" in Path(s.path).parts for s in snips), (
+        "tests/ dir files must never be scanned"
+    )
+    assert all(
+        any(k in s.text for k in ("usage_metadata", "candidates_token_count"))
+        for s in snips
+    ), "every emitted snippet must retain a keyword after truncation"
+
+
+def test_extract_drops_block_whose_keyword_is_truncated_away(tmp_path):
+    root = tmp_path / "r"
+    root.mkdir()
+    filler = "\n".join(f"    filler_{i} = {i}" for i in range(60))
+    (root / "m.py").write_text(
+        "class EarlyMatch:\n    keyword_hit = 1\n\n\n"
+        "class LateMatch:\n"
+        f"{filler}\n"
+        "    keyword_hit = 1\n"  # past the 40-line truncation window
+    )
+    snips = extract_schema_snippets(root, ["keyword_hit"])
+    texts = {s.text.splitlines()[0] for s in snips}
+    assert "class EarlyMatch:" in texts
+    assert "class LateMatch:" not in texts
+    assert all("keyword_hit" in s.text for s in snips)
+
+
 # --- fetch_sdk (subprocess mocked; cache behavior real) ---
 
 def test_fetch_sdk_builds_wheels_only_pip_argv(tmp_path, monkeypatch):
@@ -205,7 +285,7 @@ def test_fetch_sdk_retries_without_failing_pin(tmp_path, monkeypatch):
 
 
 def test_fetch_sdk_cache_hit_skips_pip(tmp_path, monkeypatch):
-    hit = tmp_path / "google-genai-1.2.0"
+    hit = tmp_path / "google-genai@1.2.0"
     (hit / "pkg").mkdir(parents=True)
 
     def boom(*a, **k):
@@ -270,7 +350,7 @@ def test_fetch_sdk_purges_partial_cache_on_failure(tmp_path, monkeypatch):
         return R()
 
     monkeypatch.setattr("tvastr.agent.sdk_schema.subprocess.run", fake_run)
-    target = tmp_path / "google-genai-1.2.0"
+    target = tmp_path / "google-genai@1.2.0"
     out = fetch_sdk("google-genai", "1.2.0", cache_root=tmp_path)
     assert out is None
     assert len(calls) == 2  # pinned attempt + unpinned retry, both failed
@@ -279,6 +359,40 @@ def test_fetch_sdk_purges_partial_cache_on_failure(tmp_path, monkeypatch):
     calls.clear()
     fetch_sdk("google-genai", "1.2.0", cache_root=tmp_path)
     assert len(calls) == 2  # re-invoked pip; no false cache hit from partial dir
+
+
+def test_fetch_sdk_pin_fallback_caches_under_latest_not_pin(tmp_path, monkeypatch):
+    # I1/M2: a failed pinned attempt must not poison — or be confused with —
+    # the unpinned cache slot. The `@` separator keeps the two cache keys
+    # unambiguous even when the package name itself contains a hyphen.
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        pinned = any("==" in a for a in argv)
+
+        class R:
+            returncode = 1 if pinned else 0
+            stderr = b"no matching distribution" if pinned else b""
+        if R.returncode == 0:
+            t = Path(argv[argv.index("--target") + 1])
+            t.mkdir(parents=True, exist_ok=True)
+            (t / "pkg").mkdir(exist_ok=True)
+        return R()
+
+    monkeypatch.setattr("tvastr.agent.sdk_schema.subprocess.run", fake_run)
+    out = fetch_sdk("google-genai", "1.2.0", cache_root=tmp_path)
+    assert out == tmp_path / "google-genai@latest"
+    assert not (tmp_path / "google-genai@1.2.0").exists()
+
+    # A later call pinning the same (previously-failing) version must not
+    # get a false cache hit from the fallback dir — the pinned attempt is
+    # re-run through pip (and still fails; the unpinned slot is a real hit).
+    calls.clear()
+    out2 = fetch_sdk("google-genai", "1.2.0", cache_root=tmp_path)
+    assert len(calls) == 1  # pinned attempt re-invoked pip, not a false hit
+    assert any("google-genai==1.2.0" in a for a in calls[0])
+    assert out2 == tmp_path / "google-genai@latest"  # falls back to the real cache hit
 
 
 # --- prompt + block formatting ---

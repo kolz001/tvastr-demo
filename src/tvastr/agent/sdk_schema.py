@@ -67,23 +67,28 @@ def build_probe_prompt(
 
 
 def parse_probe(text: str) -> SchemaProbe | None:
-    """Parse + validate the probe response. None ⇔ not relevant or unusable."""
-    merged: dict = {}
-    for obj in extract_all_json(text):
-        merged.update(obj)
-    if not merged.get("relevant"):
+    """Parse + validate the probe response. None ⇔ not relevant or unusable.
+
+    Takes only the FIRST JSON object that carries a "relevant" key, rather
+    than merging every object in the response — the issue excerpt is
+    attacker-controlled and the model may echo it back verbatim, so a
+    trailing object like ``{"package": "evil-pkg"}`` must not be able to
+    clobber the model's own probe object field-by-field.
+    """
+    probe_obj = next((obj for obj in extract_all_json(text) if "relevant" in obj), None)
+    if probe_obj is None or not probe_obj.get("relevant"):
         return None
-    package = str(merged.get("package") or "")
+    package = str(probe_obj.get("package") or "")
     if not _PACKAGE_RE.match(package):
         log.warning("sdk_schema.probe.bad_package", package=package[:120])
         return None
-    raw_keywords = merged.get("keywords") or []
+    raw_keywords = probe_obj.get("keywords") or []
     if not isinstance(raw_keywords, list):
         return None
     keywords = tuple(str(k) for k in raw_keywords if str(k).strip())[:_MAX_KEYWORDS]
     if not keywords:
         return None
-    version = merged.get("version_hint")
+    version = probe_obj.get("version_hint")
     version_hint = _valid_version_hint(str(version)) if version else None
     return SchemaProbe(package=package, version_hint=version_hint, keywords=keywords)
 
@@ -109,18 +114,27 @@ def fetch_sdk(
     """Install the package's published wheel into an isolated cache dir.
 
     Wheels-only (no setup.py execution), no dependencies, list-form argv.
-    Returns the target dir, or None on any failure. A failing version pin is
-    retried once without the pin.
+    Returns the target dir, or None on every attempt failing. A failing
+    version pin is retried once without the pin.
+
+    The cache key is computed PER ATTEMPT — a pinned attempt caches under
+    ``{package}@{version_hint}``, the unpinned fallback under
+    ``{package}@latest`` (the ``@`` separator sits outside both
+    _PACKAGE_RE/_VERSION_RE, so it can't collide with a package name that
+    itself contains a hyphen, e.g. "google" pinned to "genai-latest" vs
+    "google-genai"). This also means a pin that fell back to latest never
+    poisons the cache for a later call that pins the same version: that
+    later call finds no ``{package}@{version_hint}`` dir and re-runs pip.
     """
     if not _PACKAGE_RE.match(package):
         return None
     version_hint = _valid_version_hint(version_hint)
-    target = cache_root / f"{package}-{version_hint or 'latest'}"
-    if target.is_dir() and any(target.iterdir()):
-        return target
-    for spec in dict.fromkeys(
-        [f"{package}=={version_hint}" if version_hint else package, package]
-    ):
+    attempts: list[str | None] = [version_hint, None] if version_hint else [None]
+    for pin in dict.fromkeys(attempts):
+        target = cache_root / f"{package}@{pin or 'latest'}"
+        if target.is_dir() and any(target.iterdir()):
+            return target
+        spec = f"{package}=={pin}" if pin else package
         argv = [
             sys.executable, "-m", "pip", "install",
             "--only-binary=:all:", "--no-deps", "--quiet",
@@ -144,6 +158,7 @@ def fetch_sdk(
 
 
 _CLASS_RE = re.compile(r"^class\s+\w+", re.MULTILINE)
+_SKIP_DIR_PARTS = {"tests", "test", "testing"}
 
 
 def extract_schema_snippets(
@@ -152,12 +167,31 @@ def extract_schema_snippets(
     max_snippets: int = 6,
     max_lines_each: int = 40,
 ) -> list[Snippet]:
-    """Deterministically pull top-level class blocks containing any keyword."""
-    snippets: list[Snippet] = []
+    """Deterministically pull top-level class blocks containing any keyword.
+
+    Wheels ship test suites that can eat snippet slots, so files under a
+    tests/test/testing dir component are skipped entirely. The snippet
+    budget is allocated round-robin PER KEYWORD (rather than first-N over
+    the whole file walk) so a common keyword with many matches can't starve
+    a rare keyword whose class is the actual evidence. A block is dropped
+    if, after truncation to max_lines_each, none of the keywords remain in
+    the emitted text — a match deep inside a huge class is useless once the
+    truncation window cuts it off.
+    """
     files = sorted(list(root.rglob("*.py")) + list(root.rglob("*.pyi")))
+    # One bucket per keyword, in keyword order; a block that matches several
+    # keywords is assigned to the first keyword (in `keywords` order) it
+    # matches, so it is never counted twice.
+    buckets: dict[str, list[Snippet]] = {k: [] for k in keywords}
+    seen_blocks: set[tuple[str, int]] = set()
+
     for f in files:
-        if len(snippets) >= max_snippets:
-            break
+        try:
+            rel = f.relative_to(root)
+        except ValueError:
+            continue
+        if _SKIP_DIR_PARTS & set(rel.parts[:-1]):
+            continue
         try:
             text = f.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -166,16 +200,29 @@ def extract_schema_snippets(
         for i, start in enumerate(starts):
             end = starts[i + 1] if i + 1 < len(starts) else len(text)
             block = text[start:end].rstrip()
-            if not any(k in block for k in keywords):
+            keyword = next((k for k in keywords if k in block), None)
+            if keyword is None or (str(rel), start) in seen_blocks:
                 continue
+            seen_blocks.add((str(rel), start))
             lines = block.splitlines()
             if len(lines) > max_lines_each:
                 lines = [*lines[:max_lines_each], "    ..."]
-            snippets.append(
-                Snippet(path=str(f.relative_to(root)), text="\n".join(lines))
-            )
-            if len(snippets) >= max_snippets:
-                break
+            snippet_text = "\n".join(lines)
+            if not any(k in snippet_text for k in keywords):
+                continue  # keyword match didn't survive truncation
+            buckets[keyword].append(Snippet(path=str(rel), text=snippet_text))
+
+    snippets: list[Snippet] = []
+    round_idx = 0
+    while len(snippets) < max_snippets and any(
+        round_idx < len(buckets[k]) for k in keywords
+    ):
+        for k in keywords:
+            if round_idx < len(buckets[k]):
+                snippets.append(buckets[k][round_idx])
+                if len(snippets) >= max_snippets:
+                    break
+        round_idx += 1
     return snippets
 
 

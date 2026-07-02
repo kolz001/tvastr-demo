@@ -408,19 +408,28 @@ class RemediationAgent:
         probe = parse_probe(response.text)
         if probe is None:
             return _skip("probe: not relevant or unparseable")
-        root = fetch_sdk(probe.package, probe.version_hint)
-        if root is None:
-            return _skip(f"fetch failed: {probe.package}", package=probe.package)
-        snippets = extract_schema_snippets(root, probe.keywords)
-        if not snippets:
-            return _skip("no schema matches", package=probe.package)
+        try:
+            root = fetch_sdk(probe.package, probe.version_hint)
+            if root is None:
+                return _skip(f"fetch failed: {probe.package}", package=probe.package)
+            snippets = extract_schema_snippets(root, probe.keywords)
+            if not snippets:
+                return _skip("no schema matches", package=probe.package)
+            # The cache dir name is the ground truth for what actually got
+            # installed — a pin that fell back to latest must report
+            # "latest", never the version_hint that failed to resolve.
+            version = root.name.split("@", 1)[1]
+            block = format_schema_block(probe.package, snippets)
+        except Exception as exc:  # never let evidence-gathering crash grounding
+            log.warning("agent.sdk_schema.evidence_failed", error=str(exc))
+            return _skip(f"schema evidence error: {exc}")
         self._emit(
             "doc.sdk_schema", "ground_root_cause",
             ok=True, package=probe.package,
-            version=probe.version_hint or "latest",
+            version=version,
             snippets=len(snippets), files=[s.path for s in snippets],
         )
-        return format_schema_block(probe.package, snippets)
+        return block
 
     def _generate_fix(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]

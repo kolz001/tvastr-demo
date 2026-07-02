@@ -152,8 +152,8 @@ def _grounding_state():
             "code_context": "(ctx)", "issue_body": "body"}
 
 
-def _snippet_dir(tmp_path):
-    pkg = tmp_path / "google-genai-latest"
+def _snippet_dir(tmp_path, name="google-genai@latest"):
+    pkg = tmp_path / name
     (pkg / "google").mkdir(parents=True)
     (pkg / "google" / "types.py").write_text(
         "class UsageMetadata:\n    usage_metadata: int\n"
@@ -228,6 +228,46 @@ def test_sdk_schema_success_emits_event(tmp_path, monkeypatch):
     assert len(ev) == 1
     p = ev[0].payload
     assert p["ok"] is True and p["package"] == "google-genai" and p["snippets"] == 1
+    assert p["version"] == "latest"
+
+
+def test_sdk_schema_version_reflects_pin_fallback_not_requested_pin(tmp_path, monkeypatch):
+    # I1/M2 wiring: a pin that fell back must report the dir that actually
+    # got installed ("latest"), never the version_hint that failed to
+    # resolve — fetch_sdk itself returns the "...@latest" dir on fallback.
+    probe_pinned = (
+        '{"relevant": true, "package": "google-genai", "version_hint": "9.9.9",'
+        ' "keywords": ["usage_metadata"]}'
+    )
+    sink = ListEventSink()
+    router = _SeqRouter([probe_pinned, "grounded"])
+    monkeypatch.setattr(
+        "tvastr.agent.graph.fetch_sdk",
+        lambda pkg, ver: _snippet_dir(tmp_path, name="google-genai@latest"),
+    )
+    agent = _agent_with_grounding(router, sdk_schema=True, sink=sink)
+    agent._ground_root_cause(_grounding_state())
+    ev = [e for e in sink.events if e.type == "doc.sdk_schema"]
+    assert len(ev) == 1
+    assert ev[0].payload["version"] == "latest"  # not the failed "9.9.9" pin
+
+
+def test_sdk_schema_evidence_exception_degrades_and_grounding_still_returns(monkeypatch):
+    # M3: fetch/extract/format must never raise out of _ground_root_cause —
+    # the grounding LLM call still runs and doc.sdk_schema reports ok:false.
+    sink = ListEventSink()
+    router = _SeqRouter([_PROBE_YES, "grounded"])
+    monkeypatch.setattr(
+        "tvastr.agent.graph.fetch_sdk",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+    agent = _agent_with_grounding(router, sdk_schema=True, sink=sink)
+    out = agent._ground_root_cause(_grounding_state())
+    assert out["root_cause"].summary == "grounded"
+    ev = [e for e in sink.events if e.type == "doc.sdk_schema"]
+    assert len(ev) == 1
+    assert ev[0].payload["ok"] is False
+    assert "schema evidence error" in ev[0].payload["reason"]
 
 
 def test_flag_off_makes_zero_probe_calls():
