@@ -44,7 +44,9 @@ def create_app() -> FastAPI:
     # liveness signal before any worker can safely run this sweep. Files with
     # zero parseable events are deliberately skipped (mark_interrupted_runs
     # treats "no last event" the same as "nothing to mark terminal/non-terminal
-    # about" — there's no in-progress run to have been interrupted).
+    # about" — there's no in-progress run to have been interrupted). Since the
+    # POST handler now pre-creates the run file before starting its thread, a
+    # crash-before-first-emit also leaves a zero-event file here — same skip.
     if settings.sweep_on_startup:
         runs_dir = default_runs_dir()
         if runs_dir.is_dir():

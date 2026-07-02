@@ -78,6 +78,31 @@ def test_post_run_returns_run_id_promptly() -> None:
     assert elapsed < 5  # mock pipeline may be fast, but we must not block on it
 
 
+# --- POST /api/run pre-creates the run file (no race with an immediate stream) ---
+
+
+def test_post_creates_run_file_before_returning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run file must exist the instant POST returns — not on first emit.
+
+    Otherwise a client that GETs the stream immediately after the 202 (a
+    perfectly normal sequence, not a misuse) can race the pipeline thread to
+    its first event and hit the stream endpoint's ``not path.exists()`` 404
+    for a run that is, in fact, running. We assert existence directly,
+    without ever touching the stream endpoint, so this test can't pass by
+    accident of the stream retrying/waiting.
+    """
+    _redirect_runs_dir(monkeypatch, tmp_path)
+    client = _client()
+    resp = client.post(
+        "/api/run", json={"repo": "run-llama/llama_index", "issue_number": 8001, "dry_run": True}
+    )
+    assert resp.status_code == 202
+    run_id = resp.json()["run_id"]
+    assert (tmp_path / f"{run_id}.jsonl").exists()
+
+
 # --- stream endpoint: replay of a completed run ---
 
 
@@ -253,6 +278,49 @@ def test_stream_recovers_torn_trailing_line(
     run_module._IN_FLIGHT.pop(run_id, None)
     assert text.count("event: detect.cluster") == 1
     assert "event: pipeline.end" in text
+
+
+def test_stream_of_empty_inflight_run_waits_not_404(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-created, still-empty run file must attach cleanly (200), never 404.
+
+    This pins the POST-time state the fix produces: the file exists (zero
+    complete lines) and the run_id is registered in ``_IN_FLIGHT`` before the
+    thread has written anything. The stream must not treat "empty" as
+    "unknown" — it should poll while the thread is alive and drain to
+    ``done`` once a terminal event lands. Kept deterministic (no sleeping on
+    a live writer): the thread is already dead by the time it's registered,
+    and the terminal event is appended before attaching, so there's nothing
+    to race — this pins "empty file + registry entry -> 200, drains to done"
+    without depending on timing.
+    """
+    _redirect_runs_dir(monkeypatch, tmp_path)
+    from tvastr.api.routes import run as run_module
+
+    run_id = "emptyinflight"
+    path = tmp_path / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()  # POST-time state: file created, thread hasn't emitted yet
+    assert path.read_text(encoding="utf-8") == ""
+
+    t = threading.Thread(target=lambda: None)
+    t.start()
+    t.join()
+    assert not t.is_alive()
+    run_module._IN_FLIGHT[run_id] = t
+    JsonlEventSink(path).emit(
+        PipelineEvent(
+            type="pipeline.end", layer="pipeline", step="pipeline", run_id=run_id, payload={}
+        )
+    )
+    client = _client()
+    with client.stream("GET", f"/api/runs/{run_id}/stream") as resp:
+        assert resp.status_code == 200
+        text = "".join(resp.iter_text())
+    run_module._IN_FLIGHT.pop(run_id, None)
+    assert "event: pipeline.end" in text
+    assert text.rstrip().endswith("event: done\ndata: {}")
 
 
 # --- terminal detection + sweep ---

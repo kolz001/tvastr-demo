@@ -210,11 +210,20 @@ async def run_pipeline(request: RunRequest) -> JSONResponse:
         token=settings.github_token,
     )
     run_id = new_run_id()
+    # Create the run file BEFORE starting the pipeline thread, not on first
+    # emit. Otherwise a client that GETs the stream immediately after this
+    # 202 (a perfectly valid, expected sequence) can race the thread to its
+    # first event and hit the stream endpoint's `not path.exists()` 404 for a
+    # run that is, in fact, running. Once this returns, the file provably
+    # exists, so that 404 becomes solely "unknown run id".
+    path = run_path(run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
     _start_pipeline_thread(
         request.repo,
         issue,
         dry_run=request.dry_run,
-        sink=JsonlEventSink(run_path(run_id)),
+        sink=JsonlEventSink(path),
         run_id=run_id,
     )
     return JSONResponse({"run_id": run_id}, status_code=202)

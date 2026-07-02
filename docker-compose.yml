@@ -11,6 +11,7 @@ services:
     env_file: .env
     environment:
       TVASTR_SANDBOX_WORK_ROOT: /app/data/sandbox
+      # ${PWD} is the invoking shell's dir — run `docker compose up` from the repo root.
       TVASTR_SANDBOX_HOST_WORK_ROOT: ${PWD}/data/sandbox
     volumes:
       - ./data:/app/data
