@@ -268,6 +268,7 @@ def build_pipeline(
         and not settings.use_mocks
         and bool(settings.anthropic_api_key),
         issue_era_retrieval=settings.issue_era_retrieval,
+        sdk_schema_grounding=settings.sdk_schema_grounding,
     )
     return RemediationPipeline(
         detector=FailureDetector(),

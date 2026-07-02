@@ -26,6 +26,14 @@ from langgraph.graph import END, START, StateGraph
 
 from tvastr.agent.context import AgentContext
 from tvastr.agent.retrieval import extract_issue_files
+from tvastr.agent.sdk_schema import (
+    PROBE_SYSTEM,
+    build_probe_prompt,
+    extract_schema_snippets,
+    fetch_sdk,
+    format_schema_block,
+    parse_probe,
+)
 from tvastr.agent.state import AgentState
 from tvastr.agent.tools import (
     extract_stack_files,
@@ -323,10 +331,14 @@ class RemediationAgent:
             self._emit("doc.skipped", "ground_root_cause", reason="grounding disabled")
             return {}
         self._emit("agent.node.start", "ground_root_cause", pattern=pattern.fingerprint)
+        schema_block = ""
+        if self.ctx.sdk_schema_grounding:
+            schema_block = self._sdk_schema_evidence(pattern, root_cause, state)
         prompt = (
             f"Failure: {pattern.title}\n"
             f"Current diagnosis: {root_cause.summary}\n\n"
-            f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
+            + (f"{schema_block}\n\n" if schema_block else "")
+            + f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
             "Validate this diagnosis against authoritative external documentation. "
             "Use web_search ONLY if the root cause depends on third-party API/library "
             "behavior (e.g. a renamed field or changed return shape in a dependency). "
@@ -363,6 +375,52 @@ class RemediationAgent:
             "doc_sources": response.sources,
             "routing": _append_routing(state, decision),
         }
+
+    def _sdk_schema_evidence(
+        self, pattern: FailurePattern, root_cause: RootCause, state: AgentState
+    ) -> str:
+        """Probe → fetch → extract → format. Returns "" on every failure rung.
+
+        Emits ``doc.sdk_schema`` in all paths so the timeline shows whether the
+        grounding prompt carried real SDK definitions.
+        """
+
+        def _skip(reason: str, **extra: object) -> str:
+            self._emit("doc.sdk_schema", "ground_root_cause",
+                       ok=False, reason=reason, snippets=0, files=[], **extra)
+            return ""
+
+        try:
+            response, _decision = self.ctx.router.run(
+                TaskType.SCHEMA_PROBE,
+                build_probe_prompt(
+                    pattern.title,
+                    root_cause.summary,
+                    list(root_cause.suspected_files),
+                    state.get("issue_body") or "",
+                ),
+                sensitivity=pattern.sensitivity,
+                system=PROBE_SYSTEM,
+            )
+        except Exception as exc:
+            log.warning("agent.sdk_schema.probe_failed", error=str(exc))
+            return _skip(f"probe error: {exc}")
+        probe = parse_probe(response.text)
+        if probe is None:
+            return _skip("probe: not relevant or unparseable")
+        root = fetch_sdk(probe.package, probe.version_hint)
+        if root is None:
+            return _skip(f"fetch failed: {probe.package}", package=probe.package)
+        snippets = extract_schema_snippets(root, probe.keywords)
+        if not snippets:
+            return _skip("no schema matches", package=probe.package)
+        self._emit(
+            "doc.sdk_schema", "ground_root_cause",
+            ok=True, package=probe.package,
+            version=probe.version_hint or "latest",
+            snippets=len(snippets), files=[s.path for s in snippets],
+        )
+        return format_schema_block(probe.package, snippets)
 
     def _generate_fix(self, state: AgentState) -> AgentState:
         pattern = state["pattern"]

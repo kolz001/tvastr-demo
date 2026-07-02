@@ -42,6 +42,7 @@ class TaskType(StrEnum):
     FIX_COMPARISON = "fix_comparison"
     DOC_GROUNDING = "doc_grounding"
     REPRO_CRITIQUE = "repro_critique"
+    SCHEMA_PROBE = "schema_probe"
 
 
 _LOCAL_TASKS = {TaskType.LOG_PARSING, TaskType.SUMMARIZATION}
