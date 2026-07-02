@@ -61,6 +61,20 @@ def test_parse_probe_merges_multiple_json_objects():
     assert probe is not None and probe.package == "p"
 
 
+def test_parse_probe_rejects_path_traversal_version_hint():
+    # version_hint is LLM-controlled and feeds a pip --target path; a
+    # traversal-shaped hint must be dropped, not passed through, but the
+    # probe itself is still usable (best-effort advisory field).
+    for bad in ("/../../../tmp/pwned", "1.2.0/../x", ".."):
+        text = (
+            '{"relevant": true, "package": "p", "version_hint": "'
+            f'{bad}", "keywords": ["k"]}}'
+        )
+        probe = parse_probe(text)
+        assert probe is not None, bad
+        assert probe.version_hint is None, bad
+
+
 # --- extract_schema_snippets ---
 
 def _fake_pkg(tmp_path: Path) -> Path:
@@ -100,6 +114,32 @@ def test_extract_searches_pyi_files(tmp_path):
 def test_extract_no_match_returns_empty(tmp_path):
     root = _fake_pkg(tmp_path)
     assert extract_schema_snippets(root, ["definitely_absent_zzz"]) == []
+
+
+def test_extract_handles_multiline_class_header(tmp_path):
+    # A black-formatted multi-line class header (`class Long(\n    Base,\n):`)
+    # has no ':' on its `class` line, so a header regex requiring one misses
+    # the boundary and the class's body gets absorbed into the previous
+    # class's block (wrong snippet attribution).
+    root = tmp_path / "r"
+    root.mkdir()
+    (root / "m.py").write_text(
+        "class First:\n"
+        "    only_in_first = 1\n\n\n"
+        "class Long(\n"
+        "    Base,\n"
+        "):\n"
+        "    only_in_long = 2\n"
+    )
+    snips = extract_schema_snippets(root, ["only_in_long"])
+    assert len(snips) == 1
+    assert snips[0].text.startswith("class Long(")
+    assert "only_in_first" not in snips[0].text
+
+    snips_first = extract_schema_snippets(root, ["only_in_first"])
+    assert len(snips_first) == 1
+    assert snips_first[0].text.startswith("class First:")
+    assert "only_in_long" not in snips_first[0].text
 
 
 def test_extract_caps_snippets_and_lines(tmp_path):
@@ -185,6 +225,60 @@ def test_fetch_sdk_pip_failure_returns_none(tmp_path, monkeypatch):
 
     monkeypatch.setattr("tvastr.agent.sdk_schema.subprocess.run", fake_run)
     assert fetch_sdk("google-genai", None, cache_root=tmp_path) is None
+
+
+def test_fetch_sdk_rejects_path_traversal_version_hint(tmp_path, monkeypatch):
+    # An unvalidated version_hint (e.g. from parse_probe callers that don't
+    # go through parse_probe) feeds directly into the --target path; a
+    # traversal-shaped hint must not escape cache_root and must not be
+    # passed to pip as a version pin.
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        t = Path(argv[argv.index("--target") + 1])
+        t.mkdir(parents=True, exist_ok=True)
+        (t / "pkg").mkdir(exist_ok=True)
+
+        class R:
+            returncode = 0
+            stderr = b""
+        return R()
+
+    monkeypatch.setattr("tvastr.agent.sdk_schema.subprocess.run", fake_run)
+    out = fetch_sdk("google-genai", "/../../../tmp/pwned", cache_root=tmp_path)
+    assert out is not None
+    assert out.resolve().is_relative_to(tmp_path.resolve())
+    assert not any("==" in a for a in calls[0])
+
+
+def test_fetch_sdk_purges_partial_cache_on_failure(tmp_path, monkeypatch):
+    # A failed/timed-out pip attempt can leave a partially-written target
+    # dir; the cache check (`is_dir() and any(iterdir())`) must not treat
+    # that as a permanent false cache hit.
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        t = Path(argv[argv.index("--target") + 1])
+        t.mkdir(parents=True, exist_ok=True)
+        (t / "partial.txt").write_text("junk")
+
+        class R:
+            returncode = 1
+            stderr = b"boom"
+        return R()
+
+    monkeypatch.setattr("tvastr.agent.sdk_schema.subprocess.run", fake_run)
+    target = tmp_path / "google-genai-1.2.0"
+    out = fetch_sdk("google-genai", "1.2.0", cache_root=tmp_path)
+    assert out is None
+    assert len(calls) == 2  # pinned attempt + unpinned retry, both failed
+    assert not target.exists()
+
+    calls.clear()
+    fetch_sdk("google-genai", "1.2.0", cache_root=tmp_path)
+    assert len(calls) == 2  # re-invoked pip; no false cache hit from partial dir
 
 
 # --- prompt + block formatting ---

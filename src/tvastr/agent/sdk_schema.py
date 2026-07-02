@@ -11,6 +11,7 @@ Nothing fetched here is ever imported or executed — snippets are text.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ from tvastr.logging import get_logger
 log = get_logger(__name__)
 
 _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+!*-]{0,63}$")
 _MAX_KEYWORDS = 4
 _PIP_TIMEOUT_S = 120
 
@@ -82,8 +84,21 @@ def parse_probe(text: str) -> SchemaProbe | None:
     if not keywords:
         return None
     version = merged.get("version_hint")
-    version_hint = str(version) if version else None
+    version_hint = _valid_version_hint(str(version)) if version else None
     return SchemaProbe(package=package, version_hint=version_hint, keywords=keywords)
+
+
+def _valid_version_hint(version_hint: str | None) -> str | None:
+    """Return version_hint if it looks like a PEP-440-shaped token, else None.
+
+    version_hint is LLM-controlled and feeds a pip `--target` path; an
+    unvalidated value like "/../../../tmp/pwned" could escape cache_root.
+    The hint is best-effort advisory, so an invalid hint degrades to None
+    (fetch latest) rather than rejecting the whole probe/fetch.
+    """
+    if version_hint and _VERSION_RE.match(version_hint):
+        return version_hint
+    return None
 
 
 def fetch_sdk(
@@ -99,6 +114,7 @@ def fetch_sdk(
     """
     if not _PACKAGE_RE.match(package):
         return None
+    version_hint = _valid_version_hint(version_hint)
     target = cache_root / f"{package}-{version_hint or 'latest'}"
     if target.is_dir() and any(target.iterdir()):
         return target
@@ -114,6 +130,7 @@ def fetch_sdk(
             result = subprocess.run(argv, capture_output=True, timeout=_PIP_TIMEOUT_S)
         except Exception as exc:  # timeout, missing pip — degrade, never raise
             log.warning("sdk_schema.fetch.error", package=package, error=str(exc))
+            shutil.rmtree(target, ignore_errors=True)
             return None
         if result.returncode == 0 and target.is_dir() and any(target.iterdir()):
             return target
@@ -122,10 +139,11 @@ def fetch_sdk(
             spec=spec,
             stderr=(result.stderr or b"")[-300:].decode(errors="replace"),
         )
+        shutil.rmtree(target, ignore_errors=True)
     return None
 
 
-_CLASS_RE = re.compile(r"^class\s+\w+.*:", re.MULTILINE)
+_CLASS_RE = re.compile(r"^class\s+\w+", re.MULTILINE)
 
 
 def extract_schema_snippets(
