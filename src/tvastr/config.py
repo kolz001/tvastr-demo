@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     dry_run: bool = False
     log_level: str = "INFO"
     log_json: bool = False
+    # When true (default), create_app() sweeps data/runs on startup, appending
+    # pipeline.interrupted to any non-terminal run file left behind by a
+    # crashed or killed process. Off in tests (sealed in conftest.py) so that
+    # building a TestClient(create_app()) — done by many test modules — never
+    # mutates real run files on disk.
+    sweep_on_startup: bool = True
 
     # --- PII redaction ---
     # When true, the regex redactor is augmented with a local Presidio (spaCy

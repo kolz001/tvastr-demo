@@ -239,9 +239,32 @@ async def stream_run(run_id: str) -> StreamingResponse:
         offset = 0
         saw_terminal = False
         while True:
+            # Snapshot liveness BEFORE reading, not after. If we read first
+            # and check after, a writer that emits its last event(s) and
+            # deregisters in that gap causes us to break having already read
+            # a stale (pre-final-write) copy of the file, silently dropping
+            # those events. Checking first means: when we observe "not
+            # alive", the thread's `finally` (which pops it from
+            # `_IN_FLIGHT`) has already run, which only happens after every
+            # event is written — so the read that follows is guaranteed to
+            # see everything, and it's safe to stop after this pass.
+            thread = _IN_FLIGHT.get(run_id)
+            alive = thread is not None and thread.is_alive()
             text = path.read_text(encoding="utf-8")
-            chunk, offset = text[offset:], len(text)
-            for line in chunk.splitlines():
+            chunk = text[offset:]
+            # Only advance past whole lines. A trailing fragment with no
+            # newline yet is a line still being written; consuming it now
+            # (old behavior) would drop it, since the eventual write of the
+            # rest of the line plus the newline would land past our offset
+            # as two unparseable halves. Leave it for the next poll.
+            last_newline = chunk.rfind("\n")
+            complete, trailing = (
+                (chunk[: last_newline + 1], chunk[last_newline + 1 :])
+                if last_newline != -1
+                else ("", chunk)
+            )
+            offset += len(complete)
+            for line in complete.splitlines():
                 if not line.strip():
                     continue
                 event = _parse_event_line(line)
@@ -251,8 +274,12 @@ async def stream_run(run_id: str) -> StreamingResponse:
                 yield _event_to_sse(event)
                 if is_terminal_event(event):
                     saw_terminal = True
-            thread = _IN_FLIGHT.get(run_id)
-            if saw_terminal or thread is None or not thread.is_alive():
+            if saw_terminal or not alive:
+                # Final drain: the writer is done and will never complete a
+                # dangling trailing fragment. Log once (not a per-poll spam)
+                # and move on rather than looping forever on it.
+                if trailing.strip():
+                    log.warning("run.stream.torn_trailing_line", run_id=run_id)
                 break
             await asyncio.sleep(_TAIL_POLL_S)
         yield "event: done\ndata: {}\n\n"

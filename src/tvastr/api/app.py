@@ -9,7 +9,9 @@ from fastapi.responses import HTMLResponse
 
 from tvastr import __version__
 from tvastr.api.routes import health, issues, pr, remediate, run, verify
+from tvastr.api.routes.run import _IN_FLIGHT
 from tvastr.config import get_settings
+from tvastr.events import default_runs_dir, mark_interrupted_runs
 from tvastr.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -36,14 +38,19 @@ def create_app() -> FastAPI:
     app.include_router(run.router)
     app.include_router(verify.router)
 
-    from tvastr.api.routes.run import _IN_FLIGHT
-    from tvastr.events import default_runs_dir, mark_interrupted_runs
-
-    runs_dir = default_runs_dir()
-    if runs_dir.is_dir():
-        marked = mark_interrupted_runs(runs_dir, _IN_FLIGHT)
-        if marked:
-            log.info("app.sweep.marked_interrupted", count=marked)
+    # Single-process-scoped: liveness is judged against this process's
+    # in-memory _IN_FLIGHT map, so a sibling worker's still-running run would
+    # look "non-terminal" here too — a multi-worker deployment needs a shared
+    # liveness signal before any worker can safely run this sweep. Files with
+    # zero parseable events are deliberately skipped (mark_interrupted_runs
+    # treats "no last event" the same as "nothing to mark terminal/non-terminal
+    # about" — there's no in-progress run to have been interrupted).
+    if settings.sweep_on_startup:
+        runs_dir = default_runs_dir()
+        if runs_dir.is_dir():
+            marked = mark_interrupted_runs(runs_dir, _IN_FLIGHT)
+            if marked:
+                log.info("app.sweep.marked_interrupted", count=marked)
 
     @app.get("/app", response_class=HTMLResponse, include_in_schema=False)
     def _app_page() -> HTMLResponse:

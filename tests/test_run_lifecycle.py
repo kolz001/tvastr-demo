@@ -153,6 +153,108 @@ def test_stream_tails_live_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     run_module._IN_FLIGHT.pop(run_id, None)
 
 
+# --- stream endpoint: liveness-before-read correctness (review Finding 1) ---
+
+
+def test_stream_delivers_final_event_from_dead_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression pin: liveness must be snapshotted BEFORE the read, not after.
+
+    If liveness were checked after read_text (the pre-fix bug), a thread that
+    finishes and deregisters between the read and the check would cause the
+    reader to break without ever re-reading the events it wrote on its way
+    out. Here the thread is already dead (constructed, started, joined) by
+    the time it's registered, and the terminal event is appended only after
+    registration — pinning that a dead-thread observation still guarantees
+    one full, up-to-date read before the stream gives up.
+    """
+    _redirect_runs_dir(monkeypatch, tmp_path)
+    from tvastr.api.routes import run as run_module
+
+    run_id = "deadthread"
+    path = tmp_path / f"{run_id}.jsonl"
+    sink = JsonlEventSink(path)
+    sink.emit(
+        PipelineEvent(
+            type="pipeline.start", layer="pipeline", step="pipeline", run_id=run_id, payload={}
+        )
+    )
+    t = threading.Thread(target=lambda: None)
+    t.start()
+    t.join()
+    assert not t.is_alive()
+    run_module._IN_FLIGHT[run_id] = t
+    sink.emit(
+        PipelineEvent(
+            type="pipeline.end", layer="pipeline", step="pipeline", run_id=run_id, payload={}
+        )
+    )
+    client = _client()
+    with client.stream("GET", f"/api/runs/{run_id}/stream") as resp:
+        text = "".join(resp.iter_text())
+    run_module._IN_FLIGHT.pop(run_id, None)
+    assert text.index("event: pipeline.end") < text.index("event: done")
+
+
+# --- stream endpoint: torn trailing line must not be dropped (review Finding 2) ---
+
+
+def test_stream_recovers_torn_trailing_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A line still being written (no trailing newline yet) must be held back,
+    not consumed-and-dropped, so the event isn't lost when the write completes.
+    """
+    _redirect_runs_dir(monkeypatch, tmp_path)
+    from tvastr.api.routes import run as run_module
+
+    run_id = "torn1"
+    path = tmp_path / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start_event = PipelineEvent(
+        type="pipeline.start", layer="pipeline", step="pipeline", run_id=run_id, payload={}
+    )
+    path.write_text(start_event.to_json() + "\n", encoding="utf-8")
+
+    torn_event = PipelineEvent(
+        type="detect.cluster", layer="detection", step="cluster", run_id=run_id, payload={}
+    )
+    torn_json = torn_event.to_json()
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(torn_json[:-1])  # write everything but the closing brace, no trailing "\n"
+
+    release = threading.Event()
+
+    def _writer() -> None:
+        release.wait(timeout=10)
+        # Complete the torn line, then close out the run.
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(torn_json[-1:] + "\n")
+        JsonlEventSink(path).emit(
+            PipelineEvent(
+                type="pipeline.end", layer="pipeline", step="pipeline", run_id=run_id, payload={}
+            )
+        )
+
+    t = threading.Thread(target=_writer, daemon=True)
+    run_module._IN_FLIGHT[run_id] = t
+    t.start()
+    client = _client()
+    chunks: list[str] = []
+    with client.stream("GET", f"/api/runs/{run_id}/stream") as resp:
+        for c in resp.iter_text():
+            chunks.append(c)
+            if "pipeline.start" in "".join(chunks):
+                release.set()  # let the writer complete the torn line
+            if "event: done" in "".join(chunks):
+                break
+    text = "".join(chunks)
+    run_module._IN_FLIGHT.pop(run_id, None)
+    assert text.count("event: detect.cluster") == 1
+    assert "event: pipeline.end" in text
+
+
 # --- terminal detection + sweep ---
 
 
@@ -185,3 +287,22 @@ def test_sweep_skips_terminal_and_inflight(tmp_path: Path) -> None:
     for rid in ("ok", "err", "flying"):
         last = (tmp_path / f"{rid}.jsonl").read_text().splitlines()[-1]
         assert json.loads(last)["type"] != "pipeline.interrupted"
+
+
+# --- startup sweep gating (review Finding 3) ---
+
+
+def test_create_app_does_not_sweep_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TVASTR_SWEEP_ON_STARTUP=false is sealed in conftest.py; building a
+    TestClient(create_app()) must never touch data/runs. This is what
+    protects the real data/runs directory from the many pre-existing test
+    modules that construct TestClient(create_app()) without redirecting the
+    runs dir.
+    """
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "tvastr.api.app.mark_interrupted_runs",
+        lambda *a, **k: calls.append((a, k)) or 0,
+    )
+    create_app()
+    assert calls == []

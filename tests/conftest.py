@@ -27,6 +27,10 @@ os.environ["TVASTR_DRY_RUN"] = "false"
 os.environ["TVASTR_VERIFY_PROVISION_DEPS"] = "false"
 os.environ["TVASTR_VERIFY_SOURCE_OVERLAY"] = "false"
 os.environ["TVASTR_VERIFY_REPRO_REPAIR"] = "false"
+# Seal the startup sweep off — several pre-existing test modules build
+# TestClient(create_app()) without redirecting the runs dir; unsealed, that
+# would append pipeline.interrupted to real files under data/runs.
+os.environ["TVASTR_SWEEP_ON_STARTUP"] = "false"
 # Clear any token-shaped values from ``.env`` so live-path code refuses to fire.
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["GITHUB_TOKEN"] = ""
