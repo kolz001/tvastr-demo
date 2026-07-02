@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: uv run ruff check src tests
+      - run: uv run pytest -q
+
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t tvastr:ci .
+      - run: |
+          docker run -d --name tvastr-ci -e TVASTR_USE_MOCKS=true -p 18000:8000 tvastr:ci
+          ./scripts/ci-smoke.sh http://localhost:18000
+      - if: always()
+        run: docker logs tvastr-ci || true
