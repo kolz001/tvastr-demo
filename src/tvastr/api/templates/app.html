@@ -408,7 +408,7 @@ function updateStory(event, cardEl) {
           story.querySelector(`.row[data-slot="${s}"]`)?.classList.contains("pending"));
       }
       if (!slot) break;
-      setStoryRow(slot, html(`${p.error || p.reason || "run interrupted"}: ${p.message || p.reason || ""}`), cardEl, "err");
+      setStoryRow(slot, html(`${p.error || p.reason || "run interrupted"}${p.message ? ": " + p.message : ""}`), cardEl, "err");
       break;
     }
   }
