@@ -22,7 +22,8 @@ _SCHEMA_HINT = (
     '"same_root_cause": true|false, '
     '"equivalence": "functionally_equivalent"|"same_goal_different_approach"|'
     '"addresses_different_cause", "rationale": "2-4 sentences", '
-    '"confidence": 0.0-1.0}'
+    '"confidence": 0.0-1.0}. Use EXACTLY these lowercase enum values — '
+    "values like EQUIVALENT, WEAK, or DIFFERENT are invalid."
 )
 _VERDICTS = {"match", "partial", "divergent"}
 _EQUIV = {
@@ -30,6 +31,60 @@ _EQUIV = {
     "same_goal_different_approach",
     "addresses_different_cause",
 }
+
+# The judge model frequently answers in its own vocabulary (EQUIVALENT, WEAK,
+# DIFFERENT, ...) despite the schema hint. 39/44 persisted comparison calls
+# were off-enum; the old code silently coerced ALL of them to the worst bucket
+# — grading judged-EQUIVALENT fixes as divergent. Normalize by meaning instead.
+_VERDICT_ALIASES = {
+    "match": "match", "equivalent": "match", "same": "match",
+    "functionally_equivalent": "match",
+    "partial": "partial", "weak": "partial", "weaker": "partial",
+    "weak_equivalent": "partial", "partial_match": "partial",
+    "divergent": "divergent", "different": "divergent",
+    "not_equivalent": "divergent", "none": "divergent", "reject": "divergent",
+    "incorrect": "divergent", "different_behavior": "divergent",
+}
+_EQUIV_ALIASES = {
+    "functionally_equivalent": "functionally_equivalent",
+    "equivalent": "functionally_equivalent", "match": "functionally_equivalent",
+    "same_goal_different_approach": "same_goal_different_approach",
+    "partial": "same_goal_different_approach", "weak": "same_goal_different_approach",
+    "weaker": "same_goal_different_approach",
+    "weak_equivalent": "same_goal_different_approach",
+    "addresses_different_cause": "addresses_different_cause",
+    "different": "addresses_different_cause",
+    "not_equivalent": "addresses_different_cause", "none": "addresses_different_cause",
+    "reject": "addresses_different_cause", "incorrect": "addresses_different_cause",
+    "different_behavior": "addresses_different_cause",
+}
+_EQUIV_TO_VERDICT = {
+    "functionally_equivalent": "match",
+    "same_goal_different_approach": "partial",
+    "addresses_different_cause": "divergent",
+}
+
+
+def _normalize(raw_verdict: str, raw_equiv: str, same_root_cause: bool) -> tuple[str, str]:
+    """Map the judge's free vocabulary onto the schema enums by meaning.
+
+    Unknown equivalence falls back to what same_root_cause implies; unknown
+    verdict falls back to what the (normalized) equivalence implies.
+    """
+    equiv = _EQUIV_ALIASES.get(raw_equiv)
+    if equiv is None:
+        equiv = (
+            "same_goal_different_approach" if same_root_cause
+            else "addresses_different_cause"
+        )
+    verdict = _VERDICT_ALIASES.get(raw_verdict) or _EQUIV_TO_VERDICT[equiv]
+    if verdict != raw_verdict or equiv != raw_equiv:
+        log.warning(
+            "analysis.compare.normalized",
+            raw_verdict=raw_verdict, raw_equivalence=raw_equiv,
+            verdict=verdict, equivalence=equiv,
+        )
+    return verdict, equiv
 
 
 @dataclass(frozen=True)
@@ -95,20 +150,24 @@ def compare_fix_to_pr(
             decision,
         )
 
-    verdict = str(parsed.get("verdict", "")).lower()
-    equiv = str(parsed.get("equivalence", "")).lower()
+    same_root_cause = bool(parsed.get("same_root_cause", False))
+    verdict, equiv = _normalize(
+        str(parsed.get("verdict", "")).lower(),
+        str(parsed.get("equivalence", "")).lower(),
+        same_root_cause,
+    )
     try:
         confidence = float(parsed.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
     return (
         FixComparison(
-            verdict=verdict if verdict in _VERDICTS else "divergent",
-            same_root_cause=bool(parsed.get("same_root_cause", False)),
+            verdict=verdict,
+            same_root_cause=same_root_cause,
             files_both=files_both,
             files_ours_only=files_ours_only,
             files_theirs_only=files_theirs_only,
-            equivalence=equiv if equiv in _EQUIV else "addresses_different_cause",
+            equivalence=equiv,
             rationale=str(parsed.get("rationale", "")),
             confidence=max(0.0, min(1.0, confidence)),
         ),
