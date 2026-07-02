@@ -4,6 +4,19 @@
 # at http://localhost:11434. Set TVASTR_USE_MOCKS=false to exercise these for real.
 
 services:
+  tvastr:
+    build: .
+    ports:
+      - "8001:8000"   # host 8000 is taken by another local app
+    env_file: .env
+    environment:
+      TVASTR_SANDBOX_WORK_ROOT: /app/data/sandbox
+      TVASTR_SANDBOX_HOST_WORK_ROOT: ${PWD}/data/sandbox
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
   opensearch:
     image: opensearchproject/opensearch:2.17.1
     container_name: tvastr-opensearch
