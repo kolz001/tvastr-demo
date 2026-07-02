@@ -334,12 +334,27 @@ class RemediationAgent:
         schema_block = ""
         if self.ctx.sdk_schema_grounding:
             schema_block = self._sdk_schema_evidence(pattern, root_cause, state)
+        # With SDK definitions in hand, force an explicit field-name diff:
+        # #19293 showed the model can hold the rename evidence in its prompt
+        # and still anchor on its prior story unless told to compare names.
+        crosscheck = (
+            "FIRST, cross-check field names: list each attribute or key the "
+            "suspect code reads from the third-party library's objects, and "
+            "check each one against the SDK type definitions above. If a "
+            "field the code reads is missing there but the definitions carry "
+            "a similarly-named field (a rename, e.g. old vs new API "
+            "versions), that mismatch is the most likely root cause — name "
+            "both fields explicitly in your summary.\n\n"
+            if schema_block
+            else ""
+        )
         prompt = (
             f"Failure: {pattern.title}\n"
             f"Current diagnosis: {root_cause.summary}\n\n"
             + (f"{schema_block}\n\n" if schema_block else "")
             + f"Code context:\n{state.get('code_context') or '(none)'}\n\n"
-            "Validate this diagnosis against authoritative external documentation. "
+            + crosscheck
+            + "Validate this diagnosis against authoritative external documentation. "
             "Use web_search ONLY if the root cause depends on third-party API/library "
             "behavior (e.g. a renamed field or changed return shape in a dependency). "
             "Return ONLY the corrected root-cause summary in 2-4 sentences; if the "

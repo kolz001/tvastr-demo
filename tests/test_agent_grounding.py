@@ -181,6 +181,12 @@ def test_grounding_prompt_enriched_with_sdk_schema(tmp_path, monkeypatch):
     grounding_prompt = prompts[1][1]
     assert "response_token_count" in grounding_prompt
     assert "ground truth" in grounding_prompt.lower()
+    # With schema evidence present, the prompt must direct the model to
+    # cross-check the exact field names the suspect code reads against the
+    # SDK definitions (#19293: the rename evidence was IN the prompt but the
+    # model anchored on its prior story and never compared field names).
+    assert "cross-check" in grounding_prompt.lower()
+    assert "rename" in grounding_prompt.lower()
     assert out["root_cause"].summary == "corrected diagnosis text"
 
 
@@ -201,6 +207,9 @@ def test_probe_not_relevant_leaves_prompt_unchanged(monkeypatch):
     agent._ground_root_cause(_grounding_state())
     grounding_prompt = prompts[1][1]
     assert "ground truth" not in grounding_prompt.lower()
+    # No schema block → no cross-check instruction either (prompt stays
+    # byte-identical to the pre-feature grounding prompt).
+    assert "cross-check" not in grounding_prompt.lower()
 
 
 def test_fetch_failure_degrades_and_emits_skip_event(monkeypatch):
