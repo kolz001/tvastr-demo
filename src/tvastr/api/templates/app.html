@@ -137,6 +137,21 @@
   .pr-verdict.yes{color:#4ade80}.pr-verdict.no{color:#f87171}
   .pr-verdict.partial,.pr-verdict.unknown{color:#fbbf24}
   .pr-slot{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:2px}
+  /* Run story card — pinned sibling ABOVE the scrolling #pipeline */
+  .story{border-bottom:1px solid var(--border);background:var(--surface-2)}
+  .story .story-head{padding:6px 14px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
+  .story .row{display:flex;gap:10px;padding:6px 14px;border-top:1px solid var(--border);font-size:12.5px;line-height:1.45;cursor:pointer}
+  .story .row:hover{background:var(--surface-3)}
+  .story .row .slot{flex:0 0 96px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;padding-top:2px}
+  .story .row .val{flex:1;min-width:0}
+  .story .row.pending .val{color:var(--text-dim)}
+  .story .row.err .val{color:var(--error)}
+  .story .chip{display:inline-block;font:600 10px var(--mono);padding:1px 6px;border-radius:3px;border:1px solid var(--border);color:var(--text-dim);margin-left:6px}
+  .story .gloss{display:block;color:var(--text-dim);margin-top:2px}
+  /* Chapter dividers in the timeline */
+  .chapter{margin:14px 2px 8px;padding:6px 2px 0;font:600 12px var(--sans);color:var(--text);letter-spacing:.01em;border-top:1px solid var(--border)}
+  .chapter .n{color:var(--text-dim);font:600 11px var(--mono);margin-right:6px}
+  .chapter.sub{font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-top:1px dashed var(--border)}
 </style>
 </head>
 <body>
@@ -218,7 +233,6 @@ const $ = (id) => document.getElementById(id);
 const html = (s) => s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 let selectedIssue = null;
-let activeEventSource = null;
 let currentRunId = null;
 let runHasFix = false;
 const STAGES = ["ingest","cluster","threshold","investigate","ground_root_cause","confidence_gate","generate_fix","compare_to_pr","draft_pr","open_pr","notify","audit"];
@@ -241,6 +255,191 @@ const VERDICT_BADGE = {
   regression:             { kind:"red",    label:"regression" },
   environmental_error:    { kind:"yellow", label:"env error" },
 };
+
+// One honest plain-English sentence per verdict — used in the run story card,
+// the verify.result card body, and as tooltips on verdict badges. Static and
+// deterministic on purpose: it says only what the events prove.
+const VERDICT_GLOSS = {
+  verified_via_reproducer:   "Reproduced the failure on the buggy code, applied the agent's fix, re-ran — the failure is gone.",
+  verified_via_scoped_tests: "The repository's own tests, scoped to the changed files, pass with the fix applied.",
+  verified_via_behavior:     "A behavioral check confirmed the fixed code now returns the expected result.",
+  verified_via_warning:      "The reproducer confirmed the intended warning now fires.",
+  verified_via_better_error: "The reproducer confirmed the clearer error message now raises.",
+  masks_symptom:             "The exception went away but the behavioral check still fails — the symptom is masked, not fixed.",
+  unverified_smoke_import_only: "Only an import smoke test ran — no evidence the fix addresses the issue.",
+  unverified_doc_only:       "Documentation-only fix — there is no runtime behavior to verify.",
+  repro_broken:              "The test script itself broke, so it can't be trusted as evidence either way.",
+  no_repro:                  "Couldn't reproduce the bug in the sandbox, so the fix is unproven — an honest 'no evidence', not a failure.",
+  still_broken:              "The original failure still occurs with the fix applied.",
+  regression:                "The fix resolves the failure but breaks existing repository tests.",
+  environmental_error:       "The sandbox itself failed (timeout, network, Docker) — no verdict on the fix.",
+};
+
+// ── Run story card ───────────────────────────────────────────────────────────
+// Deterministic at-a-glance summary, derived 1:1 from the event stream. Every
+// filled row records its source event card; clicking the row jumps to and
+// expands that card — every claim is one click from its raw evidence.
+const STORY_SLOTS = [
+  { key: "issue",     label: "Issue",         pending: "…" },
+  { key: "diagnosis", label: "Diagnosis",     pending: "…" },
+  { key: "fix",       label: "Fix",           pending: "…" },
+  { key: "verify",    label: "Verified?",     pending: "not yet verified" },
+  { key: "benchmark", label: "vs. human fix", pending: "…" },
+];
+let storyEvidence = {};   // slot key → the event card element that is its evidence
+let verifyAttempts = 0;
+let runGen = 0;   // bumped on every resetStory() — lets stale stream loops (a verify
+                  // stream from a prior run, or a superseded replay) detect they've
+                  // been superseded and stop touching shared state.
+
+function resetStory() {
+  runGen++;
+  storyEvidence = {};
+  verifyAttempts = 0;
+  seenChapters = new Set();
+  const old = $("story-card");
+  if (old) old.remove();
+  const card = document.createElement("div");
+  card.id = "story-card";
+  card.className = "story";
+  card.innerHTML =
+    `<div class="story-head">Run story — click a row to jump to its evidence</div>` +
+    STORY_SLOTS.map(s =>
+      `<div class="row pending" data-slot="${s.key}">` +
+      `<span class="slot">${s.label}</span>` +
+      `<span class="val">${s.pending}</span>` +
+      `</div>`).join("");
+  card.addEventListener("click", (e) => {
+    const row = e.target.closest(".row");
+    if (!row) return;
+    const target = storyEvidence[row.dataset.slot];
+    if (!target) return;
+    target.classList.add("expanded");
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+  $("pipeline").parentElement.insertBefore(card, $("pipeline"));
+}
+
+function setStoryRow(slot, valHtml, evidence, cls) {
+  const story = $("story-card");
+  if (!story) return;
+  const row = story.querySelector(`.row[data-slot="${slot}"]`);
+  if (!row) return;
+  row.classList.remove("pending", "err");
+  if (cls) row.classList.add(cls);
+  row.querySelector(".val").innerHTML = valHtml;
+  if (evidence) storyEvidence[slot] = evidence;
+}
+
+function updateStory(event, cardEl) {
+  if (!$("story-card")) return;
+  const p = event.payload || {};
+  switch (event.type) {
+    case "pipeline.start":
+      setStoryRow("issue",
+        `${html(p.repo || "—")} #${html(String(p.issue_number ?? "?"))} — ${html(p.issue_title || "")}`,
+        cardEl);
+      break;
+    case "agent.node.end":
+      if (event.step === "investigate") {
+        const conf = p.confidence != null
+          ? `<span class="chip">confidence ${Number(p.confidence).toFixed(2)}</span>` : "";
+        setStoryRow("diagnosis", `${html(p.summary || "—")}${conf}`, cardEl);
+      }
+      break;
+    case "agent.node.start":
+      // The confidence gate annotates the diagnosis row (act/skip vs threshold).
+      if (event.step === "confidence_gate" && p.confidence != null && p.threshold != null) {
+        const row = $("story-card").querySelector('.row[data-slot="diagnosis"]');
+        if (row && !row.classList.contains("pending")) {
+          const cmp = p.decision === "act" ? "≥" : "<";
+          const label = p.decision === "act" ? "acting" : "skipped";
+          row.querySelector(".val").innerHTML +=
+            `<span class="chip">${Number(p.confidence).toFixed(2)} ${cmp} ${Number(p.threshold).toFixed(2)} → ${label}</span>`;
+        }
+      }
+      break;
+    case "fix.generated":
+      setStoryRow("fix",
+        `${(p.files || []).length} file(s) · ${html(p.register || "—")} — ${html(p.summary || "")}`,
+        cardEl);
+      break;
+    case "verify.result": {
+      verifyAttempts++;
+      const meta = VERDICT_BADGE[p.verdict] || { kind: "yellow", label: p.verdict || "?" };
+      const gloss = VERDICT_GLOSS[p.verdict];
+      setStoryRow("verify",
+        `${verifyAttempts > 1 ? `<span class="chip">attempt ${verifyAttempts}</span> ` : ""}` +
+        `<span class="verdict ${meta.kind}">${html(meta.label)}</span>` +
+        (gloss ? `<span class="gloss">${html(gloss)}</span>` : ""),
+        cardEl);
+      break;
+    }
+    case "benchmark.compared": {
+      const kind = { match: "green", partial: "yellow", divergent: "red" }[p.verdict] || "yellow";
+      const both = (p.files_both || []).length;
+      const theirs = (p.files_theirs_only || []).length;
+      setStoryRow("benchmark",
+        `<span class="verdict ${kind}">${html(p.verdict || "?")}</span>` +
+        `<span class="gloss">${p.same_root_cause ? "Same root cause as" : "Different root cause from"} ` +
+        `the human fix (PR #${html(String(p.pr_number ?? "?"))}) · files overlap ${both}/${both + theirs}</span>`,
+        cardEl);
+      break;
+    }
+    case "benchmark.skipped":
+      setStoryRow("benchmark",
+        `<span class="gloss">not compared — ${html(p.reason || "no upstream PR")}</span>`, cardEl);
+      break;
+    case "error": {
+      // Mark the row for the stage in flight: verify errors hit the verify row;
+      // ingestion/fetch errors hit the issue row (these are almost always
+      // errors before an issue could even be summarized); otherwise the
+      // earliest still-pending agent-side row. If nothing is pending, leave
+      // the card alone — the error is still visible in the timeline.
+      const story = $("story-card");
+      let slot;
+      if (event.step === "verify") {
+        slot = "verify";
+      } else if (event.layer === "ingestion" || event.step === "fetch") {
+        slot = "issue";
+      } else {
+        slot = ["diagnosis", "fix", "benchmark"].find(s =>
+          story.querySelector(`.row[data-slot="${s}"]`)?.classList.contains("pending"));
+      }
+      if (!slot) break;
+      setStoryRow(slot, html(`${p.error || "error"}: ${p.message || p.reason || ""}`), cardEl, "err");
+      break;
+    }
+  }
+}
+
+// ── Chapter dividers ─────────────────────────────────────────────────────────
+// The first event of each chapter inserts a plain-English divider. First-match
+// by chapter order, once each; once a later chapter has started, earlier
+// chapters are sealed (llm./router./tool. events recur during later stages and
+// must not re-trigger "Investigating the cause").
+const CHAPTERS = [
+  { title: "Reading the failure",        prefixes: ["ingest.", "detect.", "threshold."] },
+  { title: "Investigating the cause",    prefixes: ["agent.", "tool.", "retrieval.", "doc.", "router.", "llm."] },
+  { title: "Writing the fix",            prefixes: ["fix.", "pr."] },
+  { title: "Comparing to the human fix", prefixes: ["benchmark."] },
+  { title: "Proving it in a sandbox",    prefixes: ["verify."] },
+];
+let seenChapters = new Set();
+
+function maybeInsertDivider(event) {
+  let idx = -1;
+  for (let i = 0; i < CHAPTERS.length; i++) {
+    if (CHAPTERS[i].prefixes.some(pre => event.type.startsWith(pre))) { idx = i; break; }
+  }
+  if (idx === -1 || seenChapters.has(idx)) return;
+  if ([...seenChapters].some(s => s > idx)) return;  // sealed: a later chapter already started
+  seenChapters.add(idx);
+  const d = document.createElement("div");
+  d.className = "chapter";
+  d.innerHTML = `<span class="n">${idx + 1}.</span>${html(CHAPTERS[idx].title)}`;
+  $("pipeline").appendChild(d);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tab switching
@@ -416,11 +615,12 @@ async function analyzePr(repo, number, btn, out) {
 // Run pipeline via SSE
 // ─────────────────────────────────────────────────────────────────────────────
 async function runPipeline(req) {
-  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
   currentRunId = null;
   runHasFix = false;
 
   $("pipeline").innerHTML = "";
+  resetStory();
+  const gen = runGen;
   $("stage-strip").style.display = "flex";
   $("stage-strip").innerHTML = STAGES.map(s =>
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
@@ -451,8 +651,16 @@ async function runPipeline(req) {
   const decoder = new TextDecoder();
   let buf = "";
   while (true) {
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     const { value, done } = await reader.read();
     if (done) break;
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     buf += decoder.decode(value, { stream: true });
     // SSE: events separated by blank lines (\n\n)
     let idx;
@@ -565,6 +773,7 @@ function appendEvent(event) {
   const isVerify = VERIFY_TYPES.has(event.type);
   const chip = isVerify ? `<span class="verify-chip">verify</span>` : "";
 
+  maybeInsertDivider(event);
   const card = document.createElement("div");
   card.className = `event layer-${layer}`;
   let extraHead = "";
@@ -587,6 +796,7 @@ function appendEvent(event) {
   `;
   card.querySelector(".head").addEventListener("click", () => card.classList.toggle("expanded"));
   $("pipeline").appendChild(card);
+  updateStory(event, card);
 
   // Once the agent's PR is captured (dry-run sentinel), offer to verify.
   if (event.type === "pr.dry_run" && currentRunId && runHasFix) {
@@ -632,12 +842,13 @@ function showVerifyCTA(runId, opts) {
 
 function appendVerifyAttemptDivider(n) {
   const d = document.createElement("div");
-  d.style.cssText = "margin:10px 14px 4px;padding:4px 10px;font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-top:1px dashed var(--border)";
+  d.className = "chapter sub";
   d.textContent = `Verification attempt ${n}`;
   $("pipeline").appendChild(d);
 }
 
 async function streamVerify(runId, attempt) {
+  const gen = runGen;
   if (attempt && attempt > 1) appendVerifyAttemptDivider(attempt);
   let resp;
   try {
@@ -661,8 +872,16 @@ async function streamVerify(runId, attempt) {
   let buf = "";
   let lastVerdict = null;
   while (true) {
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     const { value, done } = await reader.read();
     if (done) break;
+    if (gen !== runGen) {
+      try { await reader.cancel(); } catch {}
+      return;
+    }
     buf += decoder.decode(value, { stream: true });
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -679,6 +898,10 @@ async function streamVerify(runId, attempt) {
       } catch {}
     }
   }
+
+  // A newer run/replay has started since this stream began — don't touch its
+  // story card, CTA, or stage strip with this stale stream's outcome.
+  if (gen !== runGen) return;
 
   // Post-stream: decide whether to re-enable the verify CTA.
   // "Green" verdicts (reproducer / scoped tests) keep the button locked — the
@@ -713,6 +936,11 @@ function colorizeDiff(diff) {
 function renderBody(event) {
   const p = event.payload || {};
   const parts = [];
+
+  // Verdict gloss: the plain-English meaning of the verdict, above the raw kvs.
+  if (event.type === "verify.result" && VERDICT_GLOSS[p.verdict]) {
+    parts.push(`<div class="kv"><span class="k">meaning</span><span class="v">${html(VERDICT_GLOSS[p.verdict])}</span></div>`);
+  }
 
   // Routing decisions: render a colored badge.
   if (event.type === "router.decide") {
@@ -777,7 +1005,7 @@ async function loadRuns() {
       <thead><tr><th>Started</th><th>Repo</th><th>Issue</th><th>Outcome</th><th>Verified?</th><th>Events</th><th>Run ID</th></tr></thead>
       <tbody>${runs.map(r => {
         const v = r.verdict ? (VERDICT_BADGE[r.verdict] || { kind:"yellow", label:r.verdict }) : null;
-        const vCell = v ? `<span class="verdict ${v.kind}">${html(v.label)}</span>` : "—";
+        const vCell = v ? `<span class="verdict ${v.kind}" title="${html(VERDICT_GLOSS[r.verdict] || "")}">${html(v.label)}</span>` : "—";
         return `
         <tr data-run="${r.run_id}">
           <td>${html((r.started_at||"").replace("T"," ").split(".")[0])}</td>
@@ -800,6 +1028,7 @@ async function replayRun(runId) {
   // Jump to triage tab so the user sees the pipeline pane.
   document.querySelector('.tab[data-tab="triage"]').click();
   $("pipeline").innerHTML = "";
+  resetStory();
   $("stage-strip").style.display = "flex";
   $("stage-strip").innerHTML = STAGES.map(s =>
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
