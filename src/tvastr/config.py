@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # code host with IssueEraCodeHost. Off in tests.
     issue_era_retrieval: bool = True
 
+    # When true, doc-grounding may install the diagnosis-relevant third-party
+    # SDK (host pip, wheels-only, no-deps, into data/sdk_cache/) and inject its
+    # type definitions into the grounding prompt as ground truth for field
+    # names. Off in tests.
+    sdk_schema_grounding: bool = True
+
     # --- Triage UI ---
     # When true, the triage UI auto-analyzes the top 5 discovered PRs on load
     # (one cloud LLM call each). Off by default so loading the issue list never

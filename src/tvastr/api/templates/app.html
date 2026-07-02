@@ -745,6 +745,9 @@ function summarize(event) {
     case "benchmark.skipped":  return p.reason || "no upstream PR";
     case "doc.grounded": return `${p.searched ? "searched docs" : "no search"}${p.changed ? " · diagnosis revised" : ""}${(p.sources||[]).length ? ` · ${p.sources.length} source(s)` : ""}`;
     case "doc.skipped":  return p.reason || "grounding skipped";
+    case "doc.sdk_schema": return p.ok
+      ? `${p.package}@${p.version} · ${p.snippets} snippet(s) from installed SDK`
+      : `skipped — ${p.reason || ""}`;
     case "error":           return p.error ? `${p.error}: ${p.message}` : (p.reason || "error");
     default: return JSON.stringify(p).slice(0, 200);
   }

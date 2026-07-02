@@ -28,6 +28,7 @@ htmlcov/
 data/opensearch/
 data/audit/
 data/runs/
+data/sdk_cache/
 .tvastr/
 
 # IDE / OS

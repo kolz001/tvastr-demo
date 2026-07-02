@@ -65,3 +65,4 @@ class AgentContext:
     run_id: str | None = None
     doc_grounding: bool = False
     issue_era_retrieval: bool = False
+    sdk_schema_grounding: bool = False
