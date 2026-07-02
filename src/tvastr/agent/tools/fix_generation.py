@@ -19,16 +19,12 @@ import re
 
 from tvastr.agent.context import AgentContext
 from tvastr.agent.tools.code_retrieval import format_code_for_prompt
+from tvastr.agent.tools.prompts import FIX_GENERATION_SYSTEM
 from tvastr.domain import FailurePattern, FileChange, FixProposal, RootCause, RoutingDecision
 from tvastr.llm.router import TaskType
 from tvastr.logging import get_logger
 
 log = get_logger(__name__)
-
-_SYSTEM = (
-    "You are a senior software engineer producing minimal, correct code fixes as JSON. "
-    "Respond with a single JSON object — no prose, no markdown fences, no commentary."
-)
 
 _PROMPT_SCHEMA_HINT = """\
 Produce a fix as JSON with this exact schema:
@@ -246,7 +242,10 @@ def generate_fix(
         )
     prompt += _PROMPT_SCHEMA_HINT
     response, decision = ctx.router.run(
-        TaskType.FIX_GENERATION, prompt, sensitivity=pattern.sensitivity, system=_SYSTEM
+        TaskType.FIX_GENERATION,
+        prompt,
+        sensitivity=pattern.sensitivity,
+        system=FIX_GENERATION_SYSTEM,
     )
 
     parsed = _parse_response(response.text)
