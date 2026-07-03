@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from tvastr.config import get_settings
@@ -20,6 +20,9 @@ from tvastr.ingestion.github_issues import (
     MockGitHubIssuesFetcher,
     issue_to_events,
 )
+from tvastr.logging import get_logger
+
+log = get_logger(__name__)
 
 router = APIRouter(tags=["issues"])
 
@@ -83,7 +86,17 @@ def list_issues(
     else:
         fetcher = GitHubIssuesFetcher(repo, token=settings.github_token)
 
-    records = fetcher.fetch(label=label, limit=limit, sort=sort)
+    try:
+        records = fetcher.fetch(label=label, limit=limit, sort=sort)
+    except Exception as exc:
+        # GitHub errors (403 secondary rate limits, 422 bad queries, network)
+        # must surface as an explained upstream failure, not a bare 500.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        hint = " — likely a transient rate limit; retry shortly" if status == 403 else ""
+        log.warning("issues.fetch_failed", repo=repo, status=status, error=str(exc))
+        raise HTTPException(
+            502, f"GitHub issue search failed ({status or type(exc).__name__}){hint}"
+        ) from exc
     return IssueList(
         repo=repo,
         sort=sort,

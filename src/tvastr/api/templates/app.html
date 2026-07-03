@@ -468,7 +468,11 @@ async function fetchIssues() {
   try {
     const url = `/api/issues?repo=${encodeURIComponent(repo)}&sort=${encodeURIComponent(sort)}&label=${encodeURIComponent(label)}&limit=${limit}`;
     const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) {
+      // Surface the server's explanation (e.g. GitHub rate-limit hint), not just a code.
+      const body = await resp.json().catch(() => null);
+      throw new Error(body?.detail || `HTTP ${resp.status}`);
+    }
     const data = await resp.json();
     renderIssues(data);
     $("mode-badge").textContent = data.mode.toUpperCase();

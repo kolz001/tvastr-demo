@@ -35,6 +35,25 @@ def test_issues_carry_remediable_flag_from_ingestion_truth() -> None:
     assert by_num[8050]["remediable"] is False
 
 
+def test_issues_route_surfaces_github_http_errors_as_502(monkeypatch) -> None:
+    """A GitHub 403 (rate limit) must not surface as a bare 500: the route maps
+    fetcher HTTP errors to 502 with an actionable detail message."""
+    import httpx
+
+    def boom(self, *, label, limit, sort=None):
+        req = httpx.Request("GET", "https://api.github.com/search/issues")
+        resp = httpx.Response(403, request=req)
+        raise httpx.HTTPStatusError("403", request=req, response=resp)
+
+    monkeypatch.setattr(
+        "tvastr.api.routes.issues.MockGitHubIssuesFetcher.fetch", boom
+    )
+    resp = client.get("/api/issues")
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "GitHub" in detail and "403" in detail
+
+
 def test_issues_endpoint_auto_analyze_prs_defaults_false() -> None:
     # The UI must not auto-spend cloud calls on load unless explicitly enabled.
     resp = client.get("/api/issues")
