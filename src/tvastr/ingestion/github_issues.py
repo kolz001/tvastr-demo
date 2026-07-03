@@ -206,7 +206,12 @@ class GitHubIssuesFetcher:
     ) -> list[IssueRecord]:
         import httpx
 
-        query = f"repo:{self.repo} is:issue is:open label:{label}"
+        # No label → no qualifier: a dangling `label:` matches nothing, which
+        # silently blanked out repos whose issues carry no labels at all.
+        # Quoted so multi-word labels ("good first issue") work.
+        query = f"repo:{self.repo} is:issue is:open"
+        if label.strip():
+            query += f' label:"{label.strip()}"'
         headers = github_headers(self.token)
         params = {
             "q": query,
@@ -248,7 +253,11 @@ class GitHubIssuesFetcher:
 
         gh = Github(self.token) if self.token else Github()
         repo = gh.get_repo(self.repo)
-        paged = repo.get_issues(state="all", labels=[label])
+        # Same empty-label rule as the search path: no label → no filter.
+        if label.strip():
+            paged = repo.get_issues(state="all", labels=[label])
+        else:
+            paged = repo.get_issues(state="all")
 
         records: list[IssueRecord] = []
         for issue in paged:

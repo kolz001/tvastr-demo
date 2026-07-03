@@ -105,3 +105,36 @@ def test_harvest_writes_jsonl_and_pipeline_can_replay(tmp_path: Path) -> None:
     # The mock fetcher emits two issues sharing a ModuleNotFoundError signature
     # → one recurring pattern.
     assert run.patterns_selected >= 1
+
+
+def test_search_query_omits_label_qualifier_when_label_empty(monkeypatch) -> None:
+    """Regression: an empty label produced a dangling `label:` qualifier that
+    GitHub's search matches to nothing — repos with unlabeled issues (e.g.
+    perplexityai/bumblebee, 13 open issues, zero labeled) returned []."""
+    from tvastr.ingestion.github_issues import GitHubIssuesFetcher
+
+    captured: dict = {}
+
+    class _FakeResp:
+        def raise_for_status(self) -> None: ...
+        def json(self) -> dict:
+            return {"items": []}
+
+    class _FakeClient:
+        def __init__(self, *a, **k): ...
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, headers=None, params=None):
+            captured["params"] = params
+            return _FakeResp()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    fetcher = GitHubIssuesFetcher("owner/repo", token="t")
+
+    fetcher.fetch(label="", limit=5, sort="interactions")
+    assert "label:" not in captured["params"]["q"]
+
+    fetcher.fetch(label="bug", limit=5, sort="interactions")
+    assert 'label:"bug"' in captured["params"]["q"] or "label:bug" in captured["params"]["q"]
