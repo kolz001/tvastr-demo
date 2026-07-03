@@ -108,6 +108,7 @@
   .res-chip.high{background:rgba(239,111,111,.13);color:var(--error);border:1px solid rgba(239,111,111,.35)}
   .res-chip.medium{background:rgba(240,184,110,.13);color:var(--warn);border:1px solid rgba(240,184,110,.35)}
   .res-chip.low{background:var(--surface-3);color:var(--text-dim);border:1px solid var(--border)}
+  .chip-nosig{display:inline-flex;align-items:center;font:600 9px var(--mono);padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em;background:rgba(240,184,110,.10);color:var(--warn);border:1px solid rgba(240,184,110,.3);cursor:help}
   /* Verification chip + result badges */
   .verify-chip{display:inline-block;font:600 9px var(--mono);padding:1px 4px;border-radius:3px;background:rgba(122,167,255,.18);color:var(--cloud);border:1px solid rgba(122,167,255,.4);margin-right:6px;text-transform:uppercase;letter-spacing:.05em}
   .verdict{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;font:600 11px var(--mono);border-radius:4px;text-transform:uppercase;letter-spacing:.05em}
@@ -495,6 +496,7 @@ function renderIssues(data) {
       <div class="preview">${html(iss.body_preview || '(no body)')}</div>
       <div class="meta">
         <span class="res-chip-slot"></span>
+        ${iss.remediable === false ? `<span class="chip-nosig" title="No failure signature (exception, traceback, or bug report) in the title or body — tvastr remediates failures; Apply fix will decline this issue.">no failure signature</span>` : ""}
         <span class="stat">👍 ${iss.thumbs_up}</span>
         <span class="stat">💬 ${iss.comments}</span>
         <span class="stat">∑ ${iss.reactions}</span>
