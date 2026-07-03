@@ -22,17 +22,19 @@ closed LlamaIndex issues instead of curated fixtures:
    been removed/consolidated by the time the agent looked, so `list_dir` and
    `search_code` against `main` returned nothing — not because there was no
    bug, but because the agent was looking at the wrong commit.
-3. **Web-search grounding confirmed a wrong diagnosis instead of correcting
-   it.** Also on #19293: the real bug was a third-party SDK (`google-genai`)
-   returning token counts under a renamed field
-   (`response_token_count` instead of `candidates_token_count`). The evidence
-   for this was unreachable everywhere the agent looked — the issue's key
-   detail was a screenshot, the comments didn't mention it — except in the
-   installed SDK's own type definitions, which nothing in the pipeline ever
-   read. Worse, doc-grounding's own web search ran queries *built from the
-   story it already believed*, and its two sources duly confirmed the wrong
-   mechanism. Confirmation bias, not absence of a search step, was the
-   failure.
+3. **Web-search grounding confirmed a story instead of testing it.** Also on
+   #19293: resolving the diagnosis hinged on the third-party SDK's
+   (`google-genai`) actual usage-metadata shape for the models in question —
+   knowledge that was unreachable everywhere the agent looked. The issue's
+   key detail was a screenshot, the comments didn't mention it, and nothing
+   in the pipeline ever read the installed SDK's own type definitions.
+   Worse, doc-grounding's web search ran queries *built from the story it
+   already believed*, and its sources duly confirmed that story.
+   Confirmation bias, not absence of a search step, was the failure.
+   (Postscript, same issue: the linked human fix keyed on a field that later
+   analysis showed doesn't exist on the affected code path at all — the
+   benchmark's reference PR can itself be wrong, which is why grounding must
+   check primary sources, not just agree with whichever fix exists.)
 
 ## Decision
 
