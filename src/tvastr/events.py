@@ -196,10 +196,18 @@ def mark_interrupted_runs(runs_dir: Path, in_flight: Mapping[str, threading.Thre
         if run_id in in_flight:
             continue
         try:
-            last = None
-            for last in load_events(path):  # noqa: B007 — want the last item
-                pass
-            if last is None or is_terminal_event(last):
+            # Judge terminality by ANY event in the file, not just the last
+            # one: the verify route appends verify.* events to the same
+            # JSONL *after* pipeline.end, so a completed+verified run's last
+            # event is verify.result, not pipeline.end. Checking only the
+            # last event would falsely re-mark every verified run as
+            # interrupted on each sweep (and non-idempotently, depending on
+            # how verify events interleave with the sweep).
+            saw_any = saw_terminal = False
+            for e in load_events(path):
+                saw_any = True
+                saw_terminal = saw_terminal or is_terminal_event(e)
+            if not saw_any or saw_terminal:
                 continue
             JsonlEventSink(path).emit(
                 PipelineEvent(

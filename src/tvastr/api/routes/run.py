@@ -259,7 +259,10 @@ async def stream_run(run_id: str) -> StreamingResponse:
             # see everything, and it's safe to stop after this pass.
             thread = _IN_FLIGHT.get(run_id)
             alive = thread is not None and thread.is_alive()
-            text = path.read_text(encoding="utf-8")
+            # errors="replace": safe because offsets only advance to newline
+            # boundaries, so a byte-torn multibyte tail is never consumed and
+            # re-decodes cleanly next poll.
+            text = path.read_text(encoding="utf-8", errors="replace")
             chunk = text[offset:]
             # Only advance past whole lines. A trailing fragment with no
             # newline yet is a line still being written; consuming it now

@@ -346,6 +346,31 @@ def test_sweep_marks_incomplete_run_once(tmp_path: Path) -> None:
     assert len((tmp_path / "cut.jsonl").read_text().splitlines()) == len(lines)
 
 
+def test_sweep_does_not_mark_verified_run_with_trailing_verify_events(tmp_path: Path) -> None:
+    """A completed+verified run ends with verify.* events appended after
+    pipeline.end (the verify route appends to the same JSONL). Terminality
+    must be judged by ANY event in the file, not just the last one, or every
+    verified run gets falsely stamped pipeline.interrupted on each sweep.
+    """
+    _write_run(
+        tmp_path,
+        "verified1",
+        ["pipeline.start", "pipeline.end", "verify.start", "verify.result"],
+    )
+    assert mark_interrupted_runs(tmp_path, {}) == 0
+    last = json.loads((tmp_path / "verified1.jsonl").read_text().splitlines()[-1])
+    assert last["type"] != "pipeline.interrupted"
+    # Idempotent across repeated sweeps (e.g. multiple verify interleavings).
+    assert mark_interrupted_runs(tmp_path, {}) == 0
+
+
+def test_sweep_still_marks_genuinely_cut_run(tmp_path: Path) -> None:
+    _write_run(tmp_path, "cut2", ["pipeline.start", "router.decide"])
+    assert mark_interrupted_runs(tmp_path, {}) == 1
+    last = json.loads((tmp_path / "cut2.jsonl").read_text().splitlines()[-1])
+    assert last["type"] == "pipeline.interrupted"
+
+
 def test_sweep_skips_terminal_and_inflight(tmp_path: Path) -> None:
     _write_run(tmp_path, "ok", ["pipeline.start", "pipeline.end"])
     _write_run(tmp_path, "err", ["error"])
