@@ -390,6 +390,7 @@ function updateStory(event, cardEl) {
       setStoryRow("benchmark",
         `<span class="gloss">not compared — ${html(p.reason || "no upstream PR")}</span>`, cardEl);
       break;
+    case "pipeline.interrupted":
     case "error": {
       // Mark the row for the stage in flight: verify errors hit the verify row;
       // ingestion/fetch errors hit the issue row (these are almost always
@@ -407,7 +408,7 @@ function updateStory(event, cardEl) {
           story.querySelector(`.row[data-slot="${s}"]`)?.classList.contains("pending"));
       }
       if (!slot) break;
-      setStoryRow(slot, html(`${p.error || "error"}: ${p.message || p.reason || ""}`), cardEl, "err");
+      setStoryRow(slot, html(`${p.error || p.reason || "run interrupted"}${p.message ? ": " + p.message : ""}`), cardEl, "err");
       break;
     }
   }
@@ -612,6 +613,48 @@ async function analyzePr(repo, number, btn, out) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Attach to a run's event stream — live attach, mid-run re-attach after a
+// refresh, and replay of completed runs all go through this one path.
+// ─────────────────────────────────────────────────────────────────────────────
+async function attachRun(runId) {
+  const gen = runGen;
+  let resp;
+  try {
+    resp = await fetch(`/api/runs/${runId}/stream`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  } catch (e) {
+    if (gen !== runGen) return;
+    appendEvent({
+      type: "error", layer: "output", step: "fetch",
+      payload: {error: String(e)}, timestamp: new Date().toISOString()
+    });
+    return;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (gen !== runGen) { try { reader.cancel(); } catch {} return; }
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const chunk = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const dataLine = chunk.split("\n").find(l => l.startsWith("data: "));
+      if (!dataLine || chunk.startsWith("event: done")) continue;
+      try {
+        const event = JSON.parse(dataLine.slice(6));
+        appendEvent(event);
+      } catch {}
+    }
+    if (gen !== runGen) { try { reader.cancel(); } catch {} return; }
+  }
+  if (gen === runGen) finalizeRun();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Run pipeline via SSE
 // ─────────────────────────────────────────────────────────────────────────────
 async function runPipeline(req) {
@@ -620,16 +663,12 @@ async function runPipeline(req) {
 
   $("pipeline").innerHTML = "";
   resetStory();
-  const gen = runGen;
   $("stage-strip").style.display = "flex";
   $("stage-strip").innerHTML = STAGES.map(s =>
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
   ).join("");
   $("pipeline-title").textContent = `Pipeline — issue #${req.issue_number}`;
 
-  // SSE doesn't support POST natively in the browser. So: POST first, then the
-  // server returns a streaming text/event-stream response. We use fetch() with
-  // a reader to parse SSE manually.
   let resp;
   try {
     resp = await fetch("/api/run", {
@@ -638,7 +677,8 @@ async function runPipeline(req) {
       body: JSON.stringify(req),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    currentRunId = resp.headers.get("X-Tvastr-Run-Id");
+    const body = await resp.json();
+    currentRunId = body.run_id;
   } catch (e) {
     appendEvent({
       type: "error", layer: "output", step: "fetch",
@@ -646,36 +686,7 @@ async function runPipeline(req) {
     });
     return;
   }
-
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  while (true) {
-    if (gen !== runGen) {
-      try { await reader.cancel(); } catch {}
-      return;
-    }
-    const { value, done } = await reader.read();
-    if (done) break;
-    if (gen !== runGen) {
-      try { await reader.cancel(); } catch {}
-      return;
-    }
-    buf += decoder.decode(value, { stream: true });
-    // SSE: events separated by blank lines (\n\n)
-    let idx;
-    while ((idx = buf.indexOf("\n\n")) !== -1) {
-      const chunk = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-      const dataLine = chunk.split("\n").find(l => l.startsWith("data: "));
-      if (!dataLine) continue;
-      try {
-        const event = JSON.parse(dataLine.slice(6));
-        appendEvent(event);
-      } catch {}
-    }
-  }
-  finalizeRun();
+  await attachRun(currentRunId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -748,6 +759,7 @@ function summarize(event) {
     case "doc.sdk_schema": return p.ok
       ? `${p.package}@${p.version} · ${p.snippets} snippet(s) from installed SDK`
       : `skipped — ${p.reason || ""}`;
+    case "pipeline.interrupted": return p.reason || "run interrupted";
     case "error":           return p.error ? `${p.error}: ${p.message}` : (p.reason || "error");
     default: return JSON.stringify(p).slice(0, 200);
   }
@@ -1037,10 +1049,7 @@ async function replayRun(runId) {
     `<span class="stage-pill" data-stage="${s}">${s}</span>`
   ).join("");
   $("pipeline-title").textContent = `Pipeline — replay ${runId}`;
-  const resp = await fetch(`/api/runs/${runId}`);
-  const events = await resp.json();
-  for (const ev of events) appendEvent(ev);
-  finalizeRun();
+  await attachRun(runId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

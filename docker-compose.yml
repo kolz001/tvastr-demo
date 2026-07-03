@@ -4,6 +4,27 @@
 # at http://localhost:11434. Set TVASTR_USE_MOCKS=false to exercise these for real.
 
 services:
+  tvastr:
+    build: .
+    ports:
+      - "8001:8000"   # host 8000 is taken by another local app
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TVASTR_SANDBOX_WORK_ROOT: /app/data/sandbox
+      # ${PWD} is the invoking shell's dir — run `docker compose up` from the repo root.
+      TVASTR_SANDBOX_HOST_WORK_ROOT: ${PWD}/data/sandbox
+      # Host dev uvicorn is the sole sweeper on this machine — a second
+      # process sweeping the same ./data/runs would mark its live runs
+      # interrupted (per-process in-flight registry). Pure-container
+      # deployments should flip this to "true".
+      TVASTR_SWEEP_ON_STARTUP: "false"
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
   opensearch:
     image: opensearchproject/opensearch:2.17.1
     container_name: tvastr-opensearch

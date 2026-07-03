@@ -15,17 +15,22 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
+from tvastr.logging import get_logger
+
+log = get_logger(__name__)
+
 Layer = Literal["ingestion", "detection", "agent", "output"]
 EventType = Literal[
     "pipeline.start",
     "pipeline.end",
+    "pipeline.interrupted",
     "ingest.read",
     "detect.cluster",
     "detect.pii",
@@ -147,20 +152,76 @@ def run_path(run_id: str, runs_dir: Path | None = None) -> Path:
     return (runs_dir or default_runs_dir()) / f"{run_id}.jsonl"
 
 
+def _parse_event_line(line: str) -> PipelineEvent | None:
+    """Parse one JSONL line into a :class:`PipelineEvent`, or ``None`` if malformed."""
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        obj = json.loads(stripped)
+        return PipelineEvent(**obj)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def load_events(path: Path) -> Iterable[PipelineEvent]:
     """Read a persisted run's events back. Skips lines that fail to parse."""
     if not path.exists():
         return
     with path.open("r", encoding="utf-8") as fh:
         for raw in fh:
-            stripped = raw.strip()
-            if not stripped:
+            event = _parse_event_line(raw)
+            if event is not None:
+                yield event
+
+
+_TERMINAL_TYPES = {"pipeline.end", "pipeline.interrupted", "error"}
+
+
+def is_terminal_event(event: PipelineEvent) -> bool:
+    """True if this event, as the LAST event of a run file, means the run is over."""
+    return event.type in _TERMINAL_TYPES
+
+
+def mark_interrupted_runs(runs_dir: Path, in_flight: Mapping[str, threading.Thread]) -> int:
+    """Append ``pipeline.interrupted`` to every non-terminal run file.
+
+    Idempotent and append-only. Files whose run_id is in ``in_flight`` are
+    skipped. Returns the number of runs marked. Per-file failures are logged
+    and never abort the sweep.
+    """
+    marked = 0
+    for path in sorted(runs_dir.glob("*.jsonl")):
+        run_id = path.stem
+        if run_id in in_flight:
+            continue
+        try:
+            # Judge terminality by ANY event in the file, not just the last
+            # one: the verify route appends verify.* events to the same
+            # JSONL *after* pipeline.end, so a completed+verified run's last
+            # event is verify.result, not pipeline.end. Checking only the
+            # last event would falsely re-mark every verified run as
+            # interrupted on each sweep (and non-idempotently, depending on
+            # how verify events interleave with the sweep).
+            saw_any = saw_terminal = False
+            for e in load_events(path):
+                saw_any = True
+                saw_terminal = saw_terminal or is_terminal_event(e)
+            if not saw_any or saw_terminal:
                 continue
-            try:
-                obj = json.loads(stripped)
-                yield PipelineEvent(**obj)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
+            JsonlEventSink(path).emit(
+                PipelineEvent(
+                    type="pipeline.interrupted",
+                    layer="pipeline",
+                    step="pipeline",
+                    run_id=run_id,
+                    payload={"reason": "server restarted mid-run"},
+                )
+            )
+            marked += 1
+        except Exception as exc:
+            log.warning("events.sweep.failed", path=str(path), error=str(exc))
+    return marked
 
 
 @dataclass(frozen=True)

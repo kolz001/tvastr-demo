@@ -208,9 +208,10 @@ class _DockerHandle:
     synthesized code we don't trust.
     """
 
-    def __init__(self, root: Path, image: str) -> None:
+    def __init__(self, root: Path, image: str, mount_root: Path | None = None) -> None:
         self.root = root
         self.image = image
+        self.mount_root = mount_root if mount_root is not None else root
         self._patch_pending = False
         self._deps_provisioned = False
 
@@ -253,7 +254,7 @@ class _DockerHandle:
             "--cap-drop=ALL",
             "-e", "PIP_NO_CACHE_DIR=1",
             "-e", "HOME=/tmp",
-            "-v", f"{self.root}:/work:rw",
+            "-v", f"{self.mount_root}:/work:rw",
             "-w", "/work",
             self.image,
             "pip", "install", "--target", "/work/.tvastr_deps", *dists,
@@ -308,7 +309,7 @@ class _DockerHandle:
             "--cap-drop=ALL",
             "--tmpfs=/tmp:rw,size=64m",
             "-v",
-            f"{self.root}:/work:rw",
+            f"{self.mount_root}:/work:rw",
             "-w",
             "/work",
             self.image,
@@ -336,13 +337,25 @@ class _DockerHandle:
 class DockerSandbox:
     name = "docker"
 
-    def __init__(self, image: str = "tvastr-verify:llamaindex") -> None:
+    def __init__(
+        self,
+        image: str = "tvastr-verify:llamaindex",
+        work_root: Path | None = None,
+        host_work_root: Path | None = None,
+    ) -> None:
         self.image = image
+        self.work_root = work_root
+        self.host_work_root = host_work_root
 
     def prepare(self) -> _DockerHandle:
-        root = Path(tempfile.mkdtemp(prefix="tvastr-verify-"))
+        if self.work_root is not None:
+            self.work_root.mkdir(parents=True, exist_ok=True)
+            root = Path(tempfile.mkdtemp(prefix="tvastr-verify-", dir=self.work_root))
+        else:
+            root = Path(tempfile.mkdtemp(prefix="tvastr-verify-"))
+        mount_root = (self.host_work_root / root.name) if self.host_work_root else root
         log.info("verify.sandbox.prepare", sandbox=self.name, root=str(root), image=self.image)
-        return _DockerHandle(root, self.image)
+        return _DockerHandle(root, self.image, mount_root=mount_root)
 
 
 # ─── Factory ──────────────────────────────────────────────────────────────
@@ -354,12 +367,24 @@ def build_sandbox(settings: Settings) -> Sandbox:
     Honours ``TVASTR_VERIFY_SANDBOX`` (`docker` / `subprocess`) when set;
     otherwise auto-detects Docker by looking for it on PATH.
     """
+    work_root = Path(settings.sandbox_work_root) if settings.sandbox_work_root else None
+    host_work_root = (
+        Path(settings.sandbox_host_work_root) if settings.sandbox_host_work_root else None
+    )
     forced = settings.verify_sandbox
     if forced == "subprocess":
         return SubprocessSandbox()
     if forced == "docker":
-        return DockerSandbox(image=settings.verify_docker_image)
+        return DockerSandbox(
+            image=settings.verify_docker_image,
+            work_root=work_root,
+            host_work_root=host_work_root,
+        )
     if shutil.which("docker"):
-        return DockerSandbox(image=settings.verify_docker_image)
+        return DockerSandbox(
+            image=settings.verify_docker_image,
+            work_root=work_root,
+            host_work_root=host_work_root,
+        )
     log.info("verify.sandbox.fallback", reason="docker not on PATH")
     return SubprocessSandbox()

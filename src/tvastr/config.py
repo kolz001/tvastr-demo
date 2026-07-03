@@ -11,7 +11,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     dry_run: bool = False
     log_level: str = "INFO"
     log_json: bool = False
+    # When true (default), create_app() sweeps data/runs on startup, appending
+    # pipeline.interrupted to any non-terminal run file left behind by a
+    # crashed or killed process. Off in tests (sealed in conftest.py) so that
+    # building a TestClient(create_app()) — done by many test modules — never
+    # mutates real run files on disk.
+    sweep_on_startup: bool = True
 
     # --- PII redaction ---
     # When true, the regex redactor is augmented with a local Presidio (spaCy
@@ -124,6 +130,22 @@ class Settings(BaseSettings):
     # in its own scaffolding, e.g. a hand-rolled fake of an SDK object) is retried
     # with a reproducer repaired against the real installed deps. Off in tests.
     verify_repro_repair: bool = True
+
+    # --- Sandbox paths (docker-out-of-docker) ---
+    # Where tvastr creates per-run verify workspaces (default: system temp).
+    sandbox_work_root: str | None = None
+    # The SAME directory as seen by the host Docker daemon. Required when
+    # tvastr itself runs in a container with /var/run/docker.sock mounted:
+    # `docker run -v` paths are resolved by the host daemon, not this process.
+    sandbox_host_work_root: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_sandbox_host_work_root(self) -> Settings:
+        if self.sandbox_host_work_root and not self.sandbox_work_root:
+            raise ValueError(
+                "TVASTR_SANDBOX_HOST_WORK_ROOT requires TVASTR_SANDBOX_WORK_ROOT"
+            )
+        return self
 
 
 @lru_cache

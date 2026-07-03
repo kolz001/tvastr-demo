@@ -46,7 +46,7 @@ def test_issues_sorted_by_comments() -> None:
     assert comments == sorted(comments, reverse=True)
 
 
-# ─── /api/run (SSE) ─────────────────────────────────────────────────────────
+# ─── /api/run (job model: POST returns run_id, GET .../stream carries events) ──
 
 
 def _parse_sse(body: str) -> list[dict]:
@@ -59,19 +59,29 @@ def _parse_sse(body: str) -> list[dict]:
     return events
 
 
+def _run_and_collect(repo: str, issue_number: int) -> list[dict]:
+    """POST /api/run then drain its stream endpoint, returning the parsed events."""
+    resp = client.post("/api/run", json={"repo": repo, "issue_number": issue_number})
+    assert resp.status_code == 202
+    run_id = resp.json()["run_id"]
+    with client.stream("GET", f"/api/runs/{run_id}/stream") as stream_resp:
+        assert stream_resp.status_code == 200
+        assert "text/event-stream" in stream_resp.headers["content-type"]
+        assert "X-Tvastr-Run-Id" in stream_resp.headers
+        text = "".join(stream_resp.iter_text())
+    # Drop the trailing `event: done\ndata: {}` sentinel — it has no "type".
+    return [e for e in _parse_sse(text) if "type" in e]
+
+
 def test_run_streams_full_pipeline_events() -> None:
     # Issue #8001 in the mock fetcher contains "ModuleNotFoundError: ..." so
     # issue_to_events returns at least one event; threshold is bypassed (1).
-    resp = client.post("/api/run", json={"repo": "run-llama/llama_index", "issue_number": 8001})
-    assert resp.status_code == 200
-    assert "text/event-stream" in resp.headers["content-type"]
-    assert "X-Tvastr-Run-Id" in resp.headers
-
-    events = _parse_sse(resp.text)
+    events = _run_and_collect("run-llama/llama_index", 8001)
     types = [e["type"] for e in events]
     # Exactly one pipeline.start (carrying run_id in its payload) followed by
-    # ingest + cluster + threshold + agent + router + llm + fix + pr. The live
-    # stream mirrors the persisted run — no separate synthetic opener.
+    # ingest + cluster + threshold + agent + router + llm + fix + pr. The
+    # replayed/tailed stream mirrors the persisted run — no separate
+    # synthetic opener.
     assert types.count("pipeline.start") == 1
     start = next(e for e in events if e["type"] == "pipeline.start")
     assert start["payload"]["run_id"]
@@ -88,8 +98,7 @@ def test_run_streams_full_pipeline_events() -> None:
 
 def test_run_surfaces_error_for_issue_without_signature() -> None:
     # Issue #8050 is a feature request — no error-shaped line in title or body.
-    resp = client.post("/api/run", json={"repo": "run-llama/llama_index", "issue_number": 8050})
-    events = _parse_sse(resp.text)
+    events = _run_and_collect("run-llama/llama_index", 8050)
     types = [e["type"] for e in events]
     assert "error" in types
     error_event = next(e for e in events if e["type"] == "error")
