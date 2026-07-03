@@ -26,6 +26,15 @@ def test_issues_endpoint_returns_mock_issues_by_default() -> None:
         assert key in first
 
 
+def test_issues_carry_remediable_flag_from_ingestion_truth() -> None:
+    """The chip must come from the SAME extractor the pipeline uses: mock issue
+    8001 has an error signature (remediable), 8050 is a feature request (not)."""
+    resp = client.get("/api/issues?limit=50")
+    by_num = {i["number"]: i for i in resp.json()["issues"]}
+    assert by_num[8001]["remediable"] is True
+    assert by_num[8050]["remediable"] is False
+
+
 def test_issues_endpoint_auto_analyze_prs_defaults_false() -> None:
     # The UI must not auto-spend cloud calls on load unless explicitly enabled.
     resp = client.get("/api/issues")

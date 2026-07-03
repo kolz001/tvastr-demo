@@ -18,6 +18,7 @@ from tvastr.ingestion.github_issues import (
     GitHubIssuesFetcher,
     IssueRecord,
     MockGitHubIssuesFetcher,
+    issue_to_events,
 )
 
 router = APIRouter(tags=["issues"])
@@ -35,6 +36,10 @@ class IssueOut(BaseModel):
     reactions: int
     thumbs_up: int
     comments: int
+    # True iff the ingestion layer can extract a failure signature — computed
+    # by the SAME issue_to_events the pipeline uses, so the chip can't drift
+    # from what "Apply fix" will actually accept.
+    remediable: bool
 
 
 class IssueList(BaseModel):
@@ -58,6 +63,7 @@ def _to_out(rec: IssueRecord) -> IssueOut:
         reactions=rec.reactions,
         thumbs_up=rec.thumbs_up,
         comments=rec.comments,
+        remediable=bool(issue_to_events(rec, default_service="triage")),
     )
 
 
