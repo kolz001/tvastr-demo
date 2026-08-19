@@ -126,24 +126,28 @@ def load_outcomes(week: str, out_dir: Path) -> list[FixOutcome] | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, list):
-        return None
-    outcomes: list[FixOutcome] = []
-    for row in payload:
-        if not isinstance(row, dict):
-            continue
-        outcomes.append(
-            FixOutcome(
-                fingerprint=row["fingerprint"],
-                title=row["title"],
-                run_id=row.get("run_id"),
-                status=row["status"],
-                pr_url=row.get("pr_url"),
-                pr_urls=tuple(row.get("pr_urls", ())),
+        if not isinstance(payload, list):
+            return None
+        outcomes: list[FixOutcome] = []
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            outcomes.append(
+                FixOutcome(
+                    fingerprint=row["fingerprint"],
+                    title=row["title"],
+                    run_id=row.get("run_id"),
+                    status=row["status"],
+                    pr_url=row.get("pr_url"),
+                    pr_urls=tuple(row.get("pr_urls", ())),
+                )
             )
-        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        # A row missing a required key (KeyError), or of the wrong shape
+        # (TypeError/ValueError), is corrupt state -- degrade to None per this
+        # function's contract, same as a JSON-decode failure, rather than
+        # raising a route-level 500.
+        return None
     return outcomes
 
 

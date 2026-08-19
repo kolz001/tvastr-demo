@@ -50,7 +50,7 @@ def _error_record(message: str, day: str) -> dict:
 
 
 def test_router_registered_in_create_app() -> None:
-    paths = {route.path for route in create_app().routes}
+    paths = {getattr(route, "path", None) for route in create_app().routes}
     assert "/api/selfheal/status" in paths
     assert "/api/selfheal/report" in paths
     assert "/api/selfheal/scan" in paths
@@ -113,6 +113,22 @@ def test_status_enabled_with_scheduler_merges_status_dict(
     assert data["enabled"] is True
     assert data["scheduler"]["alive"] is True
     assert data["scheduler"]["last_weekly_week"] == "2026-W33"
+
+
+def test_status_survives_a_corrupt_weekly_report_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupted weekly/{week}.json must not break /status: latest_report_week
+    degrades to null instead of the route erroring."""
+    _redirect_root(monkeypatch, tmp_path)
+    weekly_dir = tmp_path / "selfheal" / "weekly"
+    weekly_dir.mkdir(parents=True)
+    (weekly_dir / "2026-W34.json").write_text("{not valid json", encoding="utf-8")
+
+    resp = client.get("/api/selfheal/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["latest_report_week"] is None
 
 
 # ── GET /api/selfheal/report ────────────────────────────────────────────────
@@ -215,6 +231,49 @@ def test_report_outcome_file_present_but_no_match_leaves_outcome_null(
     assert resp.json()["to_fix"][0]["outcome"] is None
 
 
+def test_report_corrupt_weekly_json_is_explained_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupted weekly/{week}.json must not crash the route with a bare
+    500 -- it should map to an HTTPException 500 with an explained detail
+    (same pattern as the GitHub-502 mapping in api/routes/issues.py)."""
+    _redirect_root(monkeypatch, tmp_path)
+    weekly_dir = tmp_path / "selfheal" / "weekly"
+    weekly_dir.mkdir(parents=True)
+    (weekly_dir / "2026-W34.json").write_text("{not valid json", encoding="utf-8")
+
+    resp = client.get("/api/selfheal/report")
+
+    assert resp.status_code == 500
+    assert "unreadable" in resp.json()["detail"]
+
+
+def test_report_outcomes_file_with_missing_keys_leaves_outcome_null_not_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid-JSON outcomes file whose rows are missing required keys must
+    not 500 -- load_outcomes degrades to None (task 3) and the report still
+    returns 200 with outcome=null."""
+    _redirect_root(monkeypatch, tmp_path)
+    out_dir = tmp_path / "selfheal"
+    selflogs_dir = tmp_path / "selflogs"
+    day = "2026-08-17"
+    _write_selflog(
+        selflogs_dir, day, [_error_record("run.failed: RuntimeError: boom", day) for _ in range(3)]
+    )
+    scan_day(day, selflogs_dir=selflogs_dir, runs_dir=tmp_path / "runs", out_dir=out_dir)
+    report = consolidate_week("2026-W34", digests_dir=out_dir, out_dir=out_dir)
+    assert report.to_fix
+    (out_dir / "weekly" / "2026-W34-outcomes.json").write_text(
+        json.dumps([{"title": "x"}]), encoding="utf-8"
+    )
+
+    resp = client.get("/api/selfheal/report")
+
+    assert resp.status_code == 200
+    assert resp.json()["to_fix"][0]["outcome"] is None
+
+
 # ── POST /api/selfheal/scan ─────────────────────────────────────────────────
 
 
@@ -261,6 +320,20 @@ def test_scan_daily_invalid_day_is_400(tmp_path: Path, monkeypatch: pytest.Monke
     resp = client.post("/api/selfheal/scan", json={"kind": "daily", "day": "not-a-date"})
 
     assert resp.status_code == 400
+
+
+def test_scan_daily_out_of_range_calendar_day_is_422_not_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"2026-02-31" is shape-valid (YYYY-MM-DD) but not a real calendar date --
+    date.fromisoformat raises ValueError deep inside the route. Must map to a
+    clean 422, never a bare 500."""
+    _redirect_root(monkeypatch, tmp_path)
+
+    resp = client.post("/api/selfheal/scan", json={"kind": "daily", "day": "2026-02-31"})
+
+    assert resp.status_code == 422
+    assert "2026-02-31" in resp.json()["detail"]
 
 
 def test_scan_weekly_with_explicit_week_produces_report_dict(
@@ -310,6 +383,20 @@ def test_scan_weekly_invalid_week_is_400(tmp_path: Path, monkeypatch: pytest.Mon
     assert resp.status_code == 400
 
 
+def test_scan_weekly_out_of_range_week_is_422_not_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"2026-W99" passes the YYYY-Www shape regex but ISO 2026 tops out at
+    week 53 -- date.fromisocalendar raises ValueError deep inside the route.
+    Must map to a clean 422, never a bare 500."""
+    _redirect_root(monkeypatch, tmp_path)
+
+    resp = client.post("/api/selfheal/scan", json={"kind": "weekly", "week": "2026-W99"})
+
+    assert resp.status_code == 422
+    assert "2026-W99" in resp.json()["detail"]
+
+
 def test_scan_manual_trigger_allowed_regardless_of_self_heal_enabled_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -356,3 +443,21 @@ def test_scan_weekly_never_invokes_the_fix_wave(
 
     assert resp.status_code == 200
     assert json.loads(resp.text)["to_fix"]  # the report still has fix candidates, just untouched
+
+
+def test_scan_weekly_corrupt_daily_digest_is_explained_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupted daily/{day}.jsonl must not crash the weekly consolidation
+    route with a bare 500 -- it should map to an HTTPException 500 with an
+    explained detail."""
+    _redirect_root(monkeypatch, tmp_path)
+    daily_dir = tmp_path / "selfheal" / "daily"
+    daily_dir.mkdir(parents=True)
+    day = "2026-08-17"  # Monday of 2026-W34
+    (daily_dir / f"{day}.jsonl").write_text("{not valid json\n", encoding="utf-8")
+
+    resp = client.post("/api/selfheal/scan", json={"kind": "weekly", "week": "2026-W34"})
+
+    assert resp.status_code == 500
+    assert "unreadable" in resp.json()["detail"]

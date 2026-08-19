@@ -45,6 +45,13 @@ log = get_logger(__name__)
 router = APIRouter(tags=["selfheal"])
 
 _WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Disk reads that can raise on a corrupted state file (bad JSON, or valid JSON
+# missing the keys a dataclass/model constructor requires). json.JSONDecodeError
+# and pydantic's ValidationError both subclass ValueError, so this one tuple
+# covers every corrupt-state shape the routes below can hit.
+_CORRUPT_STATE_ERRORS = (OSError, ValueError, KeyError, TypeError)
 
 
 def default_selfheal_root() -> Path:
@@ -87,7 +94,14 @@ def selfheal_status(request: Request) -> SelfHealStatusOut:
     settings = get_settings()
     scheduler = getattr(request.app.state, "selfheal_scheduler", None)
     out_dir = _out_dir(default_selfheal_root())
-    latest = load_latest_report(out_dir)
+    try:
+        latest = load_latest_report(out_dir)
+    except _CORRUPT_STATE_ERRORS as exc:
+        # /status must stay up even when the report on disk is corrupt -- it's
+        # the liveness/health surface, not a place a bad file should 500.
+        # Degrade to "no report" rather than failing the whole snapshot.
+        log.warning("selfheal.api.status_report_unreadable", out_dir=str(out_dir), error=str(exc))
+        latest = None
     return SelfHealStatusOut(
         enabled=settings.self_heal_enabled,
         scheduler=SchedulerStatusOut(**scheduler.status()) if scheduler is not None else None,
@@ -129,9 +143,7 @@ class WeeklyReportOut(BaseModel):
     days_scanned: list[str]
 
 
-def _cluster_out(
-    cluster: RankedCluster, outcome_by_fp: dict[str, FixOutcome]
-) -> RankedClusterOut:
+def _cluster_out(cluster: RankedCluster, outcome_by_fp: dict[str, FixOutcome]) -> RankedClusterOut:
     outcome = outcome_by_fp.get(cluster.fingerprint)
     return RankedClusterOut(
         **asdict(cluster),
@@ -147,7 +159,11 @@ def selfheal_report() -> WeeklyReportOut:
     has ever run.
     """
     out_dir = _out_dir(default_selfheal_root())
-    report = load_latest_report(out_dir)
+    try:
+        report = load_latest_report(out_dir)
+    except _CORRUPT_STATE_ERRORS as exc:
+        log.warning("selfheal.api.report_unreadable", out_dir=str(out_dir), error=str(exc))
+        raise HTTPException(500, f"self-heal report on disk is unreadable: {exc}") from exc
     if report is None:
         raise HTTPException(404, "no weekly report yet")
 
@@ -201,10 +217,15 @@ def selfheal_scan(body: ScanRequest) -> dict[str, Any]:
 
     if body.kind == "daily":
         day = body.day or _yesterday_utc()
+        if not _DAY_RE.match(day):
+            raise HTTPException(400, f"invalid day {day!r}, expected YYYY-MM-DD")
         try:
             date.fromisoformat(day)
         except ValueError as exc:
-            raise HTTPException(400, f"invalid day {day!r}, expected YYYY-MM-DD") from exc
+            # Shape-valid (YYYY-MM-DD) but not a real calendar date, e.g.
+            # "2026-02-31" -- distinct from the 400 above, which is a bare
+            # shape mismatch.
+            raise HTTPException(422, f"invalid day {day!r}: not a real date") from exc
         digest = scan_day(
             day,
             selflogs_dir=root / "selflogs",
@@ -224,13 +245,24 @@ def selfheal_scan(body: ScanRequest) -> dict[str, Any]:
     week = body.week or _previous_iso_week()
     if not _WEEK_RE.match(week):
         raise HTTPException(400, f"invalid week {week!r}, expected YYYY-Www")
-    report = consolidate_week(
-        week,
-        digests_dir=out_dir,
-        out_dir=out_dir,
-        top_n=settings.self_heal_top_n,
-        fix_n=settings.self_heal_fix_n,
-    )
+    year_str, week_str = week.split("-W")
+    try:
+        date.fromisocalendar(int(year_str), int(week_str), 1)
+    except ValueError as exc:
+        # Shape-valid (YYYY-Www) but out of ISO-calendar range, e.g.
+        # "2026-W99" -- 2026 tops out at week 53.
+        raise HTTPException(422, f"invalid ISO week {week!r}: {exc}") from exc
+    try:
+        report = consolidate_week(
+            week,
+            digests_dir=out_dir,
+            out_dir=out_dir,
+            top_n=settings.self_heal_top_n,
+            fix_n=settings.self_heal_fix_n,
+        )
+    except _CORRUPT_STATE_ERRORS as exc:
+        log.warning("selfheal.api.scan_weekly_unreadable", week=week, error=str(exc))
+        raise HTTPException(500, f"self-heal daily digest on disk is unreadable: {exc}") from exc
     log.info(
         "selfheal.api.scan_weekly",
         week=report.week,

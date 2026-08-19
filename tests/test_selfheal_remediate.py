@@ -455,6 +455,21 @@ def test_prologue_failure_returns_skipped_outcomes_for_all_clusters_never_raises
     ]
 
 
+# ── load_outcomes: tolerant disk read ──────────────────────────────────────
+
+
+def test_load_outcomes_row_missing_required_keys_returns_none(tmp_path: Path) -> None:
+    """A valid-JSON outcomes file whose rows are missing keys FixOutcome
+    requires (e.g. only "title", no "fingerprint"/"status") must degrade to
+    None per the docstring, not raise KeyError out of the route."""
+    out_dir = tmp_path / "selfheal"
+    path = out_dir / "weekly" / "2026-W34-outcomes.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps([{"title": "x"}]), encoding="utf-8")
+
+    assert remediate_mod.load_outcomes("2026-W34", out_dir) is None
+
+
 # ── the wave: the real default starter (mock mode, offline) ───────────────
 
 
