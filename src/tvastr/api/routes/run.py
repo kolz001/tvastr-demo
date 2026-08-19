@@ -49,6 +49,7 @@ from tvastr.ingestion.github_issues import (
 )
 from tvastr.logging import get_logger
 from tvastr.pipeline import build_pipeline
+from tvastr.runner import IN_FLIGHT, start_pipeline_thread
 
 log = get_logger(__name__)
 
@@ -56,7 +57,11 @@ router = APIRouter(tags=["run"])
 
 # Live pipeline threads by run_id. Entries remove themselves when the thread
 # finishes, so "in the dict and alive" ⇔ the run is still producing events.
-_IN_FLIGHT: dict[str, threading.Thread] = {}
+# This is an ALIAS, not a copy: the registry itself lives in ``tvastr.runner``
+# so the self-heal fix wave's runs land in the same map that ``api/app.py``'s
+# sweep and the stream route below consult. Existing importers of
+# ``run._IN_FLIGHT`` (app.py, tests) keep working unchanged.
+_IN_FLIGHT: dict[str, threading.Thread] = IN_FLIGHT
 
 
 class RunRequest(BaseModel):
@@ -110,85 +115,73 @@ def _start_pipeline_thread(
     sink: EventSink,
     run_id: str,
 ) -> threading.Thread:
-    """Run the pipeline in a background thread, persisting events via ``sink``."""
+    """Run the pipeline in a background thread, persisting events via ``sink``.
+
+    The thread mechanics (registry, error-event-on-exception, deregistration)
+    live in ``tvastr.runner.start_pipeline_thread``, shared with the self-heal
+    fix wave; everything below is the issue-specific body.
+    """
     settings = get_settings().model_copy(update={"dry_run": dry_run} if dry_run else {})
 
     def _run() -> None:
-        try:
-            events = issue_to_events(issue, default_service=repo.split("/")[-1])
-            if not events:
-                # Surface as a single event then close the stream.
-                sink.emit(
-                    PipelineEvent(
-                        type="error",
-                        layer="ingestion",
-                        step="issue_to_events",
-                        run_id=run_id,
-                        payload={
-                            "reason": "no error signature found in issue title or body",
-                            "issue_number": issue.number,
-                            "issue_title": issue.title,
-                        },
-                    )
-                )
-                return
-            from tvastr.analysis.pr_discovery import discover_pr, fetch_pr_diff
-
-            pr_ref = discover_pr(
-                repo, issue.number, token=settings.github_token, use_mocks=settings.use_mocks
-            )
-            pr_diff = None
-            if pr_ref is not None:
-                try:
-                    pr_diff = fetch_pr_diff(repo, pr_ref.number, token=settings.github_token)
-                except Exception as exc:
-                    log.warning("run.pr_diff_failed", error=str(exc))
-                    pr_ref = None
-            # Single-issue mode: bypass the recurrence threshold (the user has
-            # explicitly picked this issue; the threshold is for autonomous mode).
-            settings_for_run = settings.model_copy(update={"recurrence_threshold": 1})
-            # Synthesize a "log source" that returns nothing; we'll pass events directly.
-            pipeline = build_pipeline(
-                settings_for_run,
-                log_source=SimulatedLogSource(),  # unused; events passed below
-                event_sink=sink,
-                run_id=run_id,
-            )
-            # Override the threshold engine to require only 1 occurrence.
-            pipeline.threshold.recurrence_threshold = 1
-            pipeline.run(
-                events=events,
-                run_meta={
-                    "run_id": run_id,
-                    "repo": repo,
-                    "issue_number": issue.number,
-                    "issue_title": issue.title,
-                    "issue_url": issue.url,
-                    "dry_run": dry_run,
-                    "mode": "mock" if settings.use_mocks else "live",
-                },
-                pr_ref=pr_ref,
-                pr_diff=pr_diff,
-                issue_body=issue.body or "",
-            )
-        except Exception as exc:
-            log.exception("run.failed", run_id=run_id)
+        events = issue_to_events(issue, default_service=repo.split("/")[-1])
+        if not events:
+            # Surface as a single event then close the stream.
             sink.emit(
                 PipelineEvent(
                     type="error",
-                    layer="output",
-                    step="pipeline",
+                    layer="ingestion",
+                    step="issue_to_events",
                     run_id=run_id,
-                    payload={"error": type(exc).__name__, "message": str(exc)},
+                    payload={
+                        "reason": "no error signature found in issue title or body",
+                        "issue_number": issue.number,
+                        "issue_title": issue.title,
+                    },
                 )
             )
-        finally:
-            _IN_FLIGHT.pop(run_id, None)
+            return
+        from tvastr.analysis.pr_discovery import discover_pr, fetch_pr_diff
 
-    t = threading.Thread(target=_run, daemon=True, name=f"tvastr-run-{run_id}")
-    _IN_FLIGHT[run_id] = t
-    t.start()
-    return t
+        pr_ref = discover_pr(
+            repo, issue.number, token=settings.github_token, use_mocks=settings.use_mocks
+        )
+        pr_diff = None
+        if pr_ref is not None:
+            try:
+                pr_diff = fetch_pr_diff(repo, pr_ref.number, token=settings.github_token)
+            except Exception as exc:
+                log.warning("run.pr_diff_failed", error=str(exc))
+                pr_ref = None
+        # Single-issue mode: bypass the recurrence threshold (the user has
+        # explicitly picked this issue; the threshold is for autonomous mode).
+        settings_for_run = settings.model_copy(update={"recurrence_threshold": 1})
+        # Synthesize a "log source" that returns nothing; we'll pass events directly.
+        pipeline = build_pipeline(
+            settings_for_run,
+            log_source=SimulatedLogSource(),  # unused; events passed below
+            event_sink=sink,
+            run_id=run_id,
+        )
+        # Override the threshold engine to require only 1 occurrence.
+        pipeline.threshold.recurrence_threshold = 1
+        pipeline.run(
+            events=events,
+            run_meta={
+                "run_id": run_id,
+                "repo": repo,
+                "issue_number": issue.number,
+                "issue_title": issue.title,
+                "issue_url": issue.url,
+                "dry_run": dry_run,
+                "mode": "mock" if settings.use_mocks else "live",
+            },
+            pr_ref=pr_ref,
+            pr_diff=pr_diff,
+            issue_body=issue.body or "",
+        )
+
+    return start_pipeline_thread(_run, run_id=run_id, sink=sink)
 
 
 def _event_to_sse(event: PipelineEvent) -> str:
