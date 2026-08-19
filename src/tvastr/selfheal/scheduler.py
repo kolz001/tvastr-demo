@@ -38,8 +38,10 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from tvastr.config import Settings
+from tvastr.integrations import build_notifier
 from tvastr.logging import get_logger
-from tvastr.selfheal.report import consolidate_week, week_key
+from tvastr.selfheal.remediate import FixOutcome, escalate, run_fix_wave
+from tvastr.selfheal.report import WeeklyReport, consolidate_week, week_key
 from tvastr.selfheal.scan import scan_day
 
 log = get_logger(__name__)
@@ -133,13 +135,46 @@ class SelfHealScheduler:
         )
 
     def _default_weekly(self, week: str) -> None:
-        consolidate_week(
-            week,
-            digests_dir=self._selfheal_dir,
-            out_dir=self._selfheal_dir,
-            top_n=self._settings.self_heal_top_n,
-            fix_n=self._settings.self_heal_fix_n,
-        )
+        """consolidate -> fix wave -> escalate, degrading step by step.
+
+        Each step's failure is logged and the later steps still run with
+        whatever exists: a blown-up fix wave still escalates the consolidated
+        report (every cluster then reported unattempted), because a human
+        finding out what recurred is worth more than the wave's success. Only
+        a failed *consolidation* stops everything — without a report there is
+        nothing to fix or to say. An empty report is not escalated at all:
+        "nothing happened this week" is not worth a Slack post.
+        """
+        report: WeeklyReport | None = None
+        try:
+            report = consolidate_week(
+                week,
+                digests_dir=self._selfheal_dir,
+                out_dir=self._selfheal_dir,
+                top_n=self._settings.self_heal_top_n,
+                fix_n=self._settings.self_heal_fix_n,
+            )
+        except Exception as exc:
+            log.error("selfheal.scheduler.consolidate_failed", week=week, error=str(exc))
+        if report is None:
+            return
+
+        outcomes: list[FixOutcome] = []
+        try:
+            outcomes = run_fix_wave(
+                report,
+                settings=self._settings,
+                runs_dir=self._root / "runs",
+            )
+        except Exception as exc:
+            log.error("selfheal.scheduler.fix_wave_failed", week=week, error=str(exc))
+
+        if not report.to_fix and not report.report_only:
+            return
+        try:
+            escalate(report, outcomes, build_notifier(self._settings))
+        except Exception as exc:
+            log.error("selfheal.scheduler.escalate_failed", week=week, error=str(exc))
 
     # -- the one testable decision function ----------------------------------
 
