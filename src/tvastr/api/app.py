@@ -13,6 +13,7 @@ from tvastr.api.routes.run import _IN_FLIGHT
 from tvastr.config import get_settings
 from tvastr.events import default_runs_dir, mark_interrupted_runs
 from tvastr.logging import configure_logging, get_logger
+from tvastr.selfheal.scheduler import SelfHealScheduler
 
 log = get_logger(__name__)
 
@@ -58,6 +59,16 @@ def create_app() -> FastAPI:
             marked = mark_interrupted_runs(runs_dir, _IN_FLIGHT)
             if marked:
                 log.info("app.sweep.marked_interrupted", count=marked)
+
+    # Same single-scheduler rationale as the sweep gate above: this machine's
+    # ./data is shared between the host dev process and the docker-compose
+    # container, so only one process may run the self-heal scheduler against
+    # it. Store the scheduler OBJECT (not just its thread) on app.state so
+    # Task 6's status route can call .status() on it.
+    if settings.self_heal_enabled:
+        scheduler = SelfHealScheduler(settings=settings)
+        scheduler.start()
+        app.state.selfheal_scheduler = scheduler
 
     @app.get("/app", response_class=HTMLResponse, include_in_schema=False)
     def _app_page() -> HTMLResponse:

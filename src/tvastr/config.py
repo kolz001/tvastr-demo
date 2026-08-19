@@ -50,8 +50,9 @@ class Settings(BaseSettings):
     self_heal_repo: str = "kolz001/tvastr-demo"
     # UTC hour (0-23) the daily self-heal scan runs.
     self_heal_daily_hour: int = 2
-    # Day of week (0=Monday..6=Sunday) the weekly self-heal scan runs.
-    self_heal_weekly_day: int = 6
+    # Day of week the weekly self-heal scan runs. isoweekday: 1=Mon .. 7=Sun
+    # (matches Python's date.isoweekday(), which the scheduler uses directly).
+    self_heal_weekly_day: int = 7
     # How many top recurring self-failures the daily scan considers.
     self_heal_top_n: int = 10
     # How many of those top failures actually get a fix attempt.
