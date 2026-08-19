@@ -159,7 +159,7 @@ class SelfHealScheduler:
             fired.append(self._fire_daily(yesterday))
 
         if hour_reached and now.isoweekday() == self._settings.self_heal_weekly_day:
-            target_week = week_key(yesterday)
+            target_week = week_key((now.date() - timedelta(days=7)).isoformat())
             if self._state.last_weekly_week != target_week:
                 fired.append(self._fire_weekly(target_week))
 
@@ -227,11 +227,11 @@ class SelfHealScheduler:
         else:
             next_daily = (date.fromisoformat(yesterday) + timedelta(days=1)).isoformat()
 
-        target_week = week_key(yesterday)
+        target_week = week_key((now.date() - timedelta(days=7)).isoformat())
         if self._state.last_weekly_week != target_week:
             next_weekly = target_week
         else:
-            next_weekly = week_key((date.fromisoformat(yesterday) + timedelta(days=7)).isoformat())
+            next_weekly = week_key((now.date() - timedelta(days=14)).isoformat())
 
         return {
             "alive": self._thread is not None and self._thread.is_alive(),

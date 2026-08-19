@@ -150,8 +150,8 @@ def test_weekly_fires_for_completed_previous_week_on_configured_day(tmp_path: Pa
 
     fired = scheduler.tick()
 
-    assert fired == ["daily:2026-08-22", "weekly:2026-W34"]
-    assert weekly_calls == ["2026-W34"]
+    assert fired == ["daily:2026-08-22", "weekly:2026-W33"]
+    assert weekly_calls == ["2026-W33"]
 
 
 def test_weekly_does_not_fire_on_non_configured_weekday(tmp_path: Path) -> None:
@@ -169,6 +169,27 @@ def test_weekly_does_not_fire_on_non_configured_weekday(tmp_path: Path) -> None:
     assert weekly_calls == []
 
 
+def test_weekly_configured_for_monday_targets_completed_previous_week(tmp_path: Path) -> None:
+    """Weekly configured for Monday (isoweekday=1) should target the week
+    ending the previous day, using week_key(now - 7d) semantics."""
+    # MON_AT_HOUR = Monday 2026-08-17 at 2:00 AM
+    MON_AT_HOUR = datetime(2026, 8, 17, 2, 0, tzinfo=UTC)
+    weekly_calls: list[str] = []
+    scheduler = SelfHealScheduler(
+        settings=_settings(self_heal_weekly_day=1),  # Monday
+        root=tmp_path,
+        now_fn=lambda: MON_AT_HOUR,
+        run_daily=_no_op,
+        run_weekly=weekly_calls.append,
+    )
+
+    fired = scheduler.tick()
+
+    # On Monday 2026-08-17, (now - 7 days) = 2026-08-10 = W33
+    assert fired == ["daily:2026-08-16", "weekly:2026-W33"]
+    assert weekly_calls == ["2026-W33"]
+
+
 def test_weekly_second_tick_same_week_fires_nothing(tmp_path: Path) -> None:
     weekly_calls: list[str] = []
     scheduler = SelfHealScheduler(
@@ -182,8 +203,8 @@ def test_weekly_second_tick_same_week_fires_nothing(tmp_path: Path) -> None:
     scheduler.tick()
     second = scheduler.tick()
 
-    assert weekly_calls == ["2026-W34"]
-    assert "weekly:2026-W34" not in second
+    assert weekly_calls == ["2026-W33"]
+    assert "weekly:2026-W33" not in second
 
 
 # ── tick(): hook exceptions ────────────────────────────────────────────────
@@ -237,12 +258,12 @@ def test_weekly_hook_exception_still_records_state_and_does_not_propagate(
 
     fired = scheduler.tick()  # must not raise
 
-    assert "weekly:2026-W34" in fired
-    assert calls == ["2026-W34"]
+    assert "weekly:2026-W33" in fired
+    assert calls == ["2026-W33"]
 
     second = scheduler.tick()
-    assert "weekly:2026-W34" not in second
-    assert calls == ["2026-W34"]
+    assert "weekly:2026-W33" not in second
+    assert calls == ["2026-W33"]
 
 
 # ── SchedulerState ─────────────────────────────────────────────────────────
@@ -392,10 +413,10 @@ def test_default_weekly_hook_wraps_consolidate_week(tmp_path: Path) -> None:
 
     scheduler.tick()
 
-    report_path = tmp_path / "selfheal" / "weekly" / "2026-W34.json"
+    report_path = tmp_path / "selfheal" / "weekly" / "2026-W33.json"
     assert report_path.exists()
     payload = json.loads(report_path.read_text(encoding="utf-8"))
-    assert payload["week"] == "2026-W34"
+    assert payload["week"] == "2026-W33"
 
 
 # ── app wiring: zero threads under the conftest seal ───────────────────────
