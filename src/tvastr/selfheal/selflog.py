@@ -8,15 +8,18 @@ recurring failures and feed them back through the same diagnose/fix/verify
 pipeline used for the target repo.
 
 This module must never destabilize application logging: a full disk, an
-unwritable directory, or any other I/O failure is swallowed silently and
-``event_dict`` is always returned unchanged, so a broken self-log never takes
-down (or even warns) the rest of the app.
+unwritable directory, or any other I/O failure is swallowed and ``event_dict``
+is always returned unchanged. On the first write failure per process, a single
+warning is emitted to alert operators that capture has gone dark; subsequent
+failures stay fully silent so a broken self-log never takes down the rest of
+the app.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,10 +49,18 @@ class SelfLogWriter:
         self.retention_days = retention_days
         self._lock = threading.Lock()
         self._last_day: str | None = None
+        self._warned: bool = False
 
     def __call__(self, logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
-        with contextlib.suppress(Exception):
+        try:
             self._write(event_dict)
+        except Exception as exc:
+            if not self._warned:
+                self._warned = True
+                with contextlib.suppress(Exception):
+                    logging.getLogger(__name__).warning(
+                        "selflog capture failed; further failures suppressed: %s", exc
+                    )
         return event_dict
 
     def _write(self, event_dict: EventDict) -> None:

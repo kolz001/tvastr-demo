@@ -10,6 +10,7 @@ correctness of the happy path.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from datetime import UTC, datetime, timedelta
@@ -93,6 +94,33 @@ def test_unwritable_dir_never_raises(tmp_path: Path) -> None:
         assert not selflog_path(target, _today()).exists()
     finally:
         target.chmod(0o700)  # restore write perms so tmp_path teardown can clean up
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+def test_unwritable_target_warns_once_per_process(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    target = tmp_path / "selflogs"
+    target.mkdir()
+    target.chmod(0o500)
+    writer = SelfLogWriter(target)
+    try:
+        with caplog.at_level(logging.WARNING, logger="tvastr.selfheal.selflog"):
+            result1 = writer(None, "info", {"event": "first"})
+            result2 = writer(None, "info", {"event": "second"})
+            result3 = writer(None, "info", {"event": "third"})
+
+        assert result1 == {"event": "first"}
+        assert result2 == {"event": "second"}
+        assert result3 == {"event": "third"}
+        warning_records = [
+            r for r in caplog.records
+            if r.name == "tvastr.selfheal.selflog" and r.levelname == "WARNING"
+        ]
+        assert len(warning_records) == 1
+        assert "selflog capture failed" in warning_records[0].message
+    finally:
+        target.chmod(0o700)
 
 
 def test_configure_logging_without_selflog_dir_installs_no_writer(
