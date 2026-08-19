@@ -153,6 +153,23 @@
   .chapter{margin:14px 2px 8px;padding:6px 2px 0;font:600 12px var(--sans);color:var(--text);letter-spacing:.01em;border-top:1px solid var(--border)}
   .chapter .n{color:var(--text-dim);font:600 11px var(--mono);margin-right:6px}
   .chapter.sub{font:600 10px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-top:1px dashed var(--border)}
+
+  /* Self-heal panel */
+  details.panel summary{cursor:pointer;padding:10px 14px;font:600 12px var(--mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface)}
+  details.panel summary::-webkit-details-marker{color:var(--text-dim)}
+  .sh-body{padding:12px 14px}
+  .sh-line{font-size:12.5px;line-height:1.9;color:var(--text)}
+  .sh-line .k{color:var(--text-dim);display:inline-block;min-width:160px}
+  .sh-actions{display:flex;align-items:center;gap:10px;margin:10px 0}
+  .sh-caption{padding:8px 14px;text-align:left;color:var(--text-dim);font-size:11.5px;border-bottom:1px solid var(--border)}
+  .sh-kind{display:inline-block;font:600 9px var(--mono);padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em;background:var(--surface-3);color:var(--text-dim)}
+  .sh-kind.quality{background:rgba(122,167,255,.13);color:var(--cloud)}
+  .sh-kind.handled_upstream{background:rgba(139,150,166,.13);color:var(--text-dim)}
+  .sh-status{display:inline-block;font:600 9px var(--mono);padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em;background:var(--surface-3);color:var(--text-dim)}
+  .sh-status.pr_created{background:rgba(88,200,176,.12);color:var(--accent)}
+  .sh-status.unverified{background:rgba(240,184,110,.13);color:var(--warn)}
+  .sh-status.failed{background:rgba(239,111,111,.13);color:var(--error)}
+  .sh-run-link{margin-left:6px;font-size:11px}
 </style>
 </head>
 <body>
@@ -169,6 +186,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="triage">Triage</div>
     <div class="tab" data-tab="runs">Past runs</div>
+    <div class="tab" data-tab="selfheal">Self-heal</div>
   </div>
 
   <!-- TRIAGE TAB -->
@@ -221,6 +239,23 @@
         <div class="empty">Loading…</div>
       </div>
     </div>
+  </div>
+
+  <!-- SELF-HEAL TAB -->
+  <div id="tab-selfheal" style="display:none">
+    <details class="panel" id="selfheal-card" open>
+      <summary>Self-heal</summary>
+      <div class="sh-body">
+        <div id="selfheal-status-line" class="empty">Loading…</div>
+        <div class="sh-actions">
+          <button class="primary" id="btn-selfheal-scan">Run digest now</button>
+          <span id="selfheal-scan-status" style="color:var(--text-dim);font-size:12px"></span>
+        </div>
+        <div id="selfheal-report-wrap">
+          <div class="empty">Loading…</div>
+        </div>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -452,7 +487,9 @@ document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", (
   const which = tab.dataset.tab;
   $("tab-triage").style.display = which === "triage" ? "" : "none";
   $("tab-runs").style.display = which === "runs" ? "" : "none";
+  $("tab-selfheal").style.display = which === "selfheal" ? "" : "none";
   if (which === "runs") loadRuns();
+  if (which === "selfheal") loadSelfHeal();
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1059,10 +1096,125 @@ async function replayRun(runId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Self-heal panel — status line + latest weekly report + manual scan trigger
+// ─────────────────────────────────────────────────────────────────────────────
+function renderSelfHealStatus(status) {
+  const sch = status.scheduler;
+  const lines = [
+    `<div class="sh-line"><span class="k">Enabled</span>${status.enabled ? "yes" : "no"}</div>`,
+    `<div class="sh-line"><span class="k">Scheduler</span>${sch ? (sch.alive ? "alive" : "not running") : "n/a (feature off)"}</div>`,
+  ];
+  if (sch) {
+    lines.push(`<div class="sh-line"><span class="k">Last daily digest</span>${html(sch.last_daily_date || "never")} — next expected ${html(sch.next_expected_daily)}</div>`);
+    lines.push(`<div class="sh-line"><span class="k">Last weekly report</span>${html(sch.last_weekly_week || "never")} — next expected ${html(sch.next_expected_weekly)}</div>`);
+  }
+  lines.push(`<div class="sh-line"><span class="k">Latest report on disk</span>${html(status.latest_report_week || "none yet")}</div>`);
+  $("selfheal-status-line").innerHTML = lines.join("");
+}
+
+function selfHealStatusChip(cluster, isToFix) {
+  const outcome = cluster.outcome;
+  if (outcome) {
+    return `<span class="sh-status ${html(outcome.status)}">${html(outcome.status.replace(/_/g, " "))}</span>`;
+  }
+  return isToFix
+    ? `<span class="sh-status">not yet run</span>`
+    : `<span class="sh-status">report-only</span>`;
+}
+
+function selfHealPrCell(cluster) {
+  const outcome = cluster.outcome;
+  const links = [];
+  const urls = (outcome && outcome.pr_urls && outcome.pr_urls.length)
+    ? outcome.pr_urls
+    : (outcome && outcome.pr_url ? [outcome.pr_url] : []);
+  urls.forEach(u => links.push(`<a href="${html(u)}" target="_blank" rel="noopener" class="pr-chip">PR</a>`));
+  if (outcome && outcome.run_id) {
+    links.push(`<a href="#" class="sh-run-link" data-run="${html(outcome.run_id)}">view run</a>`);
+  }
+  return links.join(" ") || "—";
+}
+
+function renderSelfHealReport(report) {
+  const clusters = [
+    ...report.to_fix.map(c => ({ c, isToFix: true })),
+    ...report.report_only.map(c => ({ c, isToFix: false })),
+  ];
+  if (!clusters.length) {
+    $("selfheal-report-wrap").innerHTML = `<div class="empty">Week ${html(report.week)}: no clusters ranked.</div>`;
+    return;
+  }
+  const generated = (report.generated_at || "").replace("T", " ").split(".")[0];
+  const rows = clusters.map(({ c, isToFix }, idx) => `
+    <tr>
+      <td>${idx + 1}</td>
+      <td><span class="sh-kind ${html(c.kind)}">${html(c.kind)}</span></td>
+      <td>${html(c.title)}</td>
+      <td>${c.count}</td>
+      <td>${selfHealStatusChip(c, isToFix)}</td>
+      <td>${selfHealPrCell(c)}</td>
+    </tr>`).join("");
+  $("selfheal-report-wrap").innerHTML = `
+    <div class="sh-caption">Week ${html(report.week)} · generated ${html(generated)} · ${report.days_scanned.length} day(s) scanned</div>
+    <table class="runs-table">
+      <thead><tr><th>#</th><th>Kind</th><th>Title</th><th>Count</th><th>Status</th><th>PR / run</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  document.querySelectorAll(".sh-run-link").forEach(a => {
+    a.addEventListener("click", (e) => { e.preventDefault(); replayRun(a.dataset.run); });
+  });
+}
+
+async function loadSelfHeal() {
+  $("selfheal-status-line").innerHTML = `<div class="empty">Loading…</div>`;
+  $("selfheal-report-wrap").innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const statusResp = await fetch("/api/selfheal/status");
+    if (!statusResp.ok) throw new Error(`HTTP ${statusResp.status}`);
+    renderSelfHealStatus(await statusResp.json());
+  } catch (e) {
+    $("selfheal-status-line").innerHTML = `<div class="empty">Failed to load status: ${html(String(e))}</div>`;
+  }
+  try {
+    const reportResp = await fetch("/api/selfheal/report");
+    if (reportResp.status === 404) {
+      $("selfheal-report-wrap").innerHTML = `<div class="empty">No weekly report yet. Click "Run digest now" (daily), then run a weekly scan once a few days are in.</div>`;
+      return;
+    }
+    if (!reportResp.ok) throw new Error(`HTTP ${reportResp.status}`);
+    renderSelfHealReport(await reportResp.json());
+  } catch (e) {
+    $("selfheal-report-wrap").innerHTML = `<div class="empty">Failed to load report: ${html(String(e))}</div>`;
+  }
+}
+
+async function runSelfHealScanNow() {
+  const btn = $("btn-selfheal-scan");
+  btn.disabled = true;
+  $("selfheal-scan-status").textContent = "running…";
+  try {
+    const resp = await fetch("/api/selfheal/scan", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "daily" }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    $("selfheal-scan-status").textContent = `done — ${data.day}: ${data.cluster_count} cluster(s), ${data.scanned_runs} run(s) scanned`;
+  } catch (e) {
+    $("selfheal-scan-status").textContent = `failed: ${String(e)}`;
+  } finally {
+    btn.disabled = false;
+    await loadSelfHeal();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Wire up
 // ─────────────────────────────────────────────────────────────────────────────
 $("btn-fetch").addEventListener("click", fetchIssues);
 $("btn-refresh-runs").addEventListener("click", loadRuns);
+$("btn-selfheal-scan").addEventListener("click", runSelfHealScanNow);
 fetchIssues();  // auto-load on page open
 </script>
 

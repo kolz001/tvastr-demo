@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from tvastr import __version__
-from tvastr.api.routes import health, issues, pr, remediate, run, verify
+from tvastr.api.routes import health, issues, pr, remediate, run, selfheal, verify
 from tvastr.api.routes.run import _IN_FLIGHT
 from tvastr.config import get_settings
 from tvastr.events import default_runs_dir, mark_interrupted_runs
@@ -42,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(pr.router)
     app.include_router(remediate.router)
     app.include_router(run.router)
+    app.include_router(selfheal.router)
     app.include_router(verify.router)
 
     # Single-process-scoped: liveness is judged against this process's

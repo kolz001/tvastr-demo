@@ -40,7 +40,7 @@ from pathlib import Path
 from tvastr.config import Settings
 from tvastr.integrations import build_notifier
 from tvastr.logging import get_logger
-from tvastr.selfheal.remediate import FixOutcome, escalate, run_fix_wave
+from tvastr.selfheal.remediate import FixOutcome, escalate, run_fix_wave, write_outcomes
 from tvastr.selfheal.report import WeeklyReport, consolidate_week, week_key
 from tvastr.selfheal.scan import scan_day
 
@@ -171,6 +171,20 @@ class SelfHealScheduler:
         except Exception as exc:
             log.error(
                 "selfheal.scheduler.fix_wave_failed", week=week, error=str(exc), self_heal=True
+            )
+
+        # Additive persistence (Task 6): the API report route reads this back
+        # to merge each to_fix cluster's PR/status onto the report. A write
+        # failure here must not stop escalation -- the Slack summary already
+        # carries the same information from `outcomes` in-process.
+        try:
+            write_outcomes(week, outcomes, self._selfheal_dir)
+        except Exception as exc:
+            log.error(
+                "selfheal.scheduler.write_outcomes_failed",
+                week=week,
+                error=str(exc),
+                self_heal=True,
             )
 
         if not report.to_fix and not report.report_only:

@@ -34,8 +34,9 @@ line, because verify events append after ``pipeline.end`` (see CLAUDE.md).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -92,6 +93,58 @@ class FixOutcome:
     # interface stability; this is additive so existing positional/keyword
     # FixOutcome(...) callers (tests included) are unaffected.
     pr_urls: tuple[str, ...] = ()
+
+
+def _outcomes_path(out_dir: Path, week: str) -> Path:
+    return out_dir / "weekly" / f"{week}-outcomes.json"
+
+
+def write_outcomes(week: str, outcomes: list[FixOutcome], out_dir: Path) -> None:
+    """Persist a week's fix-wave outcomes alongside its ``WeeklyReport``.
+
+    Outcomes were never persisted before Task 6 (``run_fix_wave`` returns them
+    in-process only, to the scheduler's weekly hook). Task 6's report route
+    needs them back on a later request to merge PR/status info onto each
+    ``to_fix`` cluster, so the weekly hook writes this file additively --
+    ``run_fix_wave``'s own signature is untouched. Written next to
+    ``out_dir/weekly/{week}.json`` (the report itself) as
+    ``out_dir/weekly/{week}-outcomes.json``.
+    """
+    path = _outcomes_path(out_dir, week)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([asdict(o) for o in outcomes], indent=2), encoding="utf-8")
+
+
+def load_outcomes(week: str, out_dir: Path) -> list[FixOutcome] | None:
+    """Load a week's persisted fix-wave outcomes.
+
+    ``None`` if no wave was ever recorded for this week -- distinct from an
+    empty list (a wave ran and produced zero ``to_fix`` outcomes).
+    """
+    path = _outcomes_path(out_dir, week)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, list):
+        return None
+    outcomes: list[FixOutcome] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        outcomes.append(
+            FixOutcome(
+                fingerprint=row["fingerprint"],
+                title=row["title"],
+                run_id=row.get("run_id"),
+                status=row["status"],
+                pr_url=row.get("pr_url"),
+                pr_urls=tuple(row.get("pr_urls", ())),
+            )
+        )
+    return outcomes
 
 
 class _Notifier(Protocol):
