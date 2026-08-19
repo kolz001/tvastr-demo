@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,18 @@ class DailyDigest:
     skipped_self_runs: int
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Best-effort ISO-8601 parse. ``None`` (never raises) on anything that
+    isn't a parseable string, so callers fall back to ``LogEvent``'s own
+    default (construction time) silently."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _selflog_candidates(day: str, selflogs_dir: Path) -> list[LogEvent]:
     """Mine one day's selflog file for error/critical records worth surfacing."""
     path = selflog_path(selflogs_dir, day)
@@ -80,8 +93,10 @@ def _selflog_candidates(day: str, selflogs_dir: Path) -> list[LogEvent]:
             if not message:
                 continue
             stack = record.get("exception") or record.get("stack")
+            timestamp = _parse_timestamp(record.get("timestamp"))
             candidates.append(
                 LogEvent(
+                    **({"timestamp": timestamp} if timestamp is not None else {}),
                     service="tvastr-self",
                     severity=Severity.ERROR,
                     message=str(message),
@@ -119,10 +134,16 @@ def _run_attributes(run_id: str, issue_ref: str) -> dict[str, str]:
     return {"origin": _ORIGIN_RUNS, "run_id": run_id, "issue": issue_ref}
 
 
+def _event_timestamp(event: PipelineEvent) -> datetime | None:
+    return _parse_timestamp(event.timestamp)
+
+
 def _ops_log_event(run_id: str, issue_ref: str, event: PipelineEvent) -> LogEvent:
     payload = event.payload
     reason = payload.get("reason") or payload.get("error") or payload.get("message") or event.step
+    timestamp = _event_timestamp(event)
     return LogEvent(
+        **({"timestamp": timestamp} if timestamp is not None else {}),
         service="tvastr-runs",
         severity=Severity.ERROR,
         message=f"{event.step}: {reason}",
@@ -132,8 +153,10 @@ def _ops_log_event(run_id: str, issue_ref: str, event: PipelineEvent) -> LogEven
     )
 
 
-def _confidence_zero_log_event(run_id: str, issue_ref: str) -> LogEvent:
+def _confidence_zero_log_event(run_id: str, issue_ref: str, event: PipelineEvent) -> LogEvent:
+    timestamp = _event_timestamp(event)
     return LogEvent(
+        **({"timestamp": timestamp} if timestamp is not None else {}),
         service="tvastr-runs",
         severity=Severity.ERROR,
         message="investigator returned confidence 0.0",
@@ -143,7 +166,9 @@ def _confidence_zero_log_event(run_id: str, issue_ref: str) -> LogEvent:
 
 
 def _repro_broken_log_event(run_id: str, issue_ref: str, event: PipelineEvent) -> LogEvent:
+    timestamp = _event_timestamp(event)
     return LogEvent(
+        **({"timestamp": timestamp} if timestamp is not None else {}),
         service="tvastr-runs",
         severity=Severity.ERROR,
         message="verify verdict repro_broken",
@@ -168,7 +193,9 @@ def _llm_failure_log_event(run_id: str, issue_ref: str, event: PipelineEvent) ->
     payload = event.payload
     detail = payload.get("error") or "llm call failed"
     task = payload.get("task", "unknown")
+    timestamp = _event_timestamp(event)
     return LogEvent(
+        **({"timestamp": timestamp} if timestamp is not None else {}),
         service="tvastr-runs",
         severity=Severity.ERROR,
         message=f"llm.call failed ({task}): {detail}",
@@ -178,22 +205,23 @@ def _llm_failure_log_event(run_id: str, issue_ref: str, event: PipelineEvent) ->
 
 
 def _extract_run_candidates(run_id: str, events: list[PipelineEvent]) -> list[LogEvent]:
+    """One run file can contain MULTIPLE ``agent.node.end``/step=investigate
+    events — the pipeline runs the agent once per detected pattern in the
+    run. Every one of them with ``confidence == 0.0`` yields its own quality
+    candidate, not just the last."""
     issue_ref = _issue_ref(events)
     candidates: list[LogEvent] = []
-    last_investigate: PipelineEvent | None = None
 
     for event in events:
         if event.type == "error":
             candidates.append(_ops_log_event(run_id, issue_ref, event))
         elif event.type == "agent.node.end" and event.step == "investigate":
-            last_investigate = event
+            if event.payload.get("confidence") == 0.0:
+                candidates.append(_confidence_zero_log_event(run_id, issue_ref, event))
         elif event.type == "verify.result" and event.payload.get("verdict") == _REPRO_BROKEN:
             candidates.append(_repro_broken_log_event(run_id, issue_ref, event))
         elif event.type == "llm.call" and _llm_call_failed(event.payload):
             candidates.append(_llm_failure_log_event(run_id, issue_ref, event))
-
-    if last_investigate is not None and last_investigate.payload.get("confidence") == 0.0:
-        candidates.append(_confidence_zero_log_event(run_id, issue_ref))
 
     return candidates
 

@@ -10,6 +10,7 @@ tail forever.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tvastr.domain import Severity
@@ -218,6 +219,79 @@ def test_nonzero_confidence_yields_no_quality_candidate(tmp_path: Path) -> None:
 
     events, _, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
     assert events == []
+
+
+def test_two_investigate_events_one_zero_one_nonzero_yields_one_candidate(
+    tmp_path: Path,
+) -> None:
+    """A run file with two investigate events (agent runs once per detected
+    pattern) — one confidence 0.0, one 0.8 — must yield exactly one
+    confidence-zero candidate, for the 0.0 event only."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    run_id = "run-mixed-confidence"
+    _write_run(
+        runs_dir,
+        run_id,
+        [
+            _pipeline_start(run_id),
+            _run_event(
+                "agent.node.end",
+                "investigate",
+                {"confidence": 0.0, "summary": "pattern A insufficient evidence"},
+                run_id=run_id,
+            ),
+            _run_event(
+                "agent.node.end",
+                "investigate",
+                {"confidence": 0.8, "summary": "pattern B clear cause"},
+                run_id=run_id,
+            ),
+            _pipeline_end(run_id),
+        ],
+    )
+
+    events, scanned_runs, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
+
+    assert scanned_runs == 1
+    assert len(events) == 1
+    assert events[0].message == "investigator returned confidence 0.0"
+
+
+def test_two_zero_confidence_investigate_events_yield_two_candidates(
+    tmp_path: Path,
+) -> None:
+    """A run file with two confidence-0.0 investigate events (two detected
+    patterns, both under-confident) must yield two quality candidates."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    run_id = "run-double-zero-confidence"
+    _write_run(
+        runs_dir,
+        run_id,
+        [
+            _pipeline_start(run_id),
+            _run_event(
+                "agent.node.end",
+                "investigate",
+                {"confidence": 0.0, "summary": "pattern A insufficient evidence"},
+                run_id=run_id,
+            ),
+            _run_event(
+                "agent.node.end",
+                "investigate",
+                {"confidence": 0.0, "summary": "pattern B insufficient evidence"},
+                run_id=run_id,
+            ),
+            _pipeline_end(run_id),
+        ],
+    )
+
+    events, scanned_runs, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
+
+    assert scanned_runs == 1
+    assert len(events) == 2
+    assert all(e.message == "investigator returned confidence 0.0" for e in events)
 
 
 # ── (d) loop guard: self_heal run contributes zero candidates ───────────────
@@ -485,6 +559,137 @@ def test_corrupt_run_lines_skipped_without_raising(tmp_path: Path) -> None:
     assert scanned_runs == 1
     assert len(events) == 1
     assert events[0].message == "step: z"
+
+
+# ── source timestamps: candidates must carry the real event time, not utcnow ─
+
+
+def test_selflog_candidate_preserves_record_timestamp(tmp_path: Path) -> None:
+    """A selflog LogEvent's timestamp must come from the record's own
+    ``timestamp`` field, not construction time."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    old_ts = datetime.now(UTC) - timedelta(days=5)
+    _write_selflog(
+        selflogs_dir,
+        DAY,
+        [
+            {
+                "event": "old failure",
+                "level": "error",
+                "timestamp": old_ts.isoformat(),
+            }
+        ],
+    )
+
+    events, _, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
+
+    assert len(events) == 1
+    assert events[0].timestamp == old_ts
+    assert (datetime.now(UTC) - events[0].timestamp) > timedelta(days=1)
+
+
+def test_selflog_candidate_falls_back_silently_on_missing_or_corrupt_timestamp(
+    tmp_path: Path,
+) -> None:
+    """A missing/corrupt ``timestamp`` field must not raise — the LogEvent
+    falls back to its default (construction-time) timestamp."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    _write_selflog(
+        selflogs_dir,
+        DAY,
+        [
+            {"event": "no timestamp field", "level": "error"},
+            {"event": "corrupt timestamp", "level": "error", "timestamp": "not-a-timestamp"},
+        ],
+    )
+
+    events, _, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
+
+    assert len(events) == 2
+    for event in events:
+        assert (datetime.now(UTC) - event.timestamp) < timedelta(minutes=5)
+
+
+def test_run_error_candidate_preserves_event_timestamp(tmp_path: Path) -> None:
+    """A run-event LogEvent's timestamp must come from the source
+    PipelineEvent's own timestamp, not construction time."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    run_id = "run-old-error"
+    old_ts = datetime.now(UTC) - timedelta(days=5)
+    old_ts_iso = old_ts.isoformat()
+    _write_run(
+        runs_dir,
+        run_id,
+        [
+            _pipeline_start(run_id),
+            _run_event(
+                "error",
+                "issue_to_events",
+                {"reason": "no signature"},
+                ts=old_ts_iso,
+                run_id=run_id,
+            ),
+            _pipeline_end(run_id),
+        ],
+    )
+
+    events, _, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
+
+    assert len(events) == 1
+    assert events[0].timestamp == old_ts
+    assert (datetime.now(UTC) - events[0].timestamp) > timedelta(days=1)
+
+
+def test_digest_cluster_first_last_seen_reflect_source_timestamps(tmp_path: Path) -> None:
+    """The clustered FailurePattern's first_seen/last_seen must be derived
+    from the candidates' real source timestamps, not from utcnow — construct
+    a selflog record and a run error event with a known, fixed timestamp and
+    assert the resulting cluster reflects it exactly rather than "now"."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    out_dir = tmp_path / "digests"
+    known_ts = datetime.fromisoformat(f"{DAY}T03:15:00+00:00")
+    _write_selflog(
+        selflogs_dir,
+        DAY,
+        [
+            {
+                "event": "ancient failure",
+                "level": "error",
+                "timestamp": known_ts.isoformat(),
+            }
+        ],
+    )
+    run_id = "run-ancient-error"
+    # events[0] (pipeline.start) must keep a DAY-prefixed timestamp so the
+    # run file is selected for this day; the error event itself carries the
+    # known timestamp under test.
+    _write_run(
+        runs_dir,
+        run_id,
+        [
+            _pipeline_start(run_id),
+            _run_event(
+                "error",
+                "step",
+                {"reason": "ancient"},
+                ts=known_ts.isoformat(),
+                run_id=run_id,
+            ),
+            _pipeline_end(run_id),
+        ],
+    )
+
+    digest = scan_day(DAY, selflogs_dir=selflogs_dir, runs_dir=runs_dir, out_dir=out_dir)
+
+    assert len(digest.clusters) == 2
+    for cluster in digest.clusters:
+        assert cluster.first_seen == known_ts
+        assert cluster.last_seen == known_ts
+        assert (datetime.now(UTC) - cluster.first_seen) > timedelta(minutes=5)
 
 
 # ── (g) roundtrip scan_day -> load_daily ─────────────────────────────────────
