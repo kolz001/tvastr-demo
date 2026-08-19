@@ -231,7 +231,7 @@ class SelfHealScheduler:
         if self._state.last_weekly_week != target_week:
             next_weekly = target_week
         else:
-            next_weekly = week_key((now.date() - timedelta(days=14)).isoformat())
+            next_weekly = week_key(now.date().isoformat())
 
         return {
             "alive": self._thread is not None and self._thread.is_alive(),

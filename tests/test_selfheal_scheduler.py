@@ -333,6 +333,22 @@ def test_status_next_expected_daily_advances_once_recorded(tmp_path: Path) -> No
     assert after == "2026-08-19"
 
 
+def test_status_next_expected_weekly_advances_once_recorded(tmp_path: Path) -> None:
+    scheduler = SelfHealScheduler(
+        settings=_settings(),
+        root=tmp_path,
+        now_fn=lambda: SUN_AT_HOUR,
+        run_daily=_no_op,
+        run_weekly=_no_op,
+    )
+    before = scheduler.status()["next_expected_weekly"]
+    scheduler.tick()
+    after = scheduler.status()["next_expected_weekly"]
+
+    assert before == "2026-W33"
+    assert after == "2026-W34"
+
+
 # ── start()/stop() thread lifecycle ────────────────────────────────────────
 
 
