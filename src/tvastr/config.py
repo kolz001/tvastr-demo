@@ -39,6 +39,26 @@ class Settings(BaseSettings):
     # mutates real run files on disk.
     sweep_on_startup: bool = True
 
+    # --- Self-healing loop ---
+    # When true, tvastr captures its own structured logs to data/selflogs/ and
+    # (from Task 2 onward) mines them for its own recurring failures, feeding
+    # them through the same diagnose/fix/verify pipeline used for the target
+    # repo. Off by default; sealed false in tests (see conftest.py).
+    self_heal_enabled: bool = False
+    # The GitHub repo self-heal fixes are opened against — tvastr's own repo,
+    # distinct from the target/testbed repo (github_repo).
+    self_heal_repo: str = "kolz001/tvastr-demo"
+    # UTC hour (0-23) the daily self-heal scan runs.
+    self_heal_daily_hour: int = 2
+    # Day of week (0=Monday..6=Sunday) the weekly self-heal scan runs.
+    self_heal_weekly_day: int = 6
+    # How many top recurring self-failures the daily scan considers.
+    self_heal_top_n: int = 10
+    # How many of those top failures actually get a fix attempt.
+    self_heal_fix_n: int = 3
+    # Self-log files (data/selflogs/) older than this are pruned on rollover.
+    self_heal_retention_days: int = 30
+
     # --- PII redaction ---
     # When true, the regex redactor is augmented with a local Presidio (spaCy
     # NER) layer that catches unstructured PII (names, locations, orgs). Off by

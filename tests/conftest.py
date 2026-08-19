@@ -31,6 +31,10 @@ os.environ["TVASTR_VERIFY_REPRO_REPAIR"] = "false"
 # TestClient(create_app()) without redirecting the runs dir; unsealed, that
 # would append pipeline.interrupted to real files under data/runs.
 os.environ["TVASTR_SWEEP_ON_STARTUP"] = "false"
+# Seal the self-heal flag off — a developer's .env may enable it, which would
+# make configure_logging install a SelfLogWriter (and later, Task 2+ start
+# mining/scheduling) during tests that build TestClient(create_app()).
+os.environ["TVASTR_SELF_HEAL_ENABLED"] = "false"
 # Clear any token-shaped values from ``.env`` so live-path code refuses to fire.
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["GITHUB_TOKEN"] = ""

@@ -19,7 +19,12 @@ log = get_logger(__name__)
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    configure_logging(level=settings.log_level, json_output=settings.log_json)
+    configure_logging(
+        level=settings.log_level,
+        json_output=settings.log_json,
+        selflog_dir=Path("data/selflogs") if settings.self_heal_enabled else None,
+        retention_days=settings.self_heal_retention_days,
+    )
 
     app = FastAPI(
         title="tvastr",
