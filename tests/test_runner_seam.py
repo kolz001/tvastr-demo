@@ -80,3 +80,74 @@ def test_route_module_shares_the_same_in_flight_map() -> None:
     from tvastr.api.routes import run as run_module
 
     assert run_module._IN_FLIGHT is IN_FLIGHT
+
+
+# ── selflog-axis loop hole: the error log itself must carry self_heal ─────
+
+
+def test_seam_error_log_forwards_error_payload_keys(tmp_path: Path) -> None:
+    """The self-heal wave's error_payload ({"self_heal": True}) must reach the
+    ``log.exception("run.failed", ...)`` call itself, not just the persisted
+    error event -- otherwise the selflog record for this failure carries no
+    self_heal marker and scan.py's selflog guard never fires on it."""
+    import tvastr.runner as runner_mod
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeLog:
+        def exception(self, event: str, **kwargs: object) -> None:
+            calls.append((event, kwargs))
+
+    monkeypatch_log = runner_mod.log
+    runner_mod.log = _FakeLog()
+    try:
+        path = tmp_path / "seam4.jsonl"
+
+        def _body() -> None:
+            raise RuntimeError("boom")
+
+        thread = start_pipeline_thread(
+            _body,
+            run_id="seam4",
+            sink=JsonlEventSink(path),
+            error_payload={"self_heal": True, "fingerprint": "abc123def456"},
+        )
+        thread.join(timeout=10)
+    finally:
+        runner_mod.log = monkeypatch_log
+
+    assert len(calls) == 1
+    event, kwargs = calls[0]
+    assert event == "run.failed"
+    assert kwargs["run_id"] == "seam4"
+    assert kwargs["self_heal"] is True
+    assert kwargs["fingerprint"] == "abc123def456"
+
+
+def test_seam_error_log_without_error_payload_is_byte_identical_to_before(
+    tmp_path: Path,
+) -> None:
+    """The route's call (no ``error_payload``) must log exactly ``run_id`` as
+    a kwarg -- the historical shape -- so ``run.py``'s behaviour is unchanged."""
+    import tvastr.runner as runner_mod
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeLog:
+        def exception(self, event: str, **kwargs: object) -> None:
+            calls.append((event, kwargs))
+
+    original_log = runner_mod.log
+    runner_mod.log = _FakeLog()
+    try:
+        path = tmp_path / "seam5.jsonl"
+
+        def _body() -> None:
+            raise RuntimeError("boom")
+
+        thread = start_pipeline_thread(_body, run_id="seam5", sink=JsonlEventSink(path))
+        thread.join(timeout=10)
+    finally:
+        runner_mod.log = original_log
+
+    assert calls == [("run.failed", {"run_id": "seam5"})]

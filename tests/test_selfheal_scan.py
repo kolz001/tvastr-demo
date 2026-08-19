@@ -113,6 +113,41 @@ def test_error_selflog_records_surface_info_does_not(tmp_path: Path) -> None:
     assert boom.attributes["origin"] == "selflog"
 
 
+def test_selflog_run_failed_with_marker_skipped_without_marker_mined(tmp_path: Path) -> None:
+    """Regression for the selflog-axis loop hole: an error log emitted by the
+    self-heal machinery itself (e.g. ``runner.py``'s ``run.failed``) must
+    carry a ``self_heal`` marker or scan.py's selflog guard never fires on it
+    and the loop can chase its own crashes. One record simulates the fixed
+    self-heal-thread log (marked); the other simulates an ordinary target-repo
+    failure with the same event name (unmarked) -- only the unmarked one may
+    be mined."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    _write_selflog(
+        selflogs_dir,
+        DAY,
+        [
+            {
+                "event": "run.failed",
+                "level": "error",
+                "timestamp": f"{DAY}T00:00:00Z",
+                "self_heal": True,
+                "run_id": "self-heal-run-1",
+            },
+            {
+                "event": "run.failed",
+                "level": "error",
+                "timestamp": f"{DAY}T00:01:00Z",
+                "run_id": "ordinary-run-1",
+            },
+        ],
+    )
+
+    events, _, _ = collect_candidates(DAY, selflogs_dir, runs_dir)
+
+    assert [e.message for e in events] == ["run.failed"]
+
+
 def test_selflog_self_heal_records_skipped(tmp_path: Path) -> None:
     selflogs_dir = tmp_path / "selflogs"
     runs_dir = tmp_path / "runs"

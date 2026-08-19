@@ -40,6 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import structlog
+
 from tvastr.config import Settings
 from tvastr.domain import LogEvent, Severity
 from tvastr.events import (
@@ -83,6 +85,13 @@ class FixOutcome:
     run_id: str | None
     status: str
     pr_url: str | None
+    # ALL pr urls opened during the run (one cluster can open more than one PR:
+    # cluster_events reconstructs one LogEvent per surviving sample message,
+    # and dissimilar samples can fingerprint into separate detected patterns —
+    # each gets its own agent run and PR). ``pr_url`` stays the first for
+    # interface stability; this is additive so existing positional/keyword
+    # FixOutcome(...) callers (tests included) are unaffected.
+    pr_urls: tuple[str, ...] = ()
 
 
 class _Notifier(Protocol):
@@ -155,10 +164,16 @@ def _self_run_settings(settings: Settings) -> Settings:
     The cluster has already recurred (that is what put it in ``to_fix``), so
     re-applying the threshold to its handful of reconstructed sample events
     would select nothing. Same reasoning as the API route's single-issue mode.
+
+    ``dry_run`` is forced True unless ``self_heal_open_prs`` is explicitly on:
+    the wave runs autonomously (no human picks the issue, unlike the API
+    route), so opening real PRs against ``self_heal_repo`` must be an opt-in,
+    not something that happens the moment self-heal is enabled in live mode.
     """
-    return settings.model_copy(
-        update={"github_repo": settings.self_heal_repo, "recurrence_threshold": 1}
-    )
+    update: dict[str, Any] = {"github_repo": settings.self_heal_repo, "recurrence_threshold": 1}
+    if not settings.self_heal_open_prs:
+        update["dry_run"] = True
+    return settings.model_copy(update=update)
 
 
 def _default_start_run(
@@ -172,14 +187,23 @@ def _default_start_run(
     """Run the real pipeline on a background thread and JOIN it before returning."""
 
     def _body() -> None:
-        pipeline = build_pipeline(
-            settings,
-            log_source=SimulatedLogSource(),  # unused; events passed directly below
-            event_sink=sink,
-            run_id=run_id,
-        )
-        pipeline.threshold.recurrence_threshold = 1
-        pipeline.run(events=events, run_meta=run_meta)
+        # Contextvars don't propagate into new threads (this body runs on one),
+        # so the marker must be bound HERE, not in the wave's loop. Without it,
+        # any log this thread emits mid-run (not just the seam's terminal
+        # error, which gets error_payload separately) lands in the selflog
+        # file unmarked and scan.py's selflog guard never fires on it.
+        structlog.contextvars.bind_contextvars(self_heal=True)
+        try:
+            pipeline = build_pipeline(
+                settings,
+                log_source=SimulatedLogSource(),  # unused; events passed directly below
+                event_sink=sink,
+                run_id=run_id,
+            )
+            pipeline.threshold.recurrence_threshold = 1
+            pipeline.run(events=events, run_meta=run_meta)
+        finally:
+            structlog.contextvars.clear_contextvars()
 
     # error_payload: if the body dies before pipeline.start is emitted, the only
     # event in the file is the failure — it must still carry the self_heal
@@ -191,30 +215,33 @@ def _default_start_run(
     return run_id
 
 
-def _pr_url(events: list[PipelineEvent]) -> str | None:
-    """First PR URL in a run's events, or ``None``.
+def _pr_urls(events: list[PipelineEvent]) -> tuple[str, ...]:
+    """ALL PR urls opened during a run's events, in emission order, deduped.
 
     Verified against the emission sites, not guessed: ``agent/graph.py``'s
-    ``_open_pr`` emits ``pr.opened`` with ``url``/``number``, and
-    ``pipeline.py`` emits ``audit.saved`` with ``pull_request_url`` (which is
-    ``None`` in dry-run, where the URL is only a sentinel). ``pr.dry_run`` is
-    deliberately NOT treated as a PR — nothing was opened.
+    ``_open_pr`` emits ``pr.opened`` with ``url``/``number`` (once per detected
+    pattern -- a run can open more than one PR), and ``pipeline.py`` emits
+    ``audit.saved`` with ``pull_request_url`` (which is ``None`` in dry-run,
+    where the URL is only a sentinel). ``pr.dry_run`` is deliberately NOT
+    treated as a PR — nothing was opened.
     """
+    urls: list[str] = []
     for event in events:
         if event.type == "pr.opened":
             url = event.payload.get("url")
-            if url:
-                return str(url)
         elif event.type == "audit.saved":
             url = event.payload.get("pull_request_url")
-            if url:
-                return str(url)
-    return None
+        else:
+            continue
+        if url and str(url) not in urls:
+            urls.append(str(url))
+    return tuple(urls)
 
 
 def _read_outcome(cluster: RankedCluster, run_id: str, runs_dir: Path) -> FixOutcome:
     events = list(load_events(run_path(run_id, runs_dir)))
-    url = _pr_url(events)
+    urls = _pr_urls(events)
+    url = urls[0] if urls else None
     # A PR wins over a later error: the run demonstrably produced the artifact
     # this wave exists to produce, and reporting that as "failed" would hide it
     # from the escalation summary (and from whoever has to review the PR).
@@ -233,7 +260,12 @@ def _read_outcome(cluster: RankedCluster, run_id: str, runs_dir: Path) -> FixOut
         run_id=run_id,
         status=status,
         pr_url=url,
+        pr_urls=urls,
     )
+
+
+def _skipped_outcomes(clusters: list[RankedCluster]) -> list[FixOutcome]:
+    return [FixOutcome(c.fingerprint, c.title, None, STATUS_SKIPPED, None) for c in clusters]
 
 
 def run_fix_wave(
@@ -248,63 +280,83 @@ def run_fix_wave(
     Returns one :class:`FixOutcome` per ``to_fix`` cluster, in report order. A
     cluster whose run cannot even be started is reported ``failed`` and the wave
     moves on — one poisoned cluster must not cost the others their fix attempt.
-    """
-    starter: Callable[..., str] = start_run or _default_start_run
-    run_settings = _self_run_settings(settings)
-    mode = "mock" if settings.use_mocks else "live"
-    outcomes: list[FixOutcome] = []
 
-    for cluster in report.to_fix:
-        run_id = new_run_id()
-        # Pre-create the run file (same reason as the API route: a reader must
-        # never see "unknown run" for a run that is, in fact, running).
-        path = run_path(run_id, runs_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-        run_meta: dict[str, Any] = {
-            "run_id": run_id,
-            # THE loop guard: pipeline.py spreads run_meta flat into
-            # pipeline.start's payload, which is where scan.py looks.
-            "self_heal": True,
-            "fingerprint": cluster.fingerprint,
-            "cluster_title": cluster.title,
-            "repo": run_settings.github_repo,
-            "mode": mode,
-        }
-        log.info(
-            "selfheal.remediate.run_start",
-            week=report.week,
-            run_id=run_id,
-            fingerprint=cluster.fingerprint,
-            repo=run_settings.github_repo,
+    This function itself must never raise: every step for one cluster (id
+    generation, run-file pre-creation, starting the run, reading the outcome
+    back) lives inside that cluster's own try/except, so a failure anywhere in
+    that sequence downgrades only THAT cluster to ``failed`` — it can never
+    discard an already-completed outcome for an earlier cluster (e.g. a real
+    opened PR silently becoming "skipped"). A catastrophic failure before any
+    cluster is even attempted (settings prep) still returns one outcome per
+    ``to_fix`` cluster, reported ``skipped``, rather than raising out of the
+    weekly job.
+    """
+    outcomes: list[FixOutcome] = []
+    try:
+        starter: Callable[..., str] = start_run or _default_start_run
+        run_settings = _self_run_settings(settings)
+        mode = "mock" if settings.use_mocks else "live"
+
+        for cluster in report.to_fix:
+            run_id: str | None = None
+            try:
+                run_id = new_run_id()
+                # Pre-create the run file (same reason as the API route: a
+                # reader must never see "unknown run" for a run that is, in
+                # fact, running).
+                path = run_path(run_id, runs_dir)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+                run_meta: dict[str, Any] = {
+                    "run_id": run_id,
+                    # THE loop guard: pipeline.py spreads run_meta flat into
+                    # pipeline.start's payload, which is where scan.py looks.
+                    "self_heal": True,
+                    "fingerprint": cluster.fingerprint,
+                    "cluster_title": cluster.title,
+                    "repo": run_settings.github_repo,
+                    "mode": mode,
+                }
+                log.info(
+                    "selfheal.remediate.run_start",
+                    week=report.week,
+                    run_id=run_id,
+                    fingerprint=cluster.fingerprint,
+                    repo=run_settings.github_repo,
+                )
+                started_id = starter(
+                    events=cluster_events(cluster),
+                    run_meta=run_meta,
+                    settings=run_settings,
+                    sink=JsonlEventSink(path),
+                    run_id=run_id,
+                )
+                outcome = _read_outcome(cluster, started_id or run_id, runs_dir)
+            except Exception as exc:
+                log.error(
+                    "selfheal.remediate.run_failed",
+                    run_id=run_id,
+                    fingerprint=cluster.fingerprint,
+                    error=str(exc),
+                    self_heal=True,
+                )
+                outcome = FixOutcome(
+                    cluster.fingerprint, cluster.title, run_id, STATUS_FAILED, None
+                )
+            else:
+                log.info(
+                    "selfheal.remediate.run_done",
+                    run_id=outcome.run_id,
+                    fingerprint=outcome.fingerprint,
+                    status=outcome.status,
+                )
+            outcomes.append(outcome)
+    except Exception as exc:
+        log.error("selfheal.remediate.wave_failed", error=str(exc), self_heal=True)
+        attempted = {o.fingerprint for o in outcomes}
+        outcomes.extend(
+            _skipped_outcomes([c for c in report.to_fix if c.fingerprint not in attempted])
         )
-        try:
-            started_id = starter(
-                events=cluster_events(cluster),
-                run_meta=run_meta,
-                settings=run_settings,
-                sink=JsonlEventSink(path),
-                run_id=run_id,
-            )
-        except Exception as exc:
-            log.error(
-                "selfheal.remediate.run_failed",
-                run_id=run_id,
-                fingerprint=cluster.fingerprint,
-                error=str(exc),
-            )
-            outcomes.append(
-                FixOutcome(cluster.fingerprint, cluster.title, run_id, STATUS_FAILED, None)
-            )
-            continue
-        outcome = _read_outcome(cluster, started_id or run_id, runs_dir)
-        log.info(
-            "selfheal.remediate.run_done",
-            run_id=outcome.run_id,
-            fingerprint=outcome.fingerprint,
-            status=outcome.status,
-        )
-        outcomes.append(outcome)
 
     return outcomes
 
@@ -323,14 +375,32 @@ def _run_link(run_id: str | None) -> str:
     return f"/api/runs/{run_id}" if run_id else "(no run)"
 
 
+def _fingerprint_token(fingerprint: str) -> str:
+    """Short, clickable-in-spirit correlation token for a Slack line.
+
+    Every cluster line in every section carries this so a reader (or a
+    follow-up automation) can tie a Slack line back to the exact cluster,
+    without repeating the full fingerprint hash inline.
+    """
+    return f"`{fingerprint[:12]}`"
+
+
 def _fixed_line(outcome: FixOutcome, cluster: RankedCluster | None) -> str:
     count = f" ({cluster.count}x)" if cluster else ""
-    return f"• {outcome.title}{count} — {outcome.pr_url}"
+    # pr_urls is the source of truth when populated (one cluster can open more
+    # than one PR); outcomes built without it (older call sites, tests) fall
+    # back to the single pr_url so no caller is left with a blank line.
+    urls = outcome.pr_urls or ((outcome.pr_url,) if outcome.pr_url else ())
+    urls_text = ", ".join(urls) if urls else str(outcome.pr_url)
+    return f"• {outcome.title}{count} — {urls_text} — {_fingerprint_token(outcome.fingerprint)}"
 
 
 def _unfixed_line(outcome: FixOutcome, cluster: RankedCluster | None) -> str:
     count = f" ({cluster.count}x)" if cluster else ""
-    return f"• {outcome.title}{count} — {outcome.status} — {_run_link(outcome.run_id)}"
+    return (
+        f"• {outcome.title}{count} — {outcome.status} — {_run_link(outcome.run_id)}"
+        f" — {_fingerprint_token(outcome.fingerprint)}"
+    )
 
 
 def _section(heading: str, lines: list[str]) -> list[str]:
@@ -379,7 +449,10 @@ def build_escalation(report: WeeklyReport, outcomes: list[FixOutcome]) -> str:
         "",
         *_section(
             "Report-only",
-            [f"• {c.title} ({c.count}x, {c.kind})" for c in report.report_only],
+            [
+                f"• {c.title} ({c.count}x, {c.kind}) — {_fingerprint_token(c.fingerprint)}"
+                for c in report.report_only
+            ],
         ),
     ]
     return "\n".join(lines)
@@ -396,5 +469,7 @@ def escalate(report: WeeklyReport, outcomes: list[FixOutcome], notifier: _Notifi
     try:
         notifier.notify(message)
     except Exception as exc:
-        log.error("selfheal.remediate.escalate_failed", week=report.week, error=str(exc))
+        log.error(
+            "selfheal.remediate.escalate_failed", week=report.week, error=str(exc), self_heal=True
+        )
     return message

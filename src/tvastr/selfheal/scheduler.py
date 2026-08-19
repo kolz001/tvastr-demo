@@ -155,7 +155,9 @@ class SelfHealScheduler:
                 fix_n=self._settings.self_heal_fix_n,
             )
         except Exception as exc:
-            log.error("selfheal.scheduler.consolidate_failed", week=week, error=str(exc))
+            log.error(
+                "selfheal.scheduler.consolidate_failed", week=week, error=str(exc), self_heal=True
+            )
         if report is None:
             return
 
@@ -167,14 +169,18 @@ class SelfHealScheduler:
                 runs_dir=self._root / "runs",
             )
         except Exception as exc:
-            log.error("selfheal.scheduler.fix_wave_failed", week=week, error=str(exc))
+            log.error(
+                "selfheal.scheduler.fix_wave_failed", week=week, error=str(exc), self_heal=True
+            )
 
         if not report.to_fix and not report.report_only:
             return
         try:
             escalate(report, outcomes, build_notifier(self._settings))
         except Exception as exc:
-            log.error("selfheal.scheduler.escalate_failed", week=week, error=str(exc))
+            log.error(
+                "selfheal.scheduler.escalate_failed", week=week, error=str(exc), self_heal=True
+            )
 
     # -- the one testable decision function ----------------------------------
 

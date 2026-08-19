@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     self_heal_fix_n: int = 3
     # Self-log files (data/selflogs/) older than this are pruned on rollover.
     self_heal_retention_days: int = 30
+    # wave opens real PRs only when explicitly enabled; otherwise forced dry-run
+    self_heal_open_prs: bool = False
 
     # --- PII redaction ---
     # When true, the regex redactor is augmented with a local Presidio (spaCy

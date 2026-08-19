@@ -11,8 +11,13 @@ import json
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from tvastr.config import Settings
+from tvastr.selfheal import scheduler as scheduler_mod
+from tvastr.selfheal.scan import scan_day
 from tvastr.selfheal.scheduler import SchedulerState, SelfHealScheduler
 
 WED_BEFORE_HOUR = datetime(2026, 8, 19, 1, 30, tzinfo=UTC)
@@ -433,6 +438,128 @@ def test_default_weekly_hook_wraps_consolidate_week(tmp_path: Path) -> None:
     assert report_path.exists()
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["week"] == "2026-W33"
+
+
+def _seed_digest(tmp_path: Path, day: str) -> None:
+    """Write one real daily digest (via scan.py's own writer) so the weekly
+    consolidation has something to rank -- required for the fix-wave / escalate
+    steps of ``_default_weekly`` to even be reached."""
+    selflogs_dir = tmp_path / "selflogs"
+    selflogs_dir.mkdir(parents=True, exist_ok=True)
+    (selflogs_dir / f"tvastr-{day}.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "event": "run.failed: RuntimeError: boom",
+                    "level": "error",
+                    "timestamp": f"{day}T10:00:00+00:00",
+                    "logger": "tvastr.runner",
+                }
+            )
+            for _ in range(3)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    scan_day(
+        day,
+        selflogs_dir=selflogs_dir,
+        runs_dir=tmp_path / "runs",
+        out_dir=tmp_path / "selfheal",
+    )
+
+
+# ── selflog-axis loop hole: weekly-path step failures carry self_heal ─────
+
+
+def test_weekly_consolidate_failure_log_carries_self_heal_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """consolidate_failed / fix_wave_failed / escalate_failed must all be
+    tagged self_heal=True -- these are self-heal machinery's own error logs,
+    and without the marker scan.py's selflog guard would mine them as fresh
+    failures next daily scan."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: Any) -> None:
+            calls.append((event, kwargs))
+
+    def _boom_consolidate(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("consolidate boom")
+
+    monkeypatch.setattr(scheduler_mod, "consolidate_week", _boom_consolidate)
+    original_log = scheduler_mod.log
+    scheduler_mod.log = _FakeLog()
+    try:
+        scheduler = SelfHealScheduler(
+            settings=_settings(), root=tmp_path, now_fn=lambda: SUN_AT_HOUR
+        )
+        scheduler.tick()
+    finally:
+        scheduler_mod.log = original_log
+
+    consolidate_calls = [c for c in calls if c[0] == "selfheal.scheduler.consolidate_failed"]
+    assert len(consolidate_calls) == 1
+    assert consolidate_calls[0][1]["self_heal"] is True
+
+
+def test_weekly_fix_wave_failure_log_carries_self_heal_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: Any) -> None:
+            calls.append((event, kwargs))
+
+    def _boom_wave(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("wave boom")
+
+    _seed_digest(tmp_path, "2026-08-12")
+    monkeypatch.setattr(scheduler_mod, "run_fix_wave", _boom_wave)
+    original_log = scheduler_mod.log
+    scheduler_mod.log = _FakeLog()
+    try:
+        scheduler = SelfHealScheduler(
+            settings=_settings(), root=tmp_path, now_fn=lambda: SUN_AT_HOUR
+        )
+        scheduler.tick()
+    finally:
+        scheduler_mod.log = original_log
+
+    wave_calls = [c for c in calls if c[0] == "selfheal.scheduler.fix_wave_failed"]
+    assert len(wave_calls) == 1
+    assert wave_calls[0][1]["self_heal"] is True
+
+
+def test_weekly_escalate_failure_log_carries_self_heal_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: Any) -> None:
+            calls.append((event, kwargs))
+
+    def _boom_escalate(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("escalate boom")
+
+    _seed_digest(tmp_path, "2026-08-12")
+    monkeypatch.setattr(scheduler_mod, "escalate", _boom_escalate)
+    original_log = scheduler_mod.log
+    scheduler_mod.log = _FakeLog()
+    try:
+        scheduler = SelfHealScheduler(
+            settings=_settings(), root=tmp_path, now_fn=lambda: SUN_AT_HOUR
+        )
+        scheduler.tick()
+    finally:
+        scheduler_mod.log = original_log
+
+    escalate_calls = [c for c in calls if c[0] == "selfheal.scheduler.escalate_failed"]
+    assert len(escalate_calls) == 1
+    assert escalate_calls[0][1]["self_heal"] is True
 
 
 # ── app wiring: zero threads under the conftest seal ───────────────────────

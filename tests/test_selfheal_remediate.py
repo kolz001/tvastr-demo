@@ -22,12 +22,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 
 from tvastr.config import Settings
 from tvastr.domain import LogEvent
-from tvastr.events import EventSink, PipelineEvent, run_path
+from tvastr.events import EventSink, JsonlEventSink, PipelineEvent, run_path
 from tvastr.integrations.slack import MockSlackNotifier
-from tvastr.selfheal.remediate import FixOutcome, escalate, run_fix_wave
+from tvastr.selfheal import remediate as remediate_mod
+from tvastr.selfheal.remediate import (
+    FixOutcome,
+    _default_start_run,
+    build_escalation,
+    escalate,
+    run_fix_wave,
+)
 from tvastr.selfheal.report import RankedCluster, WeeklyReport
 from tvastr.selfheal.scan import scan_day
 
@@ -193,6 +201,35 @@ def test_wave_falls_back_to_the_cluster_title_when_no_samples_survived(tmp_path:
     assert [e.message for e in calls[0]["events"]] == ["OpaqueFailure"]
 
 
+def test_wave_forces_dry_run_by_default(tmp_path: Path) -> None:
+    """FINDING 4: without explicit opt-in, the wave must never open real PRs —
+    ``self_heal_open_prs`` defaults False, so the run settings must be forced
+    into dry_run regardless of the caller's own dry_run value."""
+    calls: list[dict[str, Any]] = []
+
+    run_fix_wave(
+        _report([_cluster("fp1", "AError")]),
+        settings=_settings(dry_run=False),
+        runs_dir=tmp_path,
+        start_run=_starter(calls),
+    )
+
+    assert calls[0]["settings"].dry_run is True
+
+
+def test_wave_respects_dry_run_false_when_open_prs_enabled(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+
+    run_fix_wave(
+        _report([_cluster("fp1", "AError")]),
+        settings=_settings(dry_run=False, self_heal_open_prs=True),
+        runs_dir=tmp_path,
+        start_run=_starter(calls),
+    )
+
+    assert calls[0]["settings"].dry_run is False
+
+
 def test_wave_with_no_to_fix_clusters_starts_nothing(tmp_path: Path) -> None:
     calls: list[dict[str, Any]] = []
 
@@ -305,6 +342,41 @@ def test_run_file_with_no_terminal_event_is_failed(tmp_path: Path) -> None:
     assert outcomes[0].status == "failed"
 
 
+def test_multiple_pr_opened_events_yield_all_urls_and_pr_url_is_the_first(
+    tmp_path: Path,
+) -> None:
+    """FINDING 3: one cluster can open multiple PRs (one per detected pattern
+    reconstructed from its sample messages), but the old extraction returned
+    only the first — the rest were invisible to the escalation summary."""
+    url1 = f"https://github.com/{SELF_REPO}/pull/101"
+    url2 = f"https://github.com/{SELF_REPO}/pull/102"
+    starter = _starter(
+        [],
+        {
+            "fp1": [
+                _event("pr.opened", {"url": url1, "number": 101}),
+                _event("pr.opened", {"url": url2, "number": 102}),
+                _event("pipeline.end", {"outcome": "pr_opened"}),
+            ]
+        },
+    )
+
+    outcomes = run_fix_wave(
+        _report([_cluster("fp1", "AError")]),
+        settings=_settings(),
+        runs_dir=tmp_path,
+        start_run=starter,
+    )
+
+    assert outcomes[0].status == "pr_created"
+    assert outcomes[0].pr_url == url1  # interface frozen: pr_url stays the FIRST
+    assert outcomes[0].pr_urls == (url1, url2)
+
+    message = build_escalation(_report([_cluster("fp1", "AError")]), outcomes)
+    assert url1 in message
+    assert url2 in message
+
+
 def test_starter_exception_is_failed_and_does_not_stop_the_wave(tmp_path: Path) -> None:
     calls: list[dict[str, Any]] = []
     starter = _starter(calls, raises="fp1")
@@ -319,6 +391,67 @@ def test_starter_exception_is_failed_and_does_not_stop_the_wave(tmp_path: Path) 
     assert [(o.fingerprint, o.status) for o in outcomes] == [
         ("fp1", "failed"),
         ("fp2", "unverified"),
+    ]
+
+
+def test_read_outcome_exception_does_not_lose_earlier_completed_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FINDING 5: work outside the per-cluster try (here: ``_read_outcome``)
+    must never lose an already-completed outcome. A real opened PR (cluster 1)
+    must survive a catastrophic failure reading back cluster 2's run file, and
+    cluster 3 must still be attempted."""
+    calls: list[dict[str, Any]] = []
+    url = f"https://github.com/{SELF_REPO}/pull/77"
+    starter = _starter(
+        calls,
+        {
+            "fp1": [
+                _event("pr.opened", {"url": url, "number": 77}),
+                _event("pipeline.end", {"outcome": "pr_opened"}),
+            ]
+        },
+    )
+
+    original_read_outcome = remediate_mod._read_outcome
+
+    def _flaky_read_outcome(cluster: RankedCluster, run_id: str, runs_dir: Path) -> FixOutcome:
+        if cluster.fingerprint == "fp2":
+            raise RuntimeError("disk exploded reading run file")
+        return original_read_outcome(cluster, run_id, runs_dir)
+
+    monkeypatch.setattr(remediate_mod, "_read_outcome", _flaky_read_outcome)
+
+    report = _report(
+        [_cluster("fp1", "AError"), _cluster("fp2", "BError"), _cluster("fp3", "CError")]
+    )
+    outcomes = run_fix_wave(report, settings=_settings(), runs_dir=tmp_path, start_run=starter)
+
+    assert [o.fingerprint for o in outcomes] == ["fp1", "fp2", "fp3"]
+    assert outcomes[0].status == "pr_created"  # not lost/downgraded to skipped
+    assert outcomes[0].pr_url == url
+    assert outcomes[1].status == "failed"
+    assert len(calls) == 3  # cluster3 was still attempted
+
+
+def test_prologue_failure_returns_skipped_outcomes_for_all_clusters_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FINDING 5: ``run_fix_wave`` itself must never raise. A catastrophic
+    failure before any cluster is attempted (here: settings prep) must still
+    return one outcome per to_fix cluster, reported skipped."""
+
+    def _boom(settings: Settings) -> Settings:
+        raise RuntimeError("settings prep exploded")
+
+    monkeypatch.setattr(remediate_mod, "_self_run_settings", _boom)
+
+    report = _report([_cluster("fp1", "AError"), _cluster("fp2", "BError")])
+    outcomes = run_fix_wave(report, settings=_settings(), runs_dir=tmp_path)
+
+    assert [(o.fingerprint, o.status) for o in outcomes] == [
+        ("fp1", "skipped"),
+        ("fp2", "skipped"),
     ]
 
 
@@ -359,14 +492,114 @@ def test_default_starter_runs_the_real_pipeline_sequentially_and_joins(tmp_path:
 def test_default_starter_opens_a_pr_against_the_self_heal_repo(tmp_path: Path) -> None:
     """Mock mode still exercises the whole agent; the mock code host mints a PR
     URL for whichever repo the run's settings named — proving the github_repo
-    override reaches the code host, not just the run_meta."""
+    override reaches the code host, not just the run_meta. Requires explicit
+    opt-in (FINDING 4: the wave is forced dry_run unless self_heal_open_prs is
+    on, so real/mock PR creation no longer happens by default)."""
     report = _report([_cluster("fp1", "ImportError", samples=["ImportError: no module named x"])])
 
-    outcomes = run_fix_wave(report, settings=_settings(), runs_dir=tmp_path)
+    outcomes = run_fix_wave(
+        report, settings=_settings(self_heal_open_prs=True), runs_dir=tmp_path
+    )
 
     assert outcomes[0].status == "pr_created"
     assert outcomes[0].pr_url is not None
     assert SELF_REPO in outcomes[0].pr_url
+
+
+# ── selflog-axis loop hole: self-heal-thread logs must carry self_heal ────
+
+
+def test_default_start_run_binds_self_heal_contextvar_for_the_thread_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any log emitted by application code running inside the self-heal
+    thread body must carry ``self_heal=True`` via structlog contextvars (NOT
+    just the terminal error event runner.py produces) -- otherwise a stray
+    error logged mid-run (e.g. a warning from deep in the pipeline) lands in
+    the selflog file unmarked and scan.py mines it as a fresh failure.
+    Contextvars don't propagate into new threads, so the bind must happen
+    INSIDE the thread body, not in the wave's loop."""
+    captured: dict[str, Any] = {}
+
+    class _FakeThreshold:
+        recurrence_threshold: int | None = None
+
+    class _FakePipeline:
+        def __init__(self) -> None:
+            self.threshold = _FakeThreshold()
+
+        def run(self, **kwargs: Any) -> None:
+            captured["ctx"] = dict(structlog.contextvars.get_contextvars())
+
+    def _fake_build_pipeline(*args: Any, **kwargs: Any) -> _FakePipeline:
+        return _FakePipeline()
+
+    monkeypatch.setattr(remediate_mod, "build_pipeline", _fake_build_pipeline)
+
+    path = tmp_path / "ctxrun.jsonl"
+    _default_start_run(
+        events=[],
+        run_meta={"self_heal": True},
+        settings=_settings(),
+        sink=JsonlEventSink(path),
+        run_id="ctxrun",
+    )
+
+    assert captured["ctx"].get("self_heal") is True
+    # The main thread's own context must be untouched by the child thread's bind.
+    assert "self_heal" not in dict(structlog.contextvars.get_contextvars())
+
+
+def test_wave_run_failed_log_carries_self_heal_marker(tmp_path: Path) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: Any) -> None:
+            calls.append((event, kwargs))
+
+        def info(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    starter = _starter([], raises="fp1")
+
+    original_log = remediate_mod.log
+    remediate_mod.log = _FakeLog()
+    try:
+        run_fix_wave(
+            _report([_cluster("fp1", "AError")]),
+            settings=_settings(),
+            runs_dir=tmp_path,
+            start_run=starter,
+        )
+    finally:
+        remediate_mod.log = original_log
+
+    failed_calls = [c for c in calls if c[0] == "selfheal.remediate.run_failed"]
+    assert len(failed_calls) == 1
+    assert failed_calls[0][1]["self_heal"] is True
+
+
+def test_escalate_failed_log_carries_self_heal_marker() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: Any) -> None:
+            calls.append((event, kwargs))
+
+    class _Boom:
+        def notify(self, message: str) -> bool:
+            raise RuntimeError("slack down")
+
+    original_log = remediate_mod.log
+    remediate_mod.log = _FakeLog()
+    try:
+        escalate(_report([_cluster("fp1", "AError")]), [], _Boom())
+    finally:
+        remediate_mod.log = original_log
+
+    failed_calls = [c for c in calls if c[0] == "selfheal.remediate.escalate_failed"]
+    assert len(failed_calls) == 1
+    assert failed_calls[0][1]["self_heal"] is True
 
 
 # ── loop closure: the wave's own run files must never feed the scanner ────
@@ -462,6 +695,9 @@ def test_escalation_message_has_all_three_sections_and_sends_once() -> None:
     assert url in message
     assert "run2" in message  # a run link for the unfixed cluster
     assert "12" in message and "5" in message and "3" in message  # counts
+    # Every to_fix cluster's fingerprint token must appear, fixed or not.
+    for cluster in report.to_fix:
+        assert f"`{cluster.fingerprint[:12]}`" in message
 
 
 def test_escalation_reports_unattempted_clusters_when_the_wave_produced_nothing() -> None:
@@ -475,6 +711,29 @@ def test_escalation_reports_unattempted_clusters_when_the_wave_produced_nothing(
     assert "AError" in message and "BError" in message
     assert message.count("skipped") >= 2
     assert len(notifier.sent) == 1
+    for cluster in report.to_fix:
+        assert f"`{cluster.fingerprint[:12]}`" in message
+
+
+def test_escalation_fingerprint_token_appears_in_every_section() -> None:
+    """FINDING 2: build_escalation renders clusters by title only, with no way
+    to correlate a Slack line back to the cluster it came from. Every line in
+    every section (fixed/unfixed/report-only) must carry a short fingerprint
+    token, format exactly `` `{fingerprint[:12]}` ``."""
+    report = _report(
+        [_cluster("aaaaaaaaaaaaaaaa", "AError"), _cluster("bbbbbbbbbbbbbbbb", "BError")],
+        [_cluster("cccccccccccccccc", "CError")],
+    )
+    outcomes = [
+        FixOutcome("aaaaaaaaaaaaaaaa", "AError", "run1", "pr_created", "https://example/pr/1"),
+        FixOutcome("bbbbbbbbbbbbbbbb", "BError", "run2", "unverified", None),
+    ]
+
+    message = build_escalation(report, outcomes)
+
+    assert "`aaaaaaaaaaaa`" in message  # fixed line
+    assert "`bbbbbbbbbbbb`" in message  # unfixed line
+    assert "`cccccccccccc`" in message  # report-only line
 
 
 def test_escalation_includes_outcomes_absent_from_the_report() -> None:
