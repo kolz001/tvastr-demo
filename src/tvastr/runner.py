@@ -64,7 +64,7 @@ def start_pipeline_thread(
         try:
             body()
         except Exception as exc:
-            log.exception("run.failed", run_id=run_id, **(error_payload or {}))
+            log.exception("run.failed", **{"run_id": run_id, **(error_payload or {})})
             sink.emit(
                 PipelineEvent(
                     type="error",

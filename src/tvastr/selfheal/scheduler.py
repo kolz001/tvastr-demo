@@ -213,7 +213,7 @@ class SelfHealScheduler:
         try:
             self._run_daily(day)
         except Exception as exc:  # must never propagate out of tick()
-            log.error("selfheal.scheduler.daily_failed", day=day, error=str(exc))
+            log.error("selfheal.scheduler.daily_failed", day=day, error=str(exc), self_heal=True)
         return f"daily:{day}"
 
     def _fire_weekly(self, week: str) -> str:
@@ -222,7 +222,7 @@ class SelfHealScheduler:
         try:
             self._run_weekly(week)
         except Exception as exc:  # must never propagate out of tick()
-            log.error("selfheal.scheduler.weekly_failed", week=week, error=str(exc))
+            log.error("selfheal.scheduler.weekly_failed", week=week, error=str(exc), self_heal=True)
         return f"weekly:{week}"
 
     def _save_state(self) -> None:
@@ -248,7 +248,7 @@ class SelfHealScheduler:
             try:
                 self.tick()
             except Exception:  # the loop must survive anything
-                log.exception("selfheal.scheduler.tick_failed")
+                log.exception("selfheal.scheduler.tick_failed", self_heal=True)
             # Event.wait (not time.sleep) so stop() interrupts promptly instead
             # of blocking for the full poll interval.
             if self._stop_event.wait(_POLL_SECONDS):
