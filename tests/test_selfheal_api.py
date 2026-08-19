@@ -59,9 +59,14 @@ def test_router_registered_in_create_app() -> None:
 # ── GET /api/selfheal/status ────────────────────────────────────────────────
 
 
-def test_status_disabled_by_default() -> None:
+def test_status_disabled_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """TVASTR_SELF_HEAL_ENABLED=false is sealed in conftest.py -- the default
-    TestClient must report enabled=False and scheduler=None, never 500."""
+    TestClient must report enabled=False and scheduler=None, never 500.
+
+    Root is redirected to tmp_path: the route's default root is the real
+    ``data/`` dir, and a genuine weekly report there (e.g. from a live
+    shakeout) must not make this test's latest_report_week assertion flaky."""
+    _redirect_root(monkeypatch, tmp_path)
     resp = client.get("/api/selfheal/status")
     assert resp.status_code == 200
     data = resp.json()

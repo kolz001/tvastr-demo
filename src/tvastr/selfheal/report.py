@@ -54,6 +54,12 @@ SEVERITY_WEIGHTS: dict[str, float] = {
     "quality": 3.0,
     "ops": 1.0,
     "handled_upstream": 0.25,
+    # Working-as-intended outcomes (e.g. "no error signature found" -- the
+    # deliberate refusal to remediate a feature request). Nearly zeroed AND
+    # barred from to_fix: a fix wave cannot "fix" intended behavior. Tuned
+    # from the first real weekly report (2026-W27: 234 such events drowned a
+    # genuine confidence-0.0 signal scored 6.0).
+    "by_design": 0.05,
 }
 
 # Fixed literals scan.py's quality-signal generators emit verbatim -- see the
@@ -71,6 +77,13 @@ _QUALITY_MESSAGE_MARKERS: tuple[str, ...] = (
 _HANDLED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"GitHub .* failed \(\d+"),
     re.compile(r"rate[ -]?limit", re.IGNORECASE),
+)
+
+# A cluster whose representative message matches any of these is tvastr
+# working as designed (a deliberate refusal, not a defect). It is weighted
+# "by_design" and NEVER placed in ``to_fix`` -- report-only, always.
+_BY_DESIGN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"no error signature found"),
 )
 
 _MAX_SAMPLE_MESSAGES = 3
@@ -125,6 +138,10 @@ def _is_handled_upstream(representative_message: str) -> bool:
     return any(pattern.search(representative_message) for pattern in _HANDLED_PATTERNS)
 
 
+def _is_by_design(representative_message: str) -> bool:
+    return any(pattern.search(representative_message) for pattern in _BY_DESIGN_PATTERNS)
+
+
 @dataclass
 class _Merged:
     """Mutable accumulator for one fingerprint's cross-day merge, before scoring."""
@@ -151,8 +168,13 @@ def _rank(merged: dict[str, _Merged]) -> list[RankedCluster]:
     ranked: list[RankedCluster] = []
     for fingerprint, entry in merged.items():
         kind = _cluster_kind(entry.representative_message)
-        handled = _is_handled_upstream(entry.representative_message)
-        weight = SEVERITY_WEIGHTS["handled_upstream" if handled else kind]
+        if _is_by_design(entry.representative_message):
+            weight_class = "by_design"
+        elif _is_handled_upstream(entry.representative_message):
+            weight_class = "handled_upstream"
+        else:
+            weight_class = kind
+        weight = SEVERITY_WEIGHTS[weight_class]
         ranked.append(
             RankedCluster(
                 fingerprint=fingerprint,
@@ -224,11 +246,17 @@ def consolidate_week(
                 )
 
     ranked = _rank(merged)[:top_n]
+    # By-design clusters stay visible (transparency) but are barred from the
+    # fix wave: remediating intended behavior is meaningless work.
+    by_design = {fp for fp, m in merged.items() if _is_by_design(m.representative_message)}
+    fixable = [c for c in ranked if c.fingerprint not in by_design]
+    to_fix = fixable[:fix_n]
+    to_fix_fps = {c.fingerprint for c in to_fix}
     report = WeeklyReport(
         week=week,
         generated_at=datetime.now(UTC).isoformat(),
-        to_fix=ranked[:fix_n],
-        report_only=ranked[fix_n:],
+        to_fix=to_fix,
+        report_only=[c for c in ranked if c.fingerprint not in to_fix_fps],
         days_scanned=days_scanned,
     )
     _write_report(report, out_dir)

@@ -401,3 +401,79 @@ def test_days_scanned_reflects_only_present_daily_digests(tmp_path: Path) -> Non
     report = consolidate_week(WEEK, digests_dir=digests_dir, out_dir=out_dir)
 
     assert report.days_scanned == [MON]
+
+
+def _write_no_signature_run(runs_dir: Path, run_id: str, day: str) -> None:
+    """A run refused for lack of a failure signature -- by-design behavior."""
+    _write_run(
+        runs_dir,
+        run_id,
+        [
+            _pipeline_start(run_id, day),
+            _run_event(
+                "error",
+                "issue_to_events",
+                {"reason": "no error signature found in issue title or body"},
+                day=day,
+                run_id=run_id,
+            ),
+        ],
+    )
+
+
+def test_by_design_cluster_never_enters_to_fix(tmp_path: Path) -> None:
+    """Regression pinned from the first real weekly report (2026-W27).
+
+    234 'no error signature found' refusals (working-as-intended) outscored a
+    genuine confidence-0.0 quality signal 234.0 to 6.0. By-design clusters
+    must be dampened AND barred from to_fix regardless of rank.
+    """
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    digests_dir = tmp_path / "digests"
+    out_dir = tmp_path / "weekly_out"
+
+    for i in range(5):  # recurring by-design refusals (distilled from 234)
+        _write_no_signature_run(runs_dir, f"run-nosig-{i}", MON)
+    _write_run(
+        runs_dir,
+        "run-quality",
+        [
+            _pipeline_start("run-quality", MON),
+            _run_event(
+                "agent.node.end",
+                "investigate",
+                {"confidence": 0.0, "summary": "stuck"},
+                day=MON,
+                run_id="run-quality",
+            ),
+            _pipeline_end("run-quality", MON),
+        ],
+    )
+    scan_day(MON, selflogs_dir=selflogs_dir, runs_dir=runs_dir, out_dir=digests_dir)
+
+    report = consolidate_week(WEEK, digests_dir=digests_dir, out_dir=out_dir)
+
+    fix_titles = [c.title for c in report.to_fix]
+    assert all("no error signature" not in t for t in fix_titles)
+    assert any("confidence 0.0" in t for t in fix_titles)
+    nosig = [c for c in report.report_only if "no error signature" in c.title]
+    assert len(nosig) == 1
+    assert nosig[0].severity_weight == SEVERITY_WEIGHTS["by_design"]
+    assert nosig[0].kind == "ops"  # kind stays honest; only weight/placement change
+
+
+def test_by_design_excluded_from_to_fix_even_with_room(tmp_path: Path) -> None:
+    """A by-design cluster is report-only even when to_fix has empty slots."""
+    selflogs_dir = tmp_path / "selflogs"
+    runs_dir = tmp_path / "runs"
+    digests_dir = tmp_path / "digests"
+    out_dir = tmp_path / "weekly_out"
+
+    _write_no_signature_run(runs_dir, "run-nosig", MON)
+    scan_day(MON, selflogs_dir=selflogs_dir, runs_dir=runs_dir, out_dir=digests_dir)
+
+    report = consolidate_week(WEEK, digests_dir=digests_dir, out_dir=out_dir)
+
+    assert report.to_fix == []
+    assert len(report.report_only) == 1
