@@ -31,6 +31,8 @@ data/opensearch/
 data/audit/
 data/runs/
 data/sdk_cache/
+data/selflogs/
+data/selfheal/
 .tvastr/
 
 # IDE / OS

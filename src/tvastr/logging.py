@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 import structlog
+
+from tvastr.selfheal.selflog import SelfLogWriter
 
 _CONFIGURED = False
 
 
-def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
+def configure_logging(
+    level: str = "INFO",
+    json_output: bool = False,
+    selflog_dir: Path | None = None,
+    retention_days: int = 30,
+) -> None:
     global _CONFIGURED
     if _CONFIGURED:
         return
@@ -28,6 +36,8 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
     ]
+    if selflog_dir is not None:
+        shared_processors.append(SelfLogWriter(selflog_dir, retention_days=retention_days))
 
     renderer: structlog.typing.Processor = (
         structlog.processors.JSONRenderer() if json_output else structlog.dev.ConsoleRenderer()

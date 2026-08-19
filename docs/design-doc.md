@@ -218,6 +218,129 @@ tvastr ships as a container and is smoke-tested as one on every push ([ADR-0008]
 
 **CI** (`.github/workflows/ci.yml`) has two jobs. `test` runs the fully-offline suite (`uv sync --frozen`, `ruff check`, `pytest -q`) with no Docker involvement. `image`, gated on `test` passing, builds the actual `Dockerfile`, runs it with `TVASTR_USE_MOCKS=true`, and drives `scripts/ci-smoke.sh` against it — the script polls `/health`, `POST`s `/api/run` for a mock issue chosen because it has a real repro signature, then polls `GET /api/runs/{id}/stream` for up to 60 seconds until it sees `event: pipeline.end`. This is a smoke test of the *container*, exercising the job API end-to-end, not just of the source tree the way the `test` job is — a regression in the Dockerfile, the compose wiring, or the job API's happy path fails CI even though every unit test still passes.
 
+### 4.9 The self-healing loop
+
+tvastr diagnoses and fixes failures in *other* repositories, but until now its
+own failures — unhandled exceptions, mapped GitHub upstream errors,
+confidence-0.0 investigations, broken reproducers — vanished into stdout or
+sat unread in `data/runs/`. The self-healing loop (`src/tvastr/selfheal/`,
+gated by `self_heal_enabled`, default off) makes tvastr its own first
+customer: it dogfoods the same diagnose/fix/verify pipeline used against the
+target repo, pointed at tvastr's own source. Four stages, two guards.
+
+**Stage 1 — selflog capture (continuous).** `SelfLogWriter` is a structlog
+processor inserted into the shared logging chain (`configure_logging`) that
+appends every log record as one JSON line to
+`data/selflogs/tvastr-YYYY-MM-DD.jsonl` (UTC date), alongside — never instead
+of — the existing console/JSON rendering. Thread-safe via a single lock; any
+write failure is swallowed after one warning, because capture must never
+destabilize the app it's watching. Date rollover prunes files older than
+`self_heal_retention_days` (default 30). The second signal source needs no
+new capture: `data/runs/*.jsonl` already records every `error` event, verify
+verdict, and investigator confidence.
+
+**Stage 2 — daily digest.** `selfheal/scan.py` (pure functions) reads one
+UTC day's selflog file plus that day's run files and extracts issue
+candidates: ops signals (selflog `error`/`critical` records, run `error`
+events) and quality signals (root-cause confidence `0.0`, verify verdict
+`REPRO_BROKEN`, a failed `llm.call`). Candidates normalize into `LogEvent`s
+(`service="tvastr-self"`, `source="selfheal"`) and are clustered by the
+**existing `FailureDetector`** — no new fingerprinting logic. The digest is
+written to `data/selfheal/daily/YYYY-MM-DD.jsonl`, even on an empty day
+(proof of life: the scanner ran and found nothing).
+
+**Stage 3 — weekly consolidation.** `selfheal/report.py` merges an ISO
+week's daily digests by fingerprint, scores each merged cluster
+`count × severity_weight`, and keeps the top `self_heal_top_n` (default 10),
+splitting them into `to_fix` (the top `self_heal_fix_n`, default 3) and
+`report_only`. `SEVERITY_WEIGHTS` is the single tuning surface: `quality`
+(3.0) outranks `ops` (1.0) at equal frequency; `handled_upstream` (0.25)
+dampens known, already-explained upstream failures (mapped 502s, rate
+limits); and `by_design` (0.05) dampens clusters matching a deliberate
+refusal — a message like "no error signature found" (the agent correctly
+declining to remediate a feature request) is tvastr working as intended, not
+a defect. `by_design` clusters stay visible in the report for transparency
+but are **permanently barred from `to_fix`**: a fix wave cannot "fix"
+intended behavior. This weighting was tuned against the first real weekly
+report (2026-W27): 234 `by_design` refusals scored 234.0 and drowned out a
+single genuine confidence-0.0 signal scored 6.0 under the pre-tune weights;
+post-tune, the quality signal fills `to_fix` instead.
+
+**Stage 4 — self-remediation + escalation.** For each `to_fix` cluster,
+`selfheal/remediate.run_fix_wave` reconstructs representative `LogEvent`s
+from the cluster's surviving sample messages and drives them through the
+*same* `RemediationPipeline` the API route uses, with `github_repo =
+self_heal_repo` and the recurrence threshold bypassed (the cluster has
+already recurred by definition — same reasoning as the API route's
+single-issue mode). Runs are **sequential, never concurrent**: every
+self-fix works on the same repo, so the wave joins each pipeline thread
+before starting the next rather than firing them in parallel. A verified fix
+becomes a branch + PR via the existing PR path. After the wave, one
+consolidated Slack message (`build_notifier`) reports fixed (with PR links —
+one cluster can open more than one PR), attempted-but-unverified, skipped,
+and report-only clusters, each carrying a 12-character fingerprint token for
+correlation. Outcomes persist to `data/selfheal/weekly/{week}-outcomes.json`
+so the report API can merge PR/status onto each `to_fix` cluster on a later
+request.
+
+**Guard 1 — loop exclusion.** Without a guard, a self-heal run that crashes
+would emit ordinary `error`/`llm.call` events into its own run file; the next
+daily digest would mine those as fresh failures, "fix" them with another
+self-heal run, and feed itself forever. `pipeline.py` spreads a run's
+`run_meta` flat into the `pipeline.start` event's payload, so
+`selfheal/remediate.py` stamps `run_meta = {"self_heal": True, ...}` on
+every wave-launched run, and `scan.py`'s run-file scanner skips the *whole*
+file whenever any event's payload carries a truthy `self_heal` key — not
+just events tagged after the fact. The guard closes both places a self-run's
+own log lines can leak into the digest: run files (via the payload stamp,
+including a pre-`pipeline.start` crash, whose lone `error` event is stamped
+via `start_pipeline_thread`'s `error_payload`) and selflog records (via
+`structlog.contextvars.bind_contextvars(self_heal=True)` bound inside the
+wave's own run thread, since contextvars don't propagate across threads).
+This is a hard requirement, not a tuning knob.
+
+**Guard 2 — single scheduler.** `selfheal/scheduler.py` runs a daemon thread
+started by `create_app()` only when `self_heal_enabled` is true — the same
+posture as `sweep_on_startup` (§4.6): sealed false in `tests/conftest.py`,
+false in `docker-compose.yml` because the host dev process and the
+container share `./data`, and there must be exactly one scheduler firing
+against it. `SchedulerState` (`data/selfheal/state.json`:
+`last_daily_date`, `last_weekly_week`) makes firing idempotent across
+restarts — state is saved *before* the hook runs, so a crashing daily/weekly
+job never re-fires, and a missed period is caught up once (yesterday for
+daily, the last complete ISO week for weekly) rather than replayed
+repeatedly. `self_heal_weekly_day` uses `date.isoweekday()` (1=Monday..
+7=Sunday, default 7); on the default Sunday firing, the weekly job targets
+the ISO week of `now - 7 days` — the last **complete** week, since the
+current week's own Sunday digest doesn't exist until the following Monday.
+
+**Two-switch PR safety.** `self_heal_enabled` alone never opens a real PR.
+`_self_run_settings` forces `dry_run=True` for every wave run unless
+`self_heal_open_prs` (default `false`) is explicitly set — enabling the
+loop and letting it push live PRs against `self_heal_repo` are deliberately
+separate switches, because the wave runs autonomously (no human picks the
+cluster, unlike the triage UI's single-issue mode).
+
+**API / UI.** `GET /api/selfheal/status` reports the enabled flag and
+scheduler liveness/next-fire snapshot (works with the feature off:
+`scheduler=None`). `GET /api/selfheal/report` returns the latest
+`WeeklyReport` with fix outcomes merged in by fingerprint, 404 until a
+consolidation has ever run. `POST /api/selfheal/scan {"kind": "daily"|
+"weekly", ...}` manually and synchronously runs one stage — deliberately
+allowed regardless of `self_heal_enabled` (only the background scheduler is
+gated by that flag) so the loop is demoable without waiting a week, and it
+never runs the fix wave, so a manual scan can never open a PR. The
+dashboard's **Self-heal** tab (`app.html`) shows scheduler status, a "Run
+digest now" button wired to the manual-scan endpoint, and the latest
+weekly report's ranked clusters with status chips and PR links; self-runs
+open in the ordinary run view like any other run, because they stream
+through the same job-model machinery (§4.6) and share the same
+`IN_FLIGHT` registry (`tvastr.runner`).
+
+Full rationale, alternatives considered, and the honest limits (first-report
+noise, quality-signal attribution, the static ceiling) are in
+[ADR-0009](adr/0009-self-healing-loop.md).
+
 ## 5. Hybrid local/cloud LLM routing
 
 Application logs routinely contain PII and secrets. Sending raw logs to a cloud LLM is a privacy and compliance risk; using only a local model gives up the reasoning quality that root-cause analysis and code generation need. **Route work by data sensitivity, not by convenience.**
@@ -349,4 +472,5 @@ None of this changes the test suite — tests are testbed-agnostic. The bundled 
 - ADR-0006 — Ground diagnosis in issue-era code and installed-SDK reality
 - ADR-0007 — Verify oracle hardening (extends ADR-0005)
 - ADR-0008 — Job-model run lifecycle: event-sourced runs, containers, CI
+- ADR-0009 — The self-healing loop: tvastr dogfoods its own remediation pipeline
 - `docs/design-doc.pdf` — original (Haystack-era) design doc, superseded by this file

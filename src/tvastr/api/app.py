@@ -8,18 +8,24 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from tvastr import __version__
-from tvastr.api.routes import health, issues, pr, remediate, run, verify
+from tvastr.api.routes import health, issues, pr, remediate, run, selfheal, verify
 from tvastr.api.routes.run import _IN_FLIGHT
 from tvastr.config import get_settings
 from tvastr.events import default_runs_dir, mark_interrupted_runs
 from tvastr.logging import configure_logging, get_logger
+from tvastr.selfheal.scheduler import SelfHealScheduler
 
 log = get_logger(__name__)
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    configure_logging(level=settings.log_level, json_output=settings.log_json)
+    configure_logging(
+        level=settings.log_level,
+        json_output=settings.log_json,
+        selflog_dir=Path("data/selflogs") if settings.self_heal_enabled else None,
+        retention_days=settings.self_heal_retention_days,
+    )
 
     app = FastAPI(
         title="tvastr",
@@ -36,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(pr.router)
     app.include_router(remediate.router)
     app.include_router(run.router)
+    app.include_router(selfheal.router)
     app.include_router(verify.router)
 
     # Single-process-scoped: liveness is judged against this process's
@@ -53,6 +60,16 @@ def create_app() -> FastAPI:
             marked = mark_interrupted_runs(runs_dir, _IN_FLIGHT)
             if marked:
                 log.info("app.sweep.marked_interrupted", count=marked)
+
+    # Same single-scheduler rationale as the sweep gate above: this machine's
+    # ./data is shared between the host dev process and the docker-compose
+    # container, so only one process may run the self-heal scheduler against
+    # it. Store the scheduler OBJECT (not just its thread) on app.state so
+    # Task 6's status route can call .status() on it.
+    if settings.self_heal_enabled:
+        scheduler = SelfHealScheduler(settings=settings)
+        scheduler.start()
+        app.state.selfheal_scheduler = scheduler
 
     @app.get("/app", response_class=HTMLResponse, include_in_schema=False)
     def _app_page() -> HTMLResponse:

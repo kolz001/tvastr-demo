@@ -20,6 +20,9 @@ services:
       # interrupted (per-process in-flight registry). Pure-container
       # deployments should flip this to "true".
       TVASTR_SWEEP_ON_STARTUP: "false"
+      # Same single-scheduler rationale: host dev uvicorn is the sole
+      # self-heal scheduler on this shared-data machine.
+      TVASTR_SELF_HEAL_ENABLED: "false"
     volumes:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
