@@ -18,7 +18,7 @@ parse, no mutation of ``data/``. ``scan_day`` is the only function that writes
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -44,8 +44,12 @@ class DailyDigest:
     ``events`` is the full candidate list that fed ``clusters`` for the run that
     produced this digest in-process. ``load_daily`` cannot reconstruct that list
     from disk (only up to 3 sample messages per cluster are persisted), so a
-    digest loaded back from disk always has ``events == []``; callers that need
-    per-cluster samples should read them from the persisted JSONL directly.
+    digest loaded back from disk always has ``events == []``.
+
+    ``sample_messages`` mirrors what's persisted per cluster (fingerprint -> up
+    to 3 sample message strings), populated on both the in-process digest
+    (``scan_day``) and the disk-roundtrip digest (``load_daily``) so callers
+    never need to re-read the JSONL directly.
     """
 
     day: str
@@ -53,6 +57,7 @@ class DailyDigest:
     events: list[LogEvent]
     scanned_runs: int
     skipped_self_runs: int
+    sample_messages: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -279,11 +284,28 @@ def _digest_path(out_dir: Path, day: str) -> Path:
     return out_dir / "daily" / f"{day}.jsonl"
 
 
+def _cluster_sample_messages(
+    clusters: list[FailurePattern], events: list[LogEvent]
+) -> dict[str, list[str]]:
+    """Up to 3 sample messages per cluster, keyed by fingerprint — the same
+    slice ``_write_digest`` persists, factored out so ``scan_day``'s
+    in-process digest carries the identical shape ``load_daily`` reconstructs
+    from disk."""
+    events_by_id = {event.id: event for event in events}
+    return {
+        pattern.fingerprint: [
+            events_by_id[event_id].message
+            for event_id in pattern.sample_event_ids[:3]
+            if event_id in events_by_id
+        ]
+        for pattern in clusters
+    }
+
+
 def _write_digest(digest: DailyDigest, out_dir: Path) -> None:
     path = _digest_path(out_dir, digest.day)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    events_by_id = {event.id: event for event in digest.events}
     lines = [
         json.dumps(
             {
@@ -296,13 +318,8 @@ def _write_digest(digest: DailyDigest, out_dir: Path) -> None:
         )
     ]
     for pattern in digest.clusters:
-        sample_messages = [
-            events_by_id[event_id].message
-            for event_id in pattern.sample_event_ids[:3]
-            if event_id in events_by_id
-        ]
         row = pattern.model_dump(mode="json")
-        row["sample_messages"] = sample_messages
+        row["sample_messages"] = digest.sample_messages.get(pattern.fingerprint, [])
         lines.append(json.dumps(row))
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -322,6 +339,7 @@ def scan_day(day: str, *, selflogs_dir: Path, runs_dir: Path, out_dir: Path) -> 
         events=events,
         scanned_runs=scanned_runs,
         skipped_self_runs=skipped_self_runs,
+        sample_messages=_cluster_sample_messages(clusters, events),
     )
     _write_digest(digest, out_dir)
     return digest
@@ -346,9 +364,10 @@ def load_daily(out_dir: Path, day: str) -> DailyDigest | None:
 
     header = json.loads(lines[0])
     clusters: list[FailurePattern] = []
+    sample_messages: dict[str, list[str]] = {}
     for line in lines[1:]:
         row = json.loads(line)
-        row.pop("sample_messages", None)
+        sample_messages[row["fingerprint"]] = row.pop("sample_messages", [])
         clusters.append(FailurePattern(**row))
 
     return DailyDigest(
@@ -357,4 +376,5 @@ def load_daily(out_dir: Path, day: str) -> DailyDigest | None:
         events=[],
         scanned_runs=header["scanned_runs"],
         skipped_self_runs=header["skipped_self_runs"],
+        sample_messages=sample_messages,
     )
