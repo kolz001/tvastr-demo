@@ -257,6 +257,64 @@ To use Docker, build the LlamaIndex base image once:
 docker build -t tvastr-verify:llamaindex -f verification/Dockerfile.llamaindex .
 ```
 
+### The agent watches itself
+
+tvastr's own failures — unhandled exceptions, upstream GitHub errors,
+confidence-0.0 investigations, broken reproducers — used to vanish into
+stdout or sit unread in `data/runs/`. The self-healing loop makes tvastr its
+own first customer: it dogfoods the same diagnose/fix/verify pipeline it runs
+against the target repo, against its own source.
+
+1. **Capture (continuous).** With `TVASTR_SELF_HEAL_ENABLED=true`, every log
+   record is mirrored to a dated JSONL file under `data/selflogs/`, alongside
+   — never instead of — the normal console/JSON output.
+2. **Daily digest.** `data/selflogs/` plus the day's `data/runs/*.jsonl` are
+   mined for ops signals (errors, mapped GitHub failures) and quality signals
+   (confidence-0.0 investigations, broken reproducers) and clustered by the
+   existing `FailureDetector` — the same fingerprinting used everywhere else.
+3. **Weekly top-10.** A week's daily digests are merged and ranked by
+   `count × severity weight`: quality signals outrank ops noise, known/handled
+   upstream errors (mapped 502s, rate limits) are dampened, and clusters that
+   match a deliberate refusal (e.g. "no error signature found") are dampened
+   further and permanently barred from the fix wave — remediating intended
+   behavior is meaningless work. The top 10 land in the weekly report; the
+   top 3 become fix candidates.
+4. **Self-remediation + Slack escalation.** Each fix candidate runs through
+   the *same* pipeline used for the target repo, pointed at tvastr's own
+   repo. A verified fix becomes a branch + PR — never auto-merged. One
+   consolidated Slack message per week reports fixed / attempted-but-
+   unverified / skipped / report-only clusters, each tagged with a short
+   fingerprint for follow-up.
+
+**Two-switch PR safety.** `self_heal_enabled=true` alone never opens a real
+PR: the fix wave forces `dry_run=True` unless `self_heal_open_prs=true` is
+*also* set explicitly — enabling the loop and letting it open live PRs are
+deliberately separate switches.
+
+**Demo without waiting a week.** `POST /api/selfheal/scan {"kind": "daily"}`
+(or `"weekly"`) runs one stage synchronously and works regardless of
+`self_heal_enabled` — only the background scheduler is gated by that flag,
+and a manual scan never runs the fix wave, so it can never open a PR. The
+dashboard's **Self-heal** tab has a "Run digest now" button wired to it, plus
+the latest weekly report (rank, count, status, PR links).
+
+**Config** (all `TVASTR_*`-overridable):
+
+| field | default | meaning |
+| --- | --- | --- |
+| `self_heal_enabled` | `false` | master switch: capture + scheduler |
+| `self_heal_repo` | `kolz001/tvastr-demo` | remediation target repo |
+| `self_heal_daily_hour` | `2` | UTC hour for the daily digest |
+| `self_heal_weekly_day` | `7` | isoweekday for consolidation (7 = Sunday) |
+| `self_heal_top_n` | `10` | clusters in the weekly report |
+| `self_heal_fix_n` | `3` | clusters sent through the pipeline |
+| `self_heal_retention_days` | `30` | selflog retention |
+| `self_heal_open_prs` | `false` | opt-in: let the fix wave open real PRs |
+
+Slack reuses `TVASTR_SLACK_WEBHOOK_URL` — no new secrets. See
+[ADR-0009](docs/adr/0009-self-healing-loop.md) and [docs/design-doc.md
+§4.9](docs/design-doc.md) for the full design.
+
 ### Dry-run against real source
 
 A dry-run executes the full agent flow — including real Claude calls and real
